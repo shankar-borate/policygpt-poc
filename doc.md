@@ -5,10 +5,10 @@
 This POC has been refactored into a small package named `policygpt` so the main responsibilities are separated:
 
 - `policygpt/config.py`
-  Holds runtime configuration such as document folder, model names, retrieval limits, and section sizing.
+  Holds runtime configuration such as document folder, model provider, model names, retrieval limits, and section sizing.
 - `policygpt/services/`
   Contains reusable low-level services:
-  `file_extractor.py`, `openai_service.py`, and `redaction.py`.
+  `file_extractor.py`, `openai_service.py`, `bedrock_service.py`, and `redaction.py`.
 - `policygpt/corpus.py`
   Owns document ingestion, section generation, embeddings, and retrieval indexes.
 - `policygpt/conversations.py`
@@ -24,6 +24,22 @@ This POC has been refactored into a small package named `policygpt` so the main 
 `policy_gpt_poc.py` is now only the CLI/backward-compatible wrapper.
 
 ## End-to-End Flow
+
+## Model Providers
+
+The app now supports two AI providers through config:
+
+- `openai`
+  Uses the configured OpenAI chat model plus the configured OpenAI embedding model.
+- `bedrock`
+  Uses Amazon Bedrock for both chat and embeddings.
+  By config profile:
+  - `ai_profile = "bedrock-20b"` maps to `openai.gpt-oss-20b-1:0`
+  - `ai_profile = "bedrock-120b"` maps to `openai.gpt-oss-120b-1:0`
+  - embeddings use `amazon.titan-embed-text-v2:0`
+
+The single model switch is `Config.ai_profile` in `policygpt/config.py`.
+`PolicyGPTBot` chooses the correct low-level AI service based on the resolved `Config.ai_provider`, so retrieval and chat orchestration do not need provider-specific branching.
 
 ### 1. Startup
 
@@ -42,6 +58,7 @@ For each supported policy file:
 1. The corpus asks `FileExtractor` to read and parse the file.
 2. The extractor:
    - strips scripts/styles/noisy HTML tags
+   - extracts text from PDFs when the file is text-based
    - derives a document title
    - splits content into sections
 3. The corpus masks sensitive text using `Redactor`.
@@ -99,6 +116,28 @@ For every question:
    - short-term memory
    - active docs/sections
    - conversation summary when needed
+
+## Long Document Handling
+
+Large PDFs and documents are now split in two places so indexing stays under model token limits:
+
+1. Section chunking
+   `FileExtractor` already groups content into sections. If a section is too large, it is split into synthetic parts. Oversized paragraphs are now further broken by sentence or word boundaries, so one giant PDF block does not become one giant LLM call.
+
+2. Document summary reduction
+   `DocumentCorpus` no longer sends the full document text to the LLM in one prompt when a file is large. Instead it:
+   - splits the document text into summary-safe chunks
+   - summarizes each chunk
+   - recursively combines those chunk summaries if needed
+   - creates one final compact document summary for retrieval
+
+3. Token-limit recovery
+   The corpus now uses a conservative token estimate based on both characters and words before sending text to the LLM. If the OpenAI API still reports that a request is too large, the corpus immediately splits that chunk again and retries with smaller pieces.
+
+4. Skip-and-continue behavior
+   If one document or one section still cannot be processed after recursive splitting, that item is skipped and indexing continues with the next file. One bad PDF should not stop the whole startup flow.
+
+This means large text-based PDFs can be indexed without relying on a single oversized prompt, and indexing can keep moving even when one file is problematic.
 
 ## Retrieval Design
 
@@ -204,6 +243,7 @@ This is still a POC, so a few scalability limitations remain:
 
 - Thread state is in-memory only
 - Index is rebuilt at startup
+- PDF support is for text-based PDFs; scanned/image-only PDFs will not yield useful text without OCR
 - No persistent vector store
 - No async task queue for indexing
 - No caching layer for summaries/embeddings

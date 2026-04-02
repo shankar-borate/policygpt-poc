@@ -9,6 +9,8 @@ from policygpt.conversations import ConversationManager
 from policygpt.corpus import DocumentCorpus, ProgressCallback
 from policygpt.models import ChatResult, Message, SourceReference
 from policygpt.models import utc_now_iso
+from policygpt.services.base import AIService
+from policygpt.services.bedrock_service import BedrockService
 from policygpt.services.file_extractor import FileExtractor
 from policygpt.services.openai_service import OpenAIService
 from policygpt.services.redaction import Redactor
@@ -18,7 +20,7 @@ class PolicyGPTBot:
     def __init__(
         self,
         config: Config,
-        ai: OpenAIService | None = None,
+        ai: AIService | None = None,
         redactor: Redactor | None = None,
         extractor: FileExtractor | None = None,
         corpus: DocumentCorpus | None = None,
@@ -26,7 +28,7 @@ class PolicyGPTBot:
     ) -> None:
         self.config = config
         self.redactor = redactor or Redactor(config.redaction_rules)
-        self.ai = ai or OpenAIService(config.chat_model, config.embedding_model)
+        self.ai = ai or self._build_ai_service()
         self.extractor = extractor or FileExtractor(config)
         self.corpus = corpus or DocumentCorpus(
             config=config,
@@ -139,6 +141,26 @@ class PolicyGPTBot:
 
     def _embed_one(self, text: str) -> np.ndarray:
         return self.corpus.embed_text(text)
+
+    def _build_ai_service(self) -> AIService:
+        if self.config.ai_provider == "bedrock":
+            return BedrockService(
+                chat_model=self.config.chat_model,
+                embedding_model=self.config.embedding_model,
+                region_name=self.config.bedrock_region,
+                rate_limit_retries=self.config.ai_rate_limit_retries,
+                rate_limit_backoff_seconds=self.config.ai_rate_limit_backoff_seconds,
+            )
+
+        if self.config.ai_provider == "openai":
+            return OpenAIService(
+                self.config.chat_model,
+                self.config.embedding_model,
+                rate_limit_retries=self.config.ai_rate_limit_retries,
+                rate_limit_backoff_seconds=self.config.ai_rate_limit_backoff_seconds,
+            )
+
+        raise ValueError(f"Unsupported AI provider: {self.config.ai_provider}")
 
     def _system_prompt(self) -> str:
         return (

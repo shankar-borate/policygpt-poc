@@ -1,31 +1,94 @@
+import time
+
 import numpy as np
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
+
+from policygpt.services.base import AIRequestTooLargeError
 
 
 class OpenAIService:
-    def __init__(self, chat_model: str, embedding_model: str):
+    def __init__(
+        self,
+        chat_model: str,
+        embedding_model: str,
+        rate_limit_retries: int = 2,
+        rate_limit_backoff_seconds: float = 8.0,
+    ):
         self.client = OpenAI()
         self.chat_model = chat_model
         self.embedding_model = embedding_model
+        self.rate_limit_retries = max(0, rate_limit_retries)
+        self.rate_limit_backoff_seconds = max(0.0, rate_limit_backoff_seconds)
 
     def embed_texts(self, texts: list[str]) -> list[np.ndarray]:
         if not texts:
             return []
 
-        response = self.client.embeddings.create(
-            model=self.embedding_model,
-            input=texts,
+        response = self._run_with_retries(
+            lambda: self.client.embeddings.create(
+                model=self.embedding_model,
+                input=texts,
+            )
         )
         return [np.array(item.embedding, dtype=np.float32) for item in response.data]
 
     def llm_text(self, system_prompt: str, user_prompt: str, max_output_tokens: int) -> str:
-        response = self.client.chat.completions.create(
-            model=self.chat_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_completion_tokens=max_output_tokens,
+        response = self._run_with_retries(
+            lambda: self.client.chat.completions.create(
+                model=self.chat_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_completion_tokens=max_output_tokens,
+            )
         )
         content = response.choices[0].message.content
         return (content or "").strip()
+
+    def _run_with_retries(self, operation):
+        attempts = self.rate_limit_retries + 1
+        for attempt in range(attempts):
+            try:
+                return operation()
+            except Exception as exc:
+                if self.is_request_too_large_error(exc):
+                    raise AIRequestTooLargeError(str(exc)) from exc
+
+                if self.is_retryable_rate_limit_error(exc) and attempt < attempts - 1:
+                    delay_seconds = self.rate_limit_backoff_seconds * (attempt + 1)
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds)
+                    continue
+
+                raise
+
+        raise RuntimeError("OpenAI operation failed after retries.")
+
+    @staticmethod
+    def is_request_too_large_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in {
+                "request too large",
+                "input or output tokens must be reduced",
+                "maximum context length",
+                "context length exceeded",
+                "too many tokens",
+            }
+        )
+
+    @staticmethod
+    def is_retryable_rate_limit_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        if OpenAIService.is_request_too_large_error(exc):
+            return False
+
+        if isinstance(exc, (RateLimitError, APITimeoutError, APIConnectionError)):
+            return True
+
+        return "rate limit" in message or "temporarily unavailable" in message
+
+
+OpenAIRequestTooLargeError = AIRequestTooLargeError

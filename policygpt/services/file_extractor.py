@@ -27,6 +27,8 @@ class FileExtractor:
             return self.extract_from_html(path)
         if suffix == ".txt":
             return self.extract_from_plain_text(path)
+        if suffix == ".pdf":
+            return self.extract_from_pdf(path)
         return Path(path).stem, []
 
     def extract_from_html(self, path: str) -> tuple[str, list[tuple[str, str]]]:
@@ -95,6 +97,104 @@ class FileExtractor:
         flush_paragraph()
         return doc_title, self._group_units_into_sections(units)
 
+    def extract_from_pdf(self, path: str) -> tuple[str, list[tuple[str, str]]]:
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise ImportError(
+                "PDF ingestion requires the 'pypdf' package. Install dependencies from requirements.txt."
+            ) from exc
+
+        reader = PdfReader(path)
+        metadata_title = ""
+        if reader.metadata and reader.metadata.title:
+            metadata_title = self.clean_whitespace(str(reader.metadata.title))
+
+        page_texts: list[str] = []
+        for page in reader.pages:
+            extracted = page.extract_text() or ""
+            if extracted.strip():
+                page_texts.append(extracted)
+
+        combined_text = self.clean_whitespace("\n\n".join(page_texts))
+        if not combined_text:
+            return Path(path).stem, []
+
+        lines = [line.strip() for line in combined_text.split("\n") if line.strip()]
+        units = self._build_text_units(lines)
+        title = self._select_text_document_title(
+            path=path,
+            lines=lines,
+            metadata_title=metadata_title,
+        )
+        return title, self._group_units_into_sections(units)
+
+    def _build_text_units(self, lines: list[str]) -> list[tuple[str, str]]:
+        units: list[tuple[str, str]] = []
+        buffer: list[str] = []
+
+        def flush_paragraph() -> None:
+            nonlocal buffer
+            if buffer:
+                paragraph = " ".join(buffer).strip()
+                if paragraph:
+                    units.append(("p", paragraph))
+                buffer = []
+
+        heading_pattern = re.compile(r"^(\d+(\.\d+)*[\)\.]?)\s+.+|^[A-Z][A-Z0-9 /&\-,]{4,}$")
+
+        for line in lines:
+            is_heading = bool(heading_pattern.match(line)) and len(line) < 180
+            is_bullet = re.match(r"^[-*\u2022]\s+.+", line) or re.match(r"^\d+[\.\)]\s+.+", line)
+
+            if is_heading:
+                flush_paragraph()
+                units.append(("h2", line))
+            elif is_bullet:
+                flush_paragraph()
+                units.append(("li", line))
+            else:
+                buffer.append(line)
+
+        flush_paragraph()
+        return units
+
+    def _select_text_document_title(
+        self,
+        path: str,
+        lines: list[str],
+        metadata_title: str = "",
+    ) -> str:
+        file_title = self._clean_title_candidate(Path(path).stem.replace("_", " "))
+        first_line_title = ""
+
+        for line in lines[:8]:
+            candidate = self._clean_title_candidate(line)
+            if not candidate:
+                continue
+            if len(candidate) > 180:
+                continue
+            first_line_title = candidate
+            break
+
+        cleaned_metadata_title = self._clean_title_candidate(metadata_title)
+        metadata_overlap = self._title_overlap_score(cleaned_metadata_title, file_title)
+        line_overlap = self._title_overlap_score(first_line_title, file_title)
+
+        if first_line_title and not self._looks_like_bad_title(first_line_title, file_title) and (
+            self._looks_like_bad_title(cleaned_metadata_title, file_title)
+            or line_overlap > metadata_overlap
+        ):
+            return first_line_title
+
+        if cleaned_metadata_title and not self._looks_like_bad_title(cleaned_metadata_title, file_title):
+            return cleaned_metadata_title
+
+        if first_line_title and not self._looks_like_bad_title(first_line_title, file_title):
+            return first_line_title
+
+        return file_title or cleaned_metadata_title or Path(path).stem
+
     def _group_units_into_sections(self, units: list[tuple[str, str]]) -> list[tuple[str, str]]:
         sections: list[tuple[str, str]] = []
         current_title = "Introduction"
@@ -148,22 +248,59 @@ class FileExtractor:
         part_no = 1
 
         for paragraph in paragraphs:
-            paragraph_len = len(paragraph)
-            too_big = current_len + paragraph_len > self.config.target_section_chars
+            paragraph_parts = self._split_oversized_text_block(paragraph, self.config.target_section_chars)
+            for paragraph_part in paragraph_parts:
+                paragraph_len = len(paragraph_part)
+                too_big = current_len + paragraph_len > self.config.target_section_chars
 
-            if current and too_big and current_len >= self.config.min_section_chars:
-                sections.append((f"{title_prefix} - Part {part_no}", "\n\n".join(current)))
-                part_no += 1
-                current = [paragraph]
-                current_len = paragraph_len
-            else:
-                current.append(paragraph)
-                current_len += paragraph_len
+                if current and too_big and current_len >= self.config.min_section_chars:
+                    sections.append((f"{title_prefix} - Part {part_no}", "\n\n".join(current)))
+                    part_no += 1
+                    current = [paragraph_part]
+                    current_len = paragraph_len
+                else:
+                    current.append(paragraph_part)
+                    current_len += paragraph_len
 
         if current:
             sections.append((f"{title_prefix} - Part {part_no}", "\n\n".join(current)))
 
         return sections
+
+    def _split_oversized_text_block(self, text: str, target_chars: int) -> list[str]:
+        text = text.strip()
+        if not text or len(text) <= target_chars:
+            return [text] if text else []
+
+        sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", text) if sentence.strip()]
+        if len(sentences) > 1:
+            return self._pack_text_segments(sentences, target_chars, separator=" ")
+
+        words = text.split()
+        if not words:
+            return []
+        return self._pack_text_segments(words, target_chars, separator=" ")
+
+    @staticmethod
+    def _pack_text_segments(segments: list[str], target_chars: int, separator: str) -> list[str]:
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+
+        for segment in segments:
+            projected_len = current_len + len(segment) + (len(separator) if current else 0)
+            if current and projected_len > target_chars:
+                chunks.append(separator.join(current).strip())
+                current = [segment]
+                current_len = len(segment)
+            else:
+                current.append(segment)
+                current_len = projected_len if current_len else len(segment)
+
+        if current:
+            chunks.append(separator.join(current).strip())
+
+        return chunks
 
     def _select_document_title(
         self,
