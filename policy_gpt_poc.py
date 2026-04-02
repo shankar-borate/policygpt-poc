@@ -1,10 +1,10 @@
 import os
 import re
 import uuid
-import glob
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from bs4 import BeautifulSoup
@@ -18,6 +18,8 @@ from openai import OpenAI
 class Config:
     # Folder containing .html / .htm / .txt files
     DOCUMENT_FOLDER = r"D:\policy-mgmt\policies"
+    SUPPORTED_FILE_PATTERNS = ("*.html", "*.htm", "*.txt")
+    EXCLUDED_FILE_NAME_PARTS = ("_summary",)
 
     # Models
     CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1")
@@ -51,7 +53,11 @@ class Config:
     CONVERSATION_SUMMARY_MAX_OUTPUT_TOKENS = 250
 
     # Optional: if True, prints retrieval details
-    DEBUG = True
+    DEBUG = os.getenv("POLICY_GPT_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
@@ -90,14 +96,33 @@ class Message:
 
 
 @dataclass
+class SourceReference:
+    document_title: str
+    section_title: str
+    source_path: str
+    score: float
+
+
+@dataclass
+class ChatResult:
+    thread_id: str
+    answer: str
+    sources: List[SourceReference]
+
+
+@dataclass
 class ThreadState:
     thread_id: str
     recent_messages: List[Message] = field(default_factory=list)
+    display_messages: List[Message] = field(default_factory=list)
     conversation_summary: str = ""
     active_doc_ids: List[str] = field(default_factory=list)
     active_section_ids: List[str] = field(default_factory=list)
     current_topic: str = ""
-    last_answer_sources: List[str] = field(default_factory=list)
+    title: str = "New chat"
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
+    last_answer_sources: List[SourceReference] = field(default_factory=list)
 
 
 # ============================================================
@@ -183,14 +208,17 @@ class FileExtractor:
     @staticmethod
     def extract_from_html(path: str) -> Tuple[str, List[Tuple[str, str]]]:
         html = Path(path).read_text(encoding="utf-8", errors="ignore")
-        soup = BeautifulSoup(html, "lxml")
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
 
         for tag in soup(["script", "style", "noscript", "svg", "img", "meta", "link"]):
             tag.decompose()
 
-        doc_title = ""
+        html_title = ""
         if soup.title and soup.title.text.strip():
-            doc_title = soup.title.text.strip()
+            html_title = FileExtractor.clean_whitespace(soup.title.text)
 
         candidates = soup.find_all([
             "h1", "h2", "h3", "h4", "h5", "h6",
@@ -205,13 +233,11 @@ class FileExtractor:
             tag = node.name.lower()
             units.append((tag, text))
 
-        if not doc_title:
-            for tag, text in units:
-                if tag.startswith("h"):
-                    doc_title = text
-                    break
-        if not doc_title:
-            doc_title = Path(path).stem
+        doc_title = FileExtractor._select_document_title(
+            path=path,
+            html_title=html_title,
+            units=units,
+        )
 
         sections = FileExtractor._group_units_into_sections(units)
         return doc_title, sections
@@ -244,7 +270,7 @@ class FileExtractor:
 
         for line in lines:
             is_heading = bool(heading_pattern.match(line)) and len(line) < 180
-            is_bullet = re.match(r"^[-*•]\s+.+", line) or re.match(r"^\d+[\.\)]\s+.+", line)
+            is_bullet = re.match(r"^[-*\u2022]\s+.+", line) or re.match(r"^\d+[\.\)]\s+.+", line)
 
             if is_heading:
                 flush_paragraph()
@@ -327,6 +353,75 @@ class FileExtractor:
 
         return sections
 
+    @staticmethod
+    def _select_document_title(path: str, html_title: str, units: List[Tuple[str, str]]) -> str:
+        file_title = FileExtractor._clean_title_candidate(Path(path).stem.replace("_", " "))
+        heading_title = ""
+
+        for tag, text in units:
+            if not tag.startswith("h"):
+                continue
+            heading_title = FileExtractor._clean_title_candidate(text)
+            if heading_title:
+                break
+
+        cleaned_html_title = FileExtractor._clean_title_candidate(html_title)
+        html_overlap = FileExtractor._title_overlap_score(cleaned_html_title, file_title)
+        heading_overlap = FileExtractor._title_overlap_score(heading_title, file_title)
+
+        if heading_title and not FileExtractor._looks_like_bad_title(heading_title, file_title) and (
+            FileExtractor._looks_like_bad_title(cleaned_html_title, file_title)
+            or heading_overlap > html_overlap
+        ):
+            return heading_title
+
+        if cleaned_html_title and not FileExtractor._looks_like_bad_title(cleaned_html_title, file_title):
+            return cleaned_html_title
+
+        if heading_title and not FileExtractor._looks_like_bad_title(heading_title, file_title):
+            return heading_title
+
+        return file_title or cleaned_html_title or Path(path).stem
+
+    @staticmethod
+    def _clean_title_candidate(text: str) -> str:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        return compact[:200]
+
+    @staticmethod
+    def _title_overlap_score(candidate: str, file_title: str) -> float:
+        candidate_tokens = FileExtractor._tokenize_title(candidate)
+        file_tokens = FileExtractor._tokenize_title(file_title)
+        if not candidate_tokens or not file_tokens:
+            return 0.0
+        return len(candidate_tokens & file_tokens) / len(file_tokens)
+
+    @staticmethod
+    def _tokenize_title(text: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(token) >= 3
+        }
+
+    @staticmethod
+    def _looks_like_bad_title(title: str, file_title: str) -> bool:
+        if not title:
+            return True
+
+        normalized = title.casefold()
+        if normalized in {
+            "company car scheme",
+            "policy summary",
+            "document",
+            "untitled",
+            "table of contents",
+            "contents",
+        }:
+            return True
+
+        return FileExtractor._title_overlap_score(title, file_title) == 0.0
+
 
 # ============================================================
 # RETRIEVAL HELPERS
@@ -341,6 +436,23 @@ def l2_normalize(v: np.ndarray) -> np.ndarray:
 
 def cosine_similarity(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return np.dot(matrix, query)
+
+
+def list_supported_policy_files(folder_path: str) -> List[str]:
+    folder = Path(folder_path)
+    file_paths: List[str] = []
+    for pattern in Config.SUPPORTED_FILE_PATTERNS:
+        file_paths.extend(str(path) for path in folder.glob(pattern))
+    filtered_paths: List[str] = []
+    for file_path in sorted(file_paths):
+        file_name = Path(file_path).name.lower()
+        if any(part in file_name for part in Config.EXCLUDED_FILE_NAME_PARTS):
+            continue
+        filtered_paths.append(file_path)
+    return filtered_paths
+
+
+ProgressCallback = Callable[[int, int, Optional[str], int, int], None]
 
 
 # ============================================================
@@ -379,22 +491,62 @@ class PolicyGPTBot:
             self.threads[thread_id] = ThreadState(thread_id=thread_id)
         return self.threads[thread_id]
 
-    def ingest_folder(self, folder_path: str) -> None:
-        file_paths = []
-        file_paths.extend(glob.glob(os.path.join(folder_path, "*.html")))
-        file_paths.extend(glob.glob(os.path.join(folder_path, "*.htm")))
-        file_paths.extend(glob.glob(os.path.join(folder_path, "*.txt")))
+    def list_threads(self) -> List[ThreadState]:
+        return sorted(self.threads.values(), key=lambda thread: thread.updated_at, reverse=True)
 
+    def ingest_folder(
+        self,
+        folder_path: str,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> None:
+        file_paths = list_supported_policy_files(folder_path)
         if not file_paths:
             raise FileNotFoundError(f"No .html/.htm/.txt files found in folder: {folder_path}")
 
-        for path in sorted(file_paths):
-            self.ingest_file(path)
+        total_files = len(file_paths)
+        self._emit_progress(progress_callback, 0, total_files, "Scanning policy files")
 
+        for processed_files, path in enumerate(file_paths, start=1):
+            file_name = Path(path).name
+            self._emit_progress(
+                progress_callback,
+                processed_files - 1,
+                total_files,
+                f"{file_name} - reading file",
+            )
+            self.ingest_file(
+                path,
+                progress_callback=progress_callback,
+                processed_files=processed_files - 1,
+                total_files=total_files,
+            )
+            self._emit_progress(
+                progress_callback,
+                processed_files,
+                total_files,
+                f"{file_name} - completed",
+            )
+
+        self._emit_progress(progress_callback, total_files, total_files, "Building retrieval indexes")
         self._rebuild_indexes()
 
-    def ingest_file(self, path: str) -> None:
-        ext = Path(path).suffix.lower()
+    def ingest_file(
+        self,
+        path: str,
+        progress_callback: Optional[ProgressCallback] = None,
+        processed_files: int = 0,
+        total_files: int = 0,
+    ) -> None:
+        path_obj = Path(path)
+        file_name = path_obj.name
+        ext = path_obj.suffix.lower()
+
+        self._emit_progress(
+            progress_callback,
+            processed_files,
+            total_files,
+            f"{file_name} - extracting sections",
+        )
 
         if ext in [".html", ".htm"]:
             title, sections = FileExtractor.extract_from_html(path)
@@ -405,11 +557,23 @@ class PolicyGPTBot:
 
         full_text = "\n\n".join(text for _, text in sections).strip()
         if not full_text:
+            self._emit_progress(
+                progress_callback,
+                processed_files,
+                total_files,
+                f"{file_name} - skipped empty document",
+            )
             return
 
         masked_title = self.redactor.mask_text(title)
         masked_full_text = self.redactor.mask_text(full_text)
 
+        self._emit_progress(
+            progress_callback,
+            processed_files,
+            total_files,
+            f"{file_name} - summarizing document",
+        )
         doc_summary = self._create_document_summary(masked_title, masked_full_text)
         doc_embedding = self._embed_one(doc_summary)
 
@@ -425,9 +589,21 @@ class PolicyGPTBot:
             sections=[],
         )
 
-        for idx, (section_title, section_text) in enumerate(sections):
-            if not section_text.strip():
-                continue
+        valid_sections = [
+            (section_title, section_text)
+            for section_title, section_text in sections
+            if section_text.strip()
+        ]
+        total_sections = len(valid_sections)
+
+        for idx, (section_title, section_text) in enumerate(valid_sections, start=1):
+            section_label = self._format_progress_label(section_title)
+            self._emit_progress(
+                progress_callback,
+                processed_files,
+                total_files,
+                f"{file_name} - section {idx}/{total_sections}: {section_label}",
+            )
 
             masked_section_title = self.redactor.mask_text(section_title)
             masked_section_text = self.redactor.mask_text(section_text)
@@ -449,12 +625,18 @@ class PolicyGPTBot:
                 summary_embedding=section_embedding,
                 source_path=path,
                 doc_id=doc_id,
-                order_index=idx,
+                order_index=idx - 1,
             )
             doc_record.sections.append(sec)
             self.sections[section_id] = sec
 
         self.documents[doc_id] = doc_record
+        self._emit_progress(
+            progress_callback,
+            processed_files,
+            total_files,
+            f"{file_name} - finished with {len(doc_record.sections)} sections",
+        )
 
         if Config.DEBUG:
             print(f"Ingested: {path}")
@@ -502,6 +684,32 @@ class PolicyGPTBot:
         vec = self.ai.embed_texts([text])[0]
         return l2_normalize(vec)
 
+    def _emit_progress(
+        self,
+        progress_callback: Optional[ProgressCallback],
+        processed_files: int,
+        total_files: int,
+        current_step: Optional[str],
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            processed_files,
+            total_files,
+            current_step,
+            len(self.documents),
+            len(self.sections),
+        )
+
+    @staticmethod
+    def _format_progress_label(text: str, limit: int = 72) -> str:
+        compact = re.sub(r"\s+", " ", text).strip()
+        if not compact:
+            return "Untitled section"
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
     def _rebuild_indexes(self) -> None:
         self.doc_ids = []
         doc_vectors = []
@@ -520,11 +728,12 @@ class PolicyGPTBot:
         self.doc_embedding_matrix = np.vstack(doc_vectors) if doc_vectors else None
         self.section_embedding_matrix = np.vstack(sec_vectors) if sec_vectors else None
 
-    def ask(self, thread_id: str, user_question: str) -> str:
+    def chat(self, thread_id: str, user_question: str) -> ChatResult:
         if not self.documents:
             raise RuntimeError("No documents ingested. Call ingest_folder() first.")
 
         thread = self.get_thread(thread_id)
+        first_user_message = not any(message.role == "user" for message in thread.display_messages)
 
         retrieval_query = self._build_retrieval_query(thread, user_question)
         masked_retrieval_query = self.redactor.mask_text(retrieval_query)
@@ -546,20 +755,45 @@ class PolicyGPTBot:
             max_output_tokens=Config.CHAT_MAX_OUTPUT_TOKENS,
         )
 
-        final_answer = self.redactor.unmask_text(masked_answer)
+        sources = [
+            SourceReference(
+                document_title=self.documents[sec.doc_id].title,
+                section_title=sec.title,
+                source_path=sec.source_path,
+                score=score,
+            )
+            for sec, score in top_sections[:3]
+        ]
+        final_answer = self._append_reference_file_names(
+            self.redactor.unmask_text(masked_answer),
+            sources,
+        )
 
         thread.recent_messages.append(Message(role="user", content=user_question))
         thread.recent_messages.append(Message(role="assistant", content=final_answer))
         thread.recent_messages = thread.recent_messages[-Config.MAX_RECENT_MESSAGES:]
+        thread.display_messages.append(Message(role="user", content=user_question))
+        thread.display_messages.append(Message(role="assistant", content=final_answer))
 
         thread.active_doc_ids = [doc.doc_id for doc, _ in top_docs]
         thread.active_section_ids = [sec.section_id for sec, _ in top_sections]
-        thread.last_answer_sources = [f"{sec.source_path} :: {sec.title}" for sec, _ in top_sections[:3]]
+        thread.current_topic = self._derive_thread_title(user_question, limit=90)
+        thread.last_answer_sources = sources
+        if first_user_message:
+            thread.title = self._derive_thread_title(user_question)
+        thread.updated_at = utc_now_iso()
 
         if len(thread.recent_messages) >= Config.SUMMARIZE_AFTER_TURNS:
             thread.conversation_summary = self._refresh_conversation_summary(thread)
 
-        return final_answer
+        return ChatResult(
+            thread_id=thread_id,
+            answer=final_answer,
+            sources=thread.last_answer_sources,
+        )
+
+    def ask(self, thread_id: str, user_question: str) -> str:
+        return self.chat(thread_id, user_question).answer
 
     def _system_prompt(self) -> str:
         return (
@@ -571,8 +805,44 @@ class PolicyGPTBot:
             "4. Prefer the current conversation context when interpreting follow-up questions like 'what about this', 'same policy', 'that section'.\n"
             "5. If multiple documents are relevant, separate them clearly.\n"
             "6. Mention section titles and file names when useful.\n"
-            "7. Do not hallucinate."
+            "7. Do not hallucinate.\n"
+            "8. Format the answer in clean Markdown with short sections or bullets when helpful.\n"
+            "9. Default to a sharp, concise answer that gets to the point quickly.\n"
+            "10. Give more detail only when the user explicitly asks for it, such as 'in detail', 'detailed', 'step by step', or similar.\n"
+            "11. Do not add unnecessary background, repetition, or long caveats.\n"
+            "12. For direct questions, lead with the answer in the first line.\n"
+            "13. Ignore retrieved text that is about a different policy or a different topic than the user's question, even if it appears semantically similar.\n"
+            "14. If the evidence does not explicitly support the asked point, say it is not clearly stated instead of inferring."
         )
+
+    @staticmethod
+    def _append_reference_file_names(answer: str, sources: List[SourceReference]) -> str:
+        file_names: List[str] = []
+        seen = set()
+        for source in sources:
+            file_name = Path(source.source_path).name
+            if not file_name or file_name in seen:
+                continue
+            seen.add(file_name)
+            file_names.append(file_name)
+
+        if not file_names:
+            return answer.strip()
+
+        reference_line = f"Reference: {', '.join(file_names)}"
+        clean_answer = answer.strip()
+        if not clean_answer:
+            return reference_line
+        return f"{clean_answer}\n\n{reference_line}"
+
+    @staticmethod
+    def _derive_thread_title(text: str, limit: int = 56) -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        if not cleaned:
+            return "New chat"
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 3].rstrip() + "..."
 
     def _build_retrieval_query(self, thread: ThreadState, user_question: str) -> str:
         parts = []
@@ -729,15 +999,23 @@ Anything else is treated as a user question.
 """)
 
 
-def main():
-    folder = Config.DOCUMENT_FOLDER
-
+def create_ready_bot(
+    folder: Optional[str] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> PolicyGPTBot:
     if not os.getenv("OPENAI_API_KEY"):
         raise EnvironmentError("OPENAI_API_KEY is not set in environment variables.")
 
+    resolved_folder = folder or Config.DOCUMENT_FOLDER
     bot = PolicyGPTBot()
+    bot.ingest_folder(resolved_folder, progress_callback=progress_callback)
+    return bot
+
+
+def main():
+    folder = Config.DOCUMENT_FOLDER
     print(f"Ingesting folder: {folder}")
-    bot.ingest_folder(folder)
+    bot = create_ready_bot(folder)
 
     current_thread = bot.new_thread()
     print(f"\nReady. Current thread: {current_thread}")
@@ -787,8 +1065,11 @@ def main():
                 print("No sources yet.")
             else:
                 print("Last answer sources:")
-                for s in thread.last_answer_sources:
-                    print("  -", s)
+                for source in thread.last_answer_sources:
+                    print(
+                        "  -",
+                        f"{source.document_title} :: {source.section_title} ({source.source_path})",
+                    )
             continue
 
         answer = bot.ask(current_thread, user_input)

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Policy GPT</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar">
+            <div class="brand-block">
+                <p class="eyebrow">Policy GPT</p>
+                <h1>Chat with policy docs</h1>
+                <p class="muted">Ask questions across the policy folder and get grounded answers with a reference file at the end.</p>
+            </div>
+
+            <button id="new-chat-btn" class="primary-button" type="button">New chat</button>
+
+            <section class="sidebar-card">
+                <div class="status-row">
+                    <div id="status-pill" class="status-pill status-starting">Starting</div>
+                    <p id="status-meta" class="muted">Preparing the policy index...</p>
+                </div>
+                <div class="progress-block">
+                    <div class="progress-track" aria-hidden="true">
+                        <div id="progress-bar" class="progress-bar"></div>
+                    </div>
+                    <p id="progress-copy" class="progress-copy muted">Waiting for indexing updates...</p>
+                </div>
+            </section>
+
+            <section class="sidebar-section grow">
+                <div class="section-heading">
+                    <span>Conversations</span>
+                </div>
+                <div id="thread-list" class="thread-list"></div>
+            </section>
+
+            <section class="sidebar-section">
+                <div class="section-heading">
+                    <span>Corpus</span>
+                </div>
+                <div id="corpus-summary" class="corpus-summary"></div>
+            </section>
+        </aside>
+
+        <main class="chat-shell">
+            <header class="chat-header">
+                <div>
+                    <p class="eyebrow">Enterprise assistant</p>
+                    <h2 id="chat-title">New chat</h2>
+                </div>
+                <button id="reset-chat-btn" class="ghost-button" type="button">Reset thread</button>
+            </header>
+
+            <section id="hero" class="hero">
+                <div class="hero-card">
+                    <p class="eyebrow">Ask policy questions</p> 
+                    <p class="muted">The answer stays concise, and the final line shows only the reference policy file name.</p>
+                    <div class="prompt-row">
+                        <button class="prompt-chip" type="button" data-prompt="Summarize the employee leave policy in 5 bullets.">Leave policy summary</button>
+                        <button class="prompt-chip" type="button" data-prompt="What are the approval steps for reimbursement requests?">Reimbursement approvals</button>
+                        <button class="prompt-chip" type="button" data-prompt="List the eligibility conditions for this policy.">Eligibility conditions</button>
+                    </div>
+                </div>
+            </section>
+
+            <div id="messages" class="messages"></div>
+
+            <section class="reference-panel">
+                <div class="section-heading">
+                    <span>Reference files</span>
+                </div>
+                <div id="source-list" class="source-list"></div>
+            </section>
+
+            <form id="composer-form" class="composer">
+                <label class="composer-label" for="composer-input">Message</label>
+                <div class="composer-row">
+                    <textarea
+                        id="composer-input"
+                        class="composer-input"
+                        rows="1"
+                        placeholder="Ask about any policy in D:\policy-mgmt\policies..."
+                    ></textarea>
+                    <button id="send-btn" class="primary-button send-button" type="submit">Send</button>
+                </div>
+                <p class="composer-hint">Press Enter to send. Use Shift+Enter for a new line.</p>
+            </form>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
