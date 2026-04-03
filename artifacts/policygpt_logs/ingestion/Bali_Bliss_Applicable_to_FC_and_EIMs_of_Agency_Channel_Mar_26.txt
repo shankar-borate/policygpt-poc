@@ -1,0 +1,56 @@
+Source path: D:\policy-mgmt\data\durandhar_html\Bali Bliss_Applicable to FC and EIMs of Agency Channel_Mar'26.html
+Title: Bali Bliss — Contest Knowledge Base
+Canonical title: bali bliss — contest knowledge base
+Document type: document
+Version: 2.0
+Effective date: March 2026
+Tags: bali bliss, contest knowledge, knowledge base, bliss contest, bliss applicable, agency channel
+Audiences: none
+Keywords: bliss, contest, bali, knowledge, bali_bliss, base, bliss_contest, contest_knowledge, knowledge_base, agency, channel, agency_channel, applicable, eims, bliss_applicable, hdfc
+Section count: 2
+
+=== Document Summary ===
+Purpose:  
+Provides rules and information for the "Bali Bliss" contest under the Agency Channel of HDFC Life, specifically for March 2026.
+
+Scope:  
+Applies to Financial Consultants (FCs) and EIMs within the Tied Agency Channel.
+
+Major Topics:  
+- Eligibility requirements for contest participation  
+- Contest rewards/recognition structure  
+- Relevant processes, timelines, and milestones  
+- Reference to Standard Terms & Conditions v2.0 (effective 21 Nov 2024)
+
+Key Entities:  
+- HDFC Life  
+- DPPM Department  
+- Financial Consultants (FCs)  
+- EIMs (specific role not defined in excerpt)
+
+Rules/Processes:  
+Details contest operation according to updated T&C.
+
+Exceptions:  
+Not specified in the excerpt.
+
+=== Section 1: Bali Bliss — Contest Knowledge Base ===
+Type: general
+Tags: contest knowledge, knowledge base, bliss contest, bali bliss
+Keywords: contest, bliss, knowledge, bali, base, bali_bliss, bliss_contest, contest_knowledge, knowledge_base, hdfc, life, dppm, department, agency, channel, march
+Summary:
+The Bali Bliss contest is organized by HDFC Life's DPPM Department for the Agency Channel and is scheduled for March 2026.
+
+Raw text:
+HDFC Life · DPPM Department · Agency Channel Contest · March 2026
+
+=== Section 2: S10. Items Requiring Verification ===
+Type: general
+Tags: requiring verification, items requiring, s10 items, contest knowledge, knowledge base
+Keywords: items, requiring, knowledge, s10, verification, s10_items, items_requiring, requiring_verification, contest, contest_knowledge, base, knowledge_base, bali, bliss, source, dppm
+Summary:
+Section S10 outlines which items require verification for the Bali Bliss contest. It applies to Financial Consultants (FCs) and EIMs of the Tied Agency Channel at HDFC Life. The rules and processes for verification are based on the DPPM Department’s guidelines, under Standard T&C version 2.0, effective from 21 Nov 2024.
+
+Raw text:
+Bali Bliss — Contest Knowledge Base · Source: DPPM Department, HDFC Life · Applicable to FCs & EIMs of Tied Agency Channel · March 2026
+Generated for RAG-based retrieval. Standard T&C v2.0 effective 21 Nov 2024.

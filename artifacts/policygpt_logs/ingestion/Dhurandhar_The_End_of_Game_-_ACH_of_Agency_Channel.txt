@@ -1,0 +1,165 @@
+Source path: D:\policy-mgmt\data\durandhar_html\Dhurandhar_The End of Game - ACH of Agency Channel.html
+Title: Dhurandhar — The End Game | Knowledge Base
+Canonical title: dhurandhar — the end game | knowledge base
+Document type: document
+Version: unknown
+Effective date: unknown
+Tags: dhurandhar end, end game, game knowledge, knowledge base, agency channel, ach agency
+Audiences: none
+Keywords: dhurandhar, end, game, end_game, knowledge, dhurandhar_end, base, knowledge_base, agency, game_knowledge, channel, agency_channel, contest, one, block, per
+Section count: 12
+
+=== Document Summary ===
+Purpose:  
+Summarizes the structure, rules, timelines, and eligibility for the “Dhurandhar — The End Game” contest administered by HDFC Life’s Agency Channel, DPPM R&R Department.
+
+Scope:  
+Covers eligibility, contest issuers, objectives, deadlines (including original/revised values), participant groupings, sub-schemes, rules for participation, exceptions, and reward thresholds. Applies specifically to the Agency Channel; knowledge base generated from contest communication.
+
+Major Topics:  
+- Purpose, eligibility criteria, who qualifies/excluded, designation rules, and determination date  
+- Contest timelines: includes all dates, extensions, and revised deadlines  
+- Participant grouping by March Binder Target ranges  
+- Table-form summarized categories, thresholds, minimum floors, and cash rewards  
+- Status of sub-schemes: ‘Kick Start/Budget Achievers’ (closed as of 28 Feb '26), ‘Kick Start/Budget Busters’ (open till 31 Mar '26)  
+- Rules covering logins, conversions, persistency, product credits, measurement  
+- Scenarios where exceptions are categorically not granted  
+- Tax, claw-back, audit, payout, and exclusions (e.g. advance premium)  
+- Definitions of terms as per source, block-wise  
+- Interpretative guidance flagged for ambiguous or obscure topics
+
+Rules/Processes:  
+Tabular structure; category- and threshold-specific; detailed listing of relevant deadlines, groupings, and rules for rewarding and measuring. Explicit processes for login, measurement, crediting, and payout. Specific clauses for audit and tax handling.
+
+Exceptions:  
+Enumerated scenarios where exceptions are not permitted, presented in block-wise format.
+
+Key Entities:  
+HDFC Life, Agency Channel, DPPM R&R Department; Dhurandhar 1 sub-schemes (Kick Start/Budget Achievers, Budget Busters); contest participants.
+
+Version/Authority:  
+T&C Version 2.0 effective 21 Nov
+
+=== Section 1: Contest Overview § S1 ===
+Type: eligibility
+Tags: contest overview, overview s1, dhurandhar end, game knowledge, knowledge base
+Keywords: contest, contest_overview, overview_s1, knowledge, dhurandhar, end, dhurandhar_end, game, game_knowledge, base, knowledge_base, issued, eligible, its, contest_issued, issued_eligible
+Summary:
+Overview of the Dhurandhar — The End Game contest, including its issuer, eligibility criteria, and intended purpose.
+
+Raw text:
+What this contest is, who issued it, who is eligible, and its purpose.
+
+=== Section 2: Key Dates & Timeline § S2 ===
+Type: timeline
+Tags: dates timeline, timeline s2, key dates, dhurandhar end, game knowledge
+Keywords: dates, timeline, key, key_dates, dates_timeline, timeline_s2, dhurandhar, end, dhurandhar_end, game, knowledge, game_knowledge, every, date, deadline, window
+Summary:
+Summary:
+Section details all important dates, deadlines, event windows, and any extensions for Dhurandhar — The End Game Season 2, specifying both original and revised values when changes occur.
+
+Raw text:
+Every date, deadline, window, and extension — revised values show original and new.
+
+=== Section 3: Eligibility & Audience § S3 ===
+Type: eligibility
+Tags: eligibility audience, audience s3, dhurandhar end, game knowledge, knowledge base
+Keywords: eligibility, audience, eligibility_audience, audience_s3, knowledge, dhurandhar, end, dhurandhar_end, game, game_knowledge, base, knowledge_base, qualifies, excluded, designation, determination
+Summary:
+Outlines the criteria for who is eligible or excluded from participation in "Dhurandhar — The End Game," detailing designation rules and specifying the date on which eligibility is determined.
+
+Raw text:
+Who qualifies, who is excluded, designation rules, and eligibility determination date.
+
+=== Section 4: Category Classification § S4 ===
+Type: general
+Tags: category classification, classification s4, dhurandhar end, game knowledge, knowledge base
+Keywords: classification, category, category_classification, classification_s4, end, game, knowledge, dhurandhar, dhurandhar_end, game_knowledge, base, knowledge_base, participants, grouped, based, march
+Summary:
+Describes how participants are classified into categories for the End Game based on their March Binder Target ranges.
+
+Raw text:
+How participants are grouped based on March Binder Target ranges for the End Game.
+
+=== Section 5: Reward Slab Details — The End Game § S5 ===
+Type: general
+Tags: end game, slab details, reward slab, details end, game s5
+Keywords: reward, slab, details, end, game, reward_slab, slab_details, details_end, end_game, game_s5, one, block, per, table, row, every
+Summary:
+Summarizes the reward slab structure for "The End Game" in Dhurandhar, detailing each table row as a block. Specifies all categories, thresholds, minimum floors, and cash rewards explicitly.
+
+Raw text:
+One block per table row. Every category, threshold, minimum floor, and cash reward stated in full.
+
+=== Section 6: Reward Slabs — Dhurandhar 1: Budget Achievers § S5B ===
+Type: general
+Tags: dhurandhar, slabs dhurandhar, budget achievers, achievers s5b, reward slabs
+Keywords: dhurandhar, achievers, slabs, budget, budget_achievers, reward, s5b, reward_slabs, slabs_dhurandhar, dhurandhar_1, achievers_s5b, 1_budget, leadership, kick, start, sub
+Summary:
+The Dhurandhar 1: Budget Achievers sub-scheme, part of the Leadership: Kick Start initiative, is now closed as the contest period ended on 28 February 2026.
+
+Raw text:
+Dhurandhar 1 — Leadership: Kick Start / Budget Achievers sub-scheme. Status: CLOSED (contest period ended 28 Feb '26).
+
+=== Section 7: Reward Slabs — Dhurandhar 1: Budget Busters § S5C ===
+Type: general
+Tags: dhurandhar, slabs dhurandhar, budget busters, reward slabs, dhurandhar 1
+Keywords: dhurandhar, slabs, budget, busters, dhurandhar_1, budget_busters, reward, reward_slabs, slabs_dhurandhar, s5c, 1_budget, busters_s5c, leadership, kick, start, sub
+Summary:
+The "Dhurandhar 1 — Leadership: Kick Start / Budget Busters" sub-scheme is currently open until March 31, 2026, under the Budget Busters reward slabs.
+
+Raw text:
+Dhurandhar 1 — Leadership: Kick Start / Budget Busters sub-scheme. Status: STILL OPEN till 31st Mar '26.
+
+=== Section 8: Contest Rules & Conditions § S6 ===
+Type: general
+Tags: rules conditions, contest rules, conditions s6, dhurandhar end, game knowledge
+Keywords: conditions, contest, contest_rules, rules_conditions, conditions_s6, dhurandhar, end, dhurandhar_end, game, knowledge, game_knowledge, login, conversion, persistency, product, credits
+Summary:
+Section S6 outlines the contest rules and conditions for Dhurandhar — The End Game, covering login rules, conversion rules, persistency requirements, product credits, and measurement rules.
+
+Raw text:
+Login rules, conversion rules, persistency, product credits, and measurement rules.
+
+=== Section 9: No Exception Policy § S7 ===
+Type: exceptions
+Tags: exception policy, no exception, policy s7, dhurandhar end, game knowledge
+Keywords: exception, no_exception, exception_policy, policy_s7, scenario, dhurandhar, end, dhurandhar_end, game, knowledge, game_knowledge, each, granted, one, block, per
+Summary:
+Section S7 ("No Exception Policy") lists scenarios where no exceptions are granted, with each scenario presented in a separate block. The section establishes strict, scenario-specific rules that do not allow for exceptions.
+
+Raw text:
+Each scenario where no exception will be granted — one block per scenario.
+
+=== Section 10: Reward Payout Conditions § S8 ===
+Type: timeline
+Tags: payout conditions, reward payout, conditions s8, dhurandhar end, game knowledge
+Keywords: payout, conditions, reward, reward_payout, payout_conditions, conditions_s8, dhurandhar, end, dhurandhar_end, game, knowledge, game_knowledge, tax, treatment, claw, back
+Summary:
+Summary:
+Section S8 outlines the conditions for reward payouts, including tax treatment, potential claw-back provisions, audit timelines, exclusions for advance premiums, and specific payout rules.
+
+Raw text:
+Tax treatment, claw-back, audit timeline, advance premium exclusions, and payout rules.
+
+=== Section 11: Key Definitions § S9 ===
+Type: definitions
+Tags: key definitions, definitions s9, dhurandhar end, game knowledge, knowledge base
+Keywords: key, key_definitions, definitions_s9, knowledge, dhurandhar, end, dhurandhar_end, game, game_knowledge, base, knowledge_base, one, block, per, term, full
+Summary:
+Section S9 provides formal, one-block, full-sentence definitions of key terms used in the Dhurandhar — The End Game document, as stated in the source material.
+
+Raw text:
+One block per term — full sentence definition as stated in the source document.
+
+=== Section 12: Items Requiring Verification § S10 ===
+Type: contact
+Tags: requiring verification, verification s10, items requiring, dhurandhar end, game knowledge
+Keywords: items, requiring, verification, s10, items_requiring, requiring_verification, verification_s10, dhurandhar, end, dhurandhar_end, game, knowledge, dppm, department, dppm_department, game_knowledge
+Summary:
+Section S10 outlines that any items which are ambiguous, partially obscured, or not explicitly stated require verification, and interpretations of such items are flagged for confirmation. For official clarifications, contact the DPPM (R&R) department. Terms & Conditions Version 2.0 applies from 21 Nov 2024.
+
+Raw text:
+Ambiguous, partially obscured, or not explicitly stated items — interpretation used is flagged for confirmation.
+DHURANDHAR: THE END GAME · HDFC LIFE · AGENCY CHANNEL · DPPM R&R DEPARTMENT
+Knowledge Base generated from contest communication document. For official queries, contact DPPM (R&R) department. T&C Version 2.0 applicable w.e.f. 21 Nov 2024.
