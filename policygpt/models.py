@@ -19,6 +19,13 @@ class SectionRecord:
     source_path: str
     doc_id: str
     order_index: int
+    normalized_title: str = ""
+    section_type: str = "general"
+    metadata_tags: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    title_terms: list[str] = field(default_factory=list)
+    token_counts: dict[str, int] = field(default_factory=dict)
+    token_length: int = 0
 
 
 @dataclass
@@ -31,6 +38,17 @@ class DocumentRecord:
     summary: str
     summary_embedding: np.ndarray
     sections: list[SectionRecord] = field(default_factory=list)
+    normalized_title: str = ""
+    canonical_title: str = ""
+    document_type: str = "document"
+    version: str = ""
+    effective_date: str = ""
+    metadata_tags: list[str] = field(default_factory=list)
+    audiences: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    title_terms: list[str] = field(default_factory=list)
+    token_counts: dict[str, int] = field(default_factory=dict)
+    token_length: int = 0
 
 
 @dataclass

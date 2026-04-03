@@ -1,4 +1,6 @@
 import re
+import traceback
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -13,6 +15,7 @@ from policygpt.services.base import AIService
 from policygpt.services.bedrock_service import BedrockService
 from policygpt.services.file_extractor import FileExtractor
 from policygpt.services.openai_service import OpenAIService
+from policygpt.services.query_analyzer import QueryAnalysis, QueryAnalyzer
 from policygpt.services.redaction import Redactor
 
 
@@ -30,6 +33,7 @@ class PolicyGPTBot:
         self.redactor = redactor or Redactor(config.redaction_rules)
         self.ai = ai or self._build_ai_service()
         self.extractor = extractor or FileExtractor(config)
+        self.query_analyzer = QueryAnalyzer()
         self.corpus = corpus or DocumentCorpus(
             config=config,
             extractor=self.extractor,
@@ -70,71 +74,125 @@ class PolicyGPTBot:
         return self.conversations.list_threads()
 
     def chat(self, thread_id: str, user_question: str) -> ChatResult:
-        if not self.documents:
-            raise RuntimeError("No documents ingested. Call ingest_folder() first.")
+        thread = None
+        query_analysis = None
+        retrieval_query = ""
+        top_docs = []
+        top_sections = []
+        prompt_payload = ""
+        sources: list[SourceReference] = []
+        try:
+            if not self.documents:
+                raise RuntimeError("No documents ingested. Call ingest_folder() first.")
 
-        thread = self.get_thread(thread_id)
-        first_user_message = not any(message.role == "user" for message in thread.display_messages)
-
-        retrieval_query = self._build_retrieval_query(thread, user_question)
-        masked_retrieval_query = self.redactor.mask_text(retrieval_query)
-        query_vec = self._embed_one(masked_retrieval_query)
-
-        top_docs = self.corpus.retrieve_top_docs(query_vec, preferred_doc_ids=thread.active_doc_ids)
-        top_sections = self.corpus.retrieve_top_sections(
-            query_vec,
-            top_docs,
-            preferred_section_ids=thread.active_section_ids,
-        )
-
-        prompt_payload = self._build_answer_context(
-            thread=thread,
-            user_question=user_question,
-            top_docs=top_docs,
-            top_sections=top_sections,
-        )
-
-        masked_answer = self.ai.llm_text(
-            system_prompt=self.redactor.mask_text(self._system_prompt()),
-            user_prompt=self.redactor.mask_text(prompt_payload),
-            max_output_tokens=self.config.chat_max_output_tokens,
-        )
-
-        sources = [
-            SourceReference(
-                document_title=self.documents[section.doc_id].title,
-                section_title=section.title,
-                source_path=section.source_path,
-                score=score,
+            thread = self.get_thread(thread_id)
+            first_user_message = not any(message.role == "user" for message in thread.display_messages)
+            active_document_titles = [
+                self.documents[doc_id].title
+                for doc_id in thread.active_doc_ids
+                if doc_id in self.documents
+            ]
+            query_analysis = self.query_analyzer.analyze(
+                user_question=user_question,
+                active_document_titles=active_document_titles,
+                candidate_documents=list(self.documents.values()),
             )
-            for section, score in top_sections[:3]
-        ]
-        final_answer = self._append_reference_file_names(
-            self._normalize_answer_markdown(self.redactor.unmask_text(masked_answer)),
-            sources,
-        )
 
-        thread.recent_messages.append(Message(role="user", content=user_question))
-        thread.recent_messages.append(Message(role="assistant", content=final_answer))
-        thread.recent_messages = thread.recent_messages[-self.config.max_recent_messages :]
-        thread.display_messages.append(Message(role="user", content=user_question))
-        thread.display_messages.append(Message(role="assistant", content=final_answer))
-        thread.active_doc_ids = [document.doc_id for document, _ in top_docs]
-        thread.active_section_ids = [section.section_id for section, _ in top_sections]
-        thread.current_topic = self._derive_thread_title(user_question, limit=90)
-        thread.last_answer_sources = sources
-        if first_user_message:
-            thread.title = self._derive_thread_title(user_question)
-        thread.updated_at = utc_now_iso()
+            retrieval_query = self._build_retrieval_query(thread, query_analysis)
+            masked_retrieval_query = self.redactor.mask_text(retrieval_query)
+            query_vec = self._embed_one(masked_retrieval_query)
 
-        if len(thread.recent_messages) >= self.config.summarize_after_turns:
-            thread.conversation_summary = self._refresh_conversation_summary(thread)
+            top_docs = self.corpus.retrieve_top_docs(
+                query_vec,
+                query_analysis=query_analysis,
+                preferred_doc_ids=thread.active_doc_ids,
+            )
+            top_sections = self.corpus.retrieve_top_sections(
+                query_vec,
+                query_analysis,
+                top_docs,
+                preferred_section_ids=thread.active_section_ids,
+            )
+            top_docs = self._merge_retrieved_documents(top_docs, top_sections)
 
-        return ChatResult(
-            thread_id=thread_id,
-            answer=final_answer,
-            sources=thread.last_answer_sources,
-        )
+            sources = [
+                SourceReference(
+                    document_title=self.documents[section.doc_id].title,
+                    section_title=section.title,
+                    source_path=section.source_path,
+                    score=score,
+                )
+                for section, score in top_sections
+            ]
+
+            is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
+            if is_answerable:
+                prompt_payload = self._build_answer_context(
+                    thread=thread,
+                    query_analysis=query_analysis,
+                    top_docs=top_docs,
+                    top_sections=top_sections,
+                )
+
+                masked_answer = self._llm_text_with_debug_log(
+                    purpose="chat_answer",
+                    system_prompt=self.redactor.mask_text(self._system_prompt()),
+                    user_prompt=self.redactor.mask_text(prompt_payload),
+                    max_output_tokens=self.config.chat_max_output_tokens,
+                )
+                answer_text = self._normalize_answer_markdown(self.redactor.unmask_text(masked_answer))
+            else:
+                answer_text = self._build_unanswerable_response(query_analysis, top_docs)
+
+            final_answer = self._append_reference_file_names(answer_text, sources)
+            self._write_retrieval_log(
+                thread_id=thread.thread_id,
+                user_question=user_question,
+                query_analysis=query_analysis,
+                retrieval_query=retrieval_query,
+                top_docs=top_docs,
+                top_sections=top_sections,
+                is_answerable=is_answerable,
+                prompt_payload=prompt_payload,
+                final_answer=final_answer,
+                sources=sources,
+            )
+
+            thread.recent_messages.append(Message(role="user", content=user_question))
+            thread.recent_messages.append(Message(role="assistant", content=final_answer))
+            thread.recent_messages = thread.recent_messages[-self.config.max_recent_messages :]
+            thread.display_messages.append(Message(role="user", content=user_question))
+            thread.display_messages.append(Message(role="assistant", content=final_answer))
+            thread.active_doc_ids = [document.doc_id for document, _ in top_docs]
+            thread.active_section_ids = [section.section_id for section, _ in top_sections]
+            topic_summary = ", ".join(query_analysis.topic_hints) if query_analysis.topic_hints else user_question
+            thread.current_topic = self._derive_thread_title(topic_summary, limit=90)
+            thread.last_answer_sources = sources
+            if first_user_message:
+                thread.title = self._derive_thread_title(user_question)
+            thread.updated_at = utc_now_iso()
+
+            if len(thread.recent_messages) >= self.config.summarize_after_turns:
+                thread.conversation_summary = self._refresh_conversation_summary(thread)
+
+            return ChatResult(
+                thread_id=thread_id,
+                answer=final_answer,
+                sources=thread.last_answer_sources,
+            )
+        except Exception as exc:
+            self._write_query_failure_log(
+                thread_id=thread_id,
+                user_question=user_question,
+                query_analysis=query_analysis,
+                retrieval_query=retrieval_query,
+                top_docs=top_docs,
+                top_sections=top_sections,
+                prompt_payload=prompt_payload,
+                sources=sources,
+                exc=exc,
+            )
+            raise
 
     def ask(self, thread_id: str, user_question: str) -> str:
         return self.chat(thread_id, user_question).answer
@@ -170,7 +228,7 @@ class PolicyGPTBot:
             "2. If the answer is not clearly present, say that it is not clearly stated in the provided documents.\n"
             "3. Be conversational but precise.\n"
             "4. Prefer the current conversation context when interpreting follow-up questions like 'what about this', 'same policy', 'that section'.\n"
-            "5. If multiple documents are relevant, separate them clearly.\n"
+            "5. When relevant evidence comes from multiple documents or sections, synthesize across them and call out any document-specific differences clearly.\n"
             "6. Mention section titles and file names when useful.\n"
             "7. Do not hallucinate.\n"
             "8. Format the answer in clean Markdown with short sections or bullets when helpful.\n"
@@ -183,8 +241,125 @@ class PolicyGPTBot:
             "15. Rewrite policy language into plain, user-friendly business English. Do not paste long policy wording back to the user.\n"
             "16. For list, eligibility, process, approval, and comparison questions, prefer short bullets with bold labels instead of long paragraphs.\n"
             "17. Avoid horizontal rules, deep heading hierarchies, raw policy numbering, and document-style formatting.\n"
-            "18. Do not add a separate source/citation section in the answer body. References are added separately."
+            "18. Do not add a separate source/citation section in the answer body. References are added separately.\n"
+            "19. Treat the question analysis as a retrieval aid, but only state things that are clearly supported by the evidence snippets.\n"
+            "20. If the evidence covers only part of the answer, answer only that part and say what is not clearly stated.\n"
+            "21. Prefer evidence snippets over broad summaries when they conflict.\n"
+            "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format."
         )
+
+    def _answer_format_guidance(self, query_analysis: QueryAnalysis) -> str:
+        detail_suffix = (
+            " Expand slightly with supporting details because the user explicitly asked for more detail."
+            if query_analysis.detail_requested
+            else " Keep it tight and focused."
+        )
+        if "comparison" in query_analysis.intents:
+            return (
+                "Start with the direct difference, then use short bullets for each item being compared. "
+                "Call out document-specific differences explicitly when the evidence comes from different sources."
+                + detail_suffix
+            )
+        if query_analysis.multi_doc_expected:
+            return (
+                "Start with the direct answer, then cover the relevant documents in short bullets. "
+                "Call out differences or gaps across documents explicitly."
+                + detail_suffix
+            )
+        if "document_lookup" in query_analysis.intents:
+            return (
+                "Start by naming the closest matching document. Then give a short, user-friendly summary of what it covers. "
+                "If the user appears to be asking only to locate the policy, keep the summary brief and point them to the reference."
+                + detail_suffix
+            )
+        if "approval" in query_analysis.intents:
+            return (
+                "Start with who approves, then use short bullets with bold labels for each approval path or threshold."
+                + detail_suffix
+            )
+        if "eligibility" in query_analysis.intents:
+            return "Start with who is eligible, then list conditions, exclusions, or exceptions in bullets." + detail_suffix
+        if "documents_required" in query_analysis.intents:
+            return (
+                "Start with the required documents, then use short bullets. Include timing only if clearly stated."
+                + detail_suffix
+            )
+        if "checklist" in query_analysis.intents or "process" in query_analysis.intents:
+            return (
+                "Start with a one-line answer, then use short action bullets in the order the user should follow."
+                + detail_suffix
+            )
+        if "timeline" in query_analysis.intents:
+            return "Lead with the timing or deadline, then list supporting conditions in bullets." + detail_suffix
+        return "Start with a direct answer. Use short bullets only when they make the answer clearer." + detail_suffix
+
+    def _is_answerable(
+        self,
+        query_analysis: QueryAnalysis,
+        top_docs: list[tuple],
+        top_sections: list[tuple],
+    ) -> bool:
+        if "document_lookup" in query_analysis.intents and top_docs:
+            best_document = top_docs[0][0]
+            if self.corpus.document_lookup_score(query_analysis, best_document) >= 0.55:
+                return True
+
+        if not top_sections:
+            return False
+
+        best_section, best_score = top_sections[0]
+        best_document = self.documents[best_section.doc_id]
+        if best_score < self.config.answerability_min_section_score:
+            return False
+
+        support_match_count = 0
+        supporting_doc_ids: set[str] = set()
+        for section, _ in top_sections:
+            snippets = self.corpus.extract_evidence_snippets(section, query_analysis, limit=2)
+            if any(
+                term.replace("_", " ") in re.sub(r"\s+", " ", snippet).casefold()
+                for term in (query_analysis.expanded_terms or query_analysis.focus_terms)
+                for snippet in snippets
+            ):
+                support_match_count += 1
+                supporting_doc_ids.add(section.doc_id)
+
+        if support_match_count < self.config.answerability_min_support_matches:
+            return False
+
+        if query_analysis.multi_doc_expected and len({document.doc_id for document, _ in top_docs}) > 1:
+            if len(supporting_doc_ids) < 2:
+                return False
+
+        section_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_section.metadata_tags)
+        document_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_document.metadata_tags)
+        if query_analysis.topic_hints and max(section_topic_alignment, document_topic_alignment) == 0.0:
+            # Allow this only if the lexical/title signals were still strong enough to put the section on top.
+            title_overlap = len(
+                set(best_section.title_terms + best_document.title_terms).intersection(
+                    query_analysis.expanded_terms or query_analysis.focus_terms
+                )
+            )
+            if title_overlap == 0:
+                return False
+
+        return True
+
+    def _build_unanswerable_response(self, query_analysis: QueryAnalysis, top_docs) -> str:
+        if top_docs:
+            suggested_title = top_docs[0][0].title
+            if query_analysis.topic_hints:
+                topic_text = ", ".join(topic.replace("_", " ") for topic in query_analysis.topic_hints)
+                return (
+                    f"I couldn't find a clear statement for this in the indexed evidence. "
+                    f"The closest policy area I found was {topic_text}, but the retrieved text does not clearly answer it. "
+                    f"The nearest document was: {suggested_title}."
+                )
+            return (
+                "I couldn't find a clear statement for this in the indexed evidence. "
+                f"The nearest document was: {suggested_title}."
+            )
+        return "I couldn't find a clear statement for this in the indexed evidence."
 
     def _append_reference_file_names(self, answer: str, sources: list[SourceReference]) -> str:
         reference_links: list[str] = []
@@ -237,7 +412,7 @@ class PolicyGPTBot:
             return cleaned
         return cleaned[: limit - 3].rstrip() + "..."
 
-    def _build_retrieval_query(self, thread, user_question: str) -> str:
+    def _build_retrieval_query(self, thread, query_analysis: QueryAnalysis) -> str:
         parts: list[str] = []
         if thread.conversation_summary:
             parts.append(f"Conversation summary: {thread.conversation_summary}")
@@ -247,13 +422,36 @@ class PolicyGPTBot:
             active_titles = [self.documents[doc_id].title for doc_id in thread.active_doc_ids if doc_id in self.documents]
             if active_titles:
                 parts.append(f"Current documents: {', '.join(active_titles)}")
-        parts.append(f"User question: {user_question}")
+        if query_analysis.topic_hints:
+            parts.append(f"Inferred policy topics: {', '.join(query_analysis.topic_hints)}")
+        if query_analysis.intents:
+            parts.append(f"Inferred user intent: {', '.join(query_analysis.intents)}")
+        if query_analysis.expanded_terms:
+            parts.append(f"Expanded terms: {', '.join(query_analysis.expanded_terms[:24])}")
+        parts.append(query_analysis.canonical_question)
         return "\n".join(parts)
+
+    def _merge_retrieved_documents(self, top_docs: list[tuple], top_sections: list[tuple]) -> list[tuple]:
+        doc_scores: dict[str, float] = {
+            document.doc_id: score
+            for document, score in top_docs
+        }
+        for section, score in top_sections:
+            if section.doc_id not in self.documents:
+                continue
+            doc_scores[section.doc_id] = max(doc_scores.get(section.doc_id, score), score)
+
+        ranked_doc_ids = sorted(doc_scores, key=lambda doc_id: doc_scores[doc_id], reverse=True)
+        return [
+            (self.documents[doc_id], doc_scores[doc_id])
+            for doc_id in ranked_doc_ids
+            if doc_id in self.documents
+        ]
 
     def _build_answer_context(
         self,
         thread,
-        user_question: str,
+        query_analysis: QueryAnalysis,
         top_docs,
         top_sections,
     ) -> str:
@@ -266,27 +464,333 @@ class PolicyGPTBot:
         for document, score in top_docs:
             doc_context_parts.append(
                 f"[Document: {document.title} | Score: {score:.4f} | File: {document.source_path}]\n"
+                f"Metadata: type={document.document_type or 'document'}; "
+                f"tags={', '.join(document.metadata_tags) or 'none'}; "
+                f"audience={', '.join(document.audiences) or 'none'}; "
+                f"version={document.version or 'unknown'}; "
+                f"effective_date={document.effective_date or 'unknown'}\n"
                 f"Document summary:\n{self.redactor.unmask_text(document.summary)}"
             )
 
         section_context_parts = []
         for section, score in top_sections:
             document = self.documents[section.doc_id]
+            evidence_snippets = self.corpus.extract_evidence_snippets(section, query_analysis)
+            evidence_block = "\n".join(f"- {snippet}" for snippet in evidence_snippets) or "- No focused snippet extracted."
             section_context_parts.append(
                 f"[Document: {document.title} | Section: {section.title} | Score: {score:.4f} | File: {section.source_path}]\n"
+                f"Section type: {section.section_type or 'general'} | Tags: {', '.join(section.metadata_tags) or 'none'}\n"
                 f"Section summary:\n{self.redactor.unmask_text(section.summary)}\n\n"
-                f"Original section text:\n{section.raw_text}"
+                f"Relevant evidence snippets:\n{evidence_block}"
             )
 
         return (
             f"Conversation summary:\n{thread.conversation_summary or 'None'}\n\n"
             f"Recent chat:\n{recent_chat}\n\n"
-            f"User question:\n{user_question}\n\n"
+            f"Question analysis:\n{query_analysis.canonical_question}\n\n"
+            f"Answer format guidance:\n{self._answer_format_guidance(query_analysis)}\n\n"
             f"Retrieved document context:\n{chr(10).join(doc_context_parts)}\n\n"
             f"Retrieved section evidence:\n{chr(10).join(section_context_parts)}\n\n"
             "Answer the user conversationally, but ground every claim in the provided evidence. "
-            "Synthesize the policy into a clean, readable answer instead of copying document structure or wording."
+            "Synthesize the policy into a clean, readable answer instead of copying document structure or wording. "
+            "When multiple documents contribute, combine the overlapping evidence and point out any differences instead of flattening them into one rule."
         )
+
+    def _write_retrieval_log(
+        self,
+        thread_id: str,
+        user_question: str,
+        query_analysis: QueryAnalysis,
+        retrieval_query: str,
+        top_docs,
+        top_sections,
+        is_answerable: bool,
+        prompt_payload: str,
+        final_answer: str,
+        sources: list[SourceReference],
+    ) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        retrieval_dir = log_root / "retrieval"
+        retrieval_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = self._safe_log_name(utc_now_iso())
+        file_name = f"{timestamp}_{self._safe_log_name(thread_id)}.txt"
+        output_path = retrieval_dir / file_name
+
+        lines: list[str] = [
+            f"Thread ID: {thread_id}",
+            f"User question: {user_question}",
+            "",
+            "=== Query Analysis ===",
+            query_analysis.canonical_question,
+            "",
+            "=== Retrieval Query ===",
+            retrieval_query,
+            "",
+            "=== Top Documents ===",
+        ]
+
+        if top_docs:
+            for index, (document, score) in enumerate(top_docs, start=1):
+                lines.extend(
+                    [
+                        f"{index}. {document.title} | score={score:.4f} | file={document.source_path}",
+                        f"   type={document.document_type or 'document'} | tags={', '.join(document.metadata_tags) or 'none'} | audience={', '.join(document.audiences) or 'none'}",
+                        f"   summary={self.redactor.unmask_text(document.summary).strip() or '(empty)'}",
+                    ]
+                )
+        else:
+            lines.append("(none)")
+
+        lines.extend(["", "=== Top Sections ==="])
+        if top_sections:
+            for index, (section, score) in enumerate(top_sections, start=1):
+                document = self.documents[section.doc_id]
+                snippets = self.corpus.extract_evidence_snippets(section, query_analysis)
+                lines.extend(
+                    [
+                        f"{index}. {document.title} :: {section.title} | score={score:.4f} | file={section.source_path}",
+                        f"   type={section.section_type or 'general'} | tags={', '.join(section.metadata_tags) or 'none'}",
+                        f"   summary={self.redactor.unmask_text(section.summary).strip() or '(empty)'}",
+                        "   snippets:",
+                    ]
+                )
+                if snippets:
+                    lines.extend([f"   - {snippet}" for snippet in snippets])
+                else:
+                    lines.append("   - (none)")
+        else:
+            lines.append("(none)")
+
+        lines.extend(
+            [
+                "",
+                "=== Decision ===",
+                f"Answerable: {'yes' if is_answerable else 'no'}",
+                "",
+            ]
+        )
+
+        if prompt_payload.strip():
+            lines.extend(
+                [
+                    "=== Prompt Payload ===",
+                    prompt_payload,
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                "=== Final Answer ===",
+                final_answer,
+                "",
+                "=== Sources ===",
+            ]
+        )
+        if sources:
+            lines.extend(
+                [
+                    f"- {source.document_title} :: {source.section_title} | score={source.score:.4f} | file={source.source_path}"
+                    for source in sources
+                ]
+            )
+        else:
+            lines.append("(none)")
+
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+    def _write_query_failure_log(
+        self,
+        thread_id: str,
+        user_question: str,
+        query_analysis: QueryAnalysis | None,
+        retrieval_query: str,
+        top_docs,
+        top_sections,
+        prompt_payload: str,
+        sources: list[SourceReference],
+        exc: Exception,
+    ) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        failure_dir = log_root / "retrieval_failures"
+        failure_dir.mkdir(parents=True, exist_ok=True)
+        output_path = failure_dir / f"{uuid.uuid4()}.txt"
+        lines: list[str] = [
+            f"Thread ID: {thread_id}",
+            f"User question: {user_question}",
+            f"Error: {type(exc).__name__}: {exc}",
+            "",
+        ]
+
+        if query_analysis is not None:
+            lines.extend(
+                [
+                    "=== Query Analysis ===",
+                    query_analysis.canonical_question,
+                    "",
+                ]
+            )
+
+        if retrieval_query.strip():
+            lines.extend(
+                [
+                    "=== Retrieval Query ===",
+                    retrieval_query,
+                    "",
+                ]
+            )
+
+        lines.append("=== Top Documents ===")
+        if top_docs:
+            lines.extend(
+                [
+                    f"- {document.title} | score={score:.4f} | file={document.source_path}"
+                    for document, score in top_docs
+                ]
+            )
+        else:
+            lines.append("(none)")
+
+        lines.extend(["", "=== Top Sections ==="])
+        if top_sections:
+            lines.extend(
+                [
+                    f"- {self.documents[section.doc_id].title} :: {section.title} | score={score:.4f} | file={section.source_path}"
+                    for section, score in top_sections
+                    if section.doc_id in self.documents
+                ]
+            )
+        else:
+            lines.append("(none)")
+
+        if prompt_payload.strip():
+            lines.extend(
+                [
+                    "",
+                    "=== Prompt Payload ===",
+                    prompt_payload,
+                ]
+            )
+
+        lines.extend(
+            [
+                "",
+                "=== Sources ===",
+            ]
+        )
+        if sources:
+            lines.extend(
+                [
+                    f"- {source.document_title} :: {source.section_title} | score={source.score:.4f} | file={source.source_path}"
+                    for source in sources
+                ]
+            )
+        else:
+            lines.append("(none)")
+
+        lines.extend(
+            [
+                "",
+                "=== Traceback ===",
+                traceback.format_exc().strip() or f"{type(exc).__name__}: {exc}",
+            ]
+        )
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+    def _resolve_debug_log_dir(self) -> Path | None:
+        if not self.config.debug:
+            return None
+        raw_path = (self.config.debug_log_dir or "").strip()
+        if not raw_path:
+            return None
+        base_path = Path(self.config.document_folder)
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = base_path / candidate
+        return candidate
+
+    @staticmethod
+    def _safe_log_name(value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+        return cleaned.strip("._") or "policygpt_log"
+
+    def _llm_text_with_debug_log(
+        self,
+        purpose: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_output_tokens: int,
+    ) -> str:
+        try:
+            response_text = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=max_output_tokens,
+            )
+        except Exception as exc:
+            self._write_llm_debug_log(
+                purpose=purpose,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_text="",
+                max_output_tokens=max_output_tokens,
+                error_text=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        self._write_llm_debug_log(
+            purpose=purpose,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_text=response_text,
+            max_output_tokens=max_output_tokens,
+        )
+        return response_text
+
+    def _write_llm_debug_log(
+        self,
+        purpose: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_text: str,
+        max_output_tokens: int,
+        error_text: str = "",
+    ) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        llm_dir = log_root / "llm"
+        llm_dir.mkdir(parents=True, exist_ok=True)
+        output_path = llm_dir / f"{uuid.uuid4()}.txt"
+        lines = [
+            f"Purpose: {purpose}",
+            f"Model provider: {self.config.ai_provider}",
+            f"Max output tokens: {max_output_tokens}",
+            "",
+            "=== System Prompt ===",
+            self.redactor.unmask_text(system_prompt).strip() or "(empty)",
+            "",
+            "=== User Prompt ===",
+            self.redactor.unmask_text(user_prompt).strip() or "(empty)",
+            "",
+            "=== Response ===",
+            self.redactor.unmask_text(response_text).strip() or "(empty)",
+        ]
+        if error_text:
+            lines.extend(
+                [
+                    "",
+                    "=== Error ===",
+                    error_text,
+                ]
+            )
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
     def _refresh_conversation_summary(self, thread) -> str:
         recent_chat = "\n".join(f"{message.role.upper()}: {message.content}" for message in thread.recent_messages)
@@ -295,7 +799,8 @@ class PolicyGPTBot:
             "Capture current document, current topic, key answered points, and unresolved questions. "
             "Be concise and factual."
         )
-        summary = self.ai.llm_text(
+        summary = self._llm_text_with_debug_log(
+            purpose="conversation_summary",
             system_prompt=self.redactor.mask_text(system_prompt),
             user_prompt=self.redactor.mask_text(recent_chat),
             max_output_tokens=self.config.conversation_summary_max_output_tokens,

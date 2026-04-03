@@ -1,15 +1,21 @@
 import re
+import traceback
 import uuid
+from collections import Counter
+from math import log
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
 from policygpt.config import Config
-from policygpt.models import DocumentRecord, SectionRecord
+from policygpt.models import DocumentRecord, SectionRecord, utc_now_iso
 from policygpt.services.base import AIRequestTooLargeError, AIService
 from policygpt.services.file_extractor import FileExtractor
+from policygpt.services.metadata_extractor import MetadataExtractor
+from policygpt.services.query_analyzer import QueryAnalysis
 from policygpt.services.redaction import Redactor
+from policygpt.services.taxonomy import keywordize_text, normalize_text, tokenize_text, unique_preserving_order
 
 
 ProgressCallback = Callable[[int, int, str | None, int, int], None]
@@ -38,6 +44,7 @@ class DocumentCorpus:
         self.extractor = extractor
         self.ai = ai
         self.redactor = redactor
+        self.metadata_extractor = MetadataExtractor()
 
         self.documents: dict[str, DocumentRecord] = {}
         self.sections: dict[str, SectionRecord] = {}
@@ -45,6 +52,30 @@ class DocumentCorpus:
         self.doc_embedding_matrix: np.ndarray | None = None
         self.section_ids: list[str] = []
         self.section_embedding_matrix: np.ndarray | None = None
+        self.doc_term_doc_freq: dict[str, int] = {}
+        self.section_term_doc_freq: dict[str, int] = {}
+        self.avg_doc_token_length = 0.0
+        self.avg_section_token_length = 0.0
+        self._active_ingestion_run_id: str | None = None
+
+    TOPIC_ALIGNMENT_IGNORED_TOKENS: set[str] = {
+        "policy",
+        "policies",
+        "document",
+        "documents",
+        "process",
+        "processes",
+        "procedure",
+        "procedures",
+        "checklist",
+        "checklists",
+        "guideline",
+        "guidelines",
+        "manual",
+        "matrix",
+        "form",
+        "forms",
+    }
 
     def ingest_folder(
         self,
@@ -53,45 +84,84 @@ class DocumentCorpus:
     ) -> None:
         file_paths = self.list_supported_policy_files(folder_path)
         if not file_paths:
+            self._write_ingestion_failure_log(
+                source_path=folder_path,
+                stage="scan",
+                reason="No .html/.htm/.txt/.pdf files found in folder.",
+            )
             raise FileNotFoundError(f"No .html/.htm/.txt/.pdf files found in folder: {folder_path}")
 
         total_files = len(file_paths)
         self._emit_progress(progress_callback, 0, total_files, "Scanning policy files")
+        self._active_ingestion_run_id = str(uuid.uuid4())
+        self._write_ingestion_run_header(folder_path, file_paths)
 
-        for processed_files, path in enumerate(file_paths, start=1):
-            file_name = Path(path).name
-            self._emit_progress(
-                progress_callback,
-                processed_files - 1,
-                total_files,
-                f"{file_name} - reading file",
-            )
-            try:
-                self.ingest_file(
-                    path=path,
-                    progress_callback=progress_callback,
-                    processed_files=processed_files - 1,
-                    total_files=total_files,
-                )
+        try:
+            for processed_files, path in enumerate(file_paths, start=1):
+                file_name = Path(path).name
                 self._emit_progress(
                     progress_callback,
-                    processed_files,
+                    processed_files - 1,
                     total_files,
-                    f"{file_name} - completed",
+                    f"{file_name} - reading file",
                 )
-            except Exception as exc:
-                self._emit_progress(
-                    progress_callback,
-                    processed_files,
-                    total_files,
-                    f"{file_name} - skipped after error: {self._format_error_for_progress(exc)}",
-                )
-                if self.config.debug:
-                    print(f"Skipped document after error: {path}")
-                    print(f"  {type(exc).__name__}: {exc}")
+                try:
+                    status, detail = self.ingest_file(
+                        path=path,
+                        progress_callback=progress_callback,
+                        processed_files=processed_files - 1,
+                        total_files=total_files,
+                    )
+                    if status == "ingested":
+                        self._emit_progress(
+                            progress_callback,
+                            processed_files,
+                            total_files,
+                            f"{file_name} - completed",
+                        )
+                    else:
+                        self._append_ingestion_index_entry(
+                            source_path=path,
+                            status=status,
+                            detail=detail,
+                        )
+                        self._write_ingestion_failure_log(
+                            source_path=path,
+                            stage="ingest_file",
+                            reason=detail,
+                        )
+                        self._emit_progress(
+                            progress_callback,
+                            processed_files,
+                            total_files,
+                            f"{file_name} - {detail}",
+                        )
+                except Exception as exc:
+                    self._append_ingestion_index_entry(
+                        source_path=path,
+                        status="failed",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                    self._write_ingestion_failure_log(
+                        source_path=path,
+                        stage="ingest_file",
+                        reason=f"{type(exc).__name__}: {exc}",
+                        exc=exc,
+                    )
+                    self._emit_progress(
+                        progress_callback,
+                        processed_files,
+                        total_files,
+                        f"{file_name} - skipped after error: {self._format_error_for_progress(exc)}",
+                    )
+                    if self.config.debug:
+                        print(f"Skipped document after error: {path}")
+                        print(f"  {type(exc).__name__}: {exc}")
 
-        self._emit_progress(progress_callback, total_files, total_files, "Building retrieval indexes")
-        self.rebuild_indexes()
+            self._emit_progress(progress_callback, total_files, total_files, "Building retrieval indexes")
+            self.rebuild_indexes()
+        finally:
+            self._active_ingestion_run_id = None
 
     def ingest_file(
         self,
@@ -99,7 +169,7 @@ class DocumentCorpus:
         progress_callback: ProgressCallback | None = None,
         processed_files: int = 0,
         total_files: int = 0,
-    ) -> None:
+    ) -> tuple[str, str]:
         path_obj = Path(path)
         file_name = path_obj.name
         extension = path_obj.suffix.lower()
@@ -112,7 +182,7 @@ class DocumentCorpus:
         )
 
         if extension not in {".html", ".htm", ".txt", ".pdf"}:
-            return
+            return ("skipped", f"unsupported file extension: {extension or 'none'}")
 
         title, sections = self.extractor.extract(path)
         full_text = "\n\n".join(text for _, text in sections).strip()
@@ -124,10 +194,11 @@ class DocumentCorpus:
                 total_files,
                 f"{file_name} - {skip_reason}",
             )
-            return
+            return ("skipped", skip_reason)
 
         masked_title = self.redactor.mask_text(title)
         masked_full_text = self.redactor.mask_text(full_text)
+        document_metadata = self.metadata_extractor.extract_document_metadata(path, title, full_text)
 
         self._emit_progress(
             progress_callback,
@@ -155,6 +226,17 @@ class DocumentCorpus:
             summary=document_summary,
             summary_embedding=document_embedding,
             sections=[],
+            normalized_title=document_metadata.normalized_title,
+            canonical_title=document_metadata.canonical_title,
+            document_type=document_metadata.document_type,
+            version=document_metadata.version,
+            effective_date=document_metadata.effective_date,
+            metadata_tags=document_metadata.tags,
+            audiences=document_metadata.audiences,
+            keywords=document_metadata.keywords,
+            title_terms=document_metadata.title_terms,
+            token_counts=document_metadata.token_counts,
+            token_length=document_metadata.token_length,
         )
 
         valid_sections = [(section_title, section_text) for section_title, section_text in sections if section_text.strip()]
@@ -171,6 +253,7 @@ class DocumentCorpus:
 
             masked_section_title = self.redactor.mask_text(section_title)
             masked_section_text = self.redactor.mask_text(section_text)
+            section_metadata = self.metadata_extractor.extract_section_metadata(title, section_title, section_text)
             try:
                 section_summary = self._create_section_summary(
                     doc_title=masked_title,
@@ -191,6 +274,12 @@ class DocumentCorpus:
                 if self.config.debug:
                     print(f"Skipped section in {path}: {section_title}")
                     print(f"  {type(exc).__name__}: {exc}")
+                self._write_ingestion_failure_log(
+                    source_path=path,
+                    stage="section_summary",
+                    reason=f"Skipped section '{section_title}': {type(exc).__name__}: {exc}",
+                    exc=exc,
+                )
                 continue
 
             section_id = str(uuid.uuid4())
@@ -204,11 +293,19 @@ class DocumentCorpus:
                 source_path=path,
                 doc_id=document_id,
                 order_index=index - 1,
+                normalized_title=section_metadata.normalized_title,
+                section_type=section_metadata.section_type,
+                metadata_tags=section_metadata.tags,
+                keywords=section_metadata.keywords,
+                title_terms=section_metadata.title_terms,
+                token_counts=section_metadata.token_counts,
+                token_length=section_metadata.token_length,
             )
             document.sections.append(section)
             self.sections[section_id] = section
 
         self.documents[document_id] = document
+        self._write_ingestion_log(document)
         self._emit_progress(
             progress_callback,
             processed_files,
@@ -220,43 +317,102 @@ class DocumentCorpus:
             print(f"Ingested: {path}")
             print(f"  Title: {title}")
             print(f"  Sections: {len(document.sections)}")
+        return ("ingested", f"ingested with {len(document.sections)} sections")
 
     def rebuild_indexes(self) -> None:
         self.doc_ids = []
         doc_vectors: list[np.ndarray] = []
+        doc_token_lengths: list[int] = []
+        self.doc_term_doc_freq = {}
         for doc_id, document in self.documents.items():
             self.doc_ids.append(doc_id)
             doc_vectors.append(document.summary_embedding)
+            doc_token_lengths.append(document.token_length)
+            for term in document.token_counts:
+                self.doc_term_doc_freq[term] = self.doc_term_doc_freq.get(term, 0) + 1
 
         self.section_ids = []
         section_vectors: list[np.ndarray] = []
+        section_token_lengths: list[int] = []
+        self.section_term_doc_freq = {}
         for section_id, section in self.sections.items():
             self.section_ids.append(section_id)
             section_vectors.append(section.summary_embedding)
+            section_token_lengths.append(section.token_length)
+            for term in section.token_counts:
+                self.section_term_doc_freq[term] = self.section_term_doc_freq.get(term, 0) + 1
 
         self.doc_embedding_matrix = np.vstack(doc_vectors) if doc_vectors else None
         self.section_embedding_matrix = np.vstack(section_vectors) if section_vectors else None
+        self.avg_doc_token_length = float(sum(doc_token_lengths) / len(doc_token_lengths)) if doc_token_lengths else 0.0
+        self.avg_section_token_length = (
+            float(sum(section_token_lengths) / len(section_token_lengths))
+            if section_token_lengths
+            else 0.0
+        )
 
     def retrieve_top_docs(
         self,
         query_vec: np.ndarray,
+        query_analysis: QueryAnalysis,
         preferred_doc_ids: list[str] | None = None,
     ) -> list[tuple[DocumentRecord, float]]:
         if self.doc_embedding_matrix is None or not self.doc_ids:
             return []
 
-        scores = cosine_similarity(query_vec, self.doc_embedding_matrix)
+        semantic_scores = {
+            doc_id: float(score)
+            for doc_id, score in zip(self.doc_ids, cosine_similarity(query_vec, self.doc_embedding_matrix))
+        }
+        lexical_scores = {
+            doc_id: self._bm25_score(
+                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
+                token_counts=self.documents[doc_id].token_counts,
+                token_length=self.documents[doc_id].token_length,
+                doc_freq=self.doc_term_doc_freq,
+                total_items=len(self.doc_ids),
+                average_length=self.avg_doc_token_length,
+            )
+            for doc_id in self.doc_ids
+        }
+        title_scores = {
+            doc_id: self._term_overlap_score(
+                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
+                candidate_terms=self.documents[doc_id].title_terms + self.documents[doc_id].keywords,
+            )
+            for doc_id in self.doc_ids
+        }
+        metadata_scores = {
+            doc_id: self._document_metadata_score(query_analysis, self.documents[doc_id])
+            for doc_id in self.doc_ids
+        }
+        lookup_scores = {
+            doc_id: self._document_lookup_score(query_analysis, self.documents[doc_id])
+            for doc_id in self.doc_ids
+        }
+
+        semantic_norm = self._normalize_score_map(semantic_scores)
+        lexical_norm = self._normalize_score_map(lexical_scores)
+        title_norm = self._normalize_score_map(title_scores)
         preferred_set = set(preferred_doc_ids or [])
         rescored: list[tuple[str, float]] = []
 
-        for index, doc_id in enumerate(self.doc_ids):
-            score = float(scores[index])
+        for doc_id in self.doc_ids:
+            score = (
+                self.config.doc_semantic_weight * semantic_norm.get(doc_id, 0.0)
+                + self.config.doc_lexical_weight * lexical_norm.get(doc_id, 0.0)
+                + self.config.doc_title_weight * title_norm.get(doc_id, 0.0)
+                + self.config.doc_metadata_weight * metadata_scores.get(doc_id, 0.0)
+            )
+            if "document_lookup" in query_analysis.intents:
+                score += 0.22 * lookup_scores.get(doc_id, 0.0)
             if doc_id in preferred_set:
                 score += 0.08
             rescored.append((doc_id, score))
 
         rescored.sort(key=lambda item: item[1], reverse=True)
-        results = [(self.documents[doc_id], score) for doc_id, score in rescored[: self.config.top_docs]]
+        doc_limit = self._doc_limit_for_query(query_analysis)
+        results = [(self.documents[doc_id], score) for doc_id, score in rescored[:doc_limit]]
 
         if self.config.debug:
             print("\nTop documents:")
@@ -268,34 +424,60 @@ class DocumentCorpus:
     def retrieve_top_sections(
         self,
         query_vec: np.ndarray,
+        query_analysis: QueryAnalysis,
         top_docs: list[tuple[DocumentRecord, float]],
         preferred_section_ids: list[str] | None = None,
     ) -> list[tuple[SectionRecord, float]]:
+        if self.section_embedding_matrix is None or not self.section_ids:
+            return []
+
         preferred_set = set(preferred_section_ids or [])
-        candidate_sections: list[tuple[SectionRecord, float]] = []
+        doc_score_lookup = {document.doc_id: score for document, score in top_docs}
+        candidate_scores: dict[str, float] = {}
 
-        for document, document_score in top_docs:
-            if not document.sections:
-                continue
+        per_doc_candidate_limit = self._per_doc_section_limit_for_query(query_analysis)
+        for document, _ in top_docs:
+            local_pairs = self._score_sections(
+                query_vec=query_vec,
+                query_analysis=query_analysis,
+                section_ids=[section.section_id for section in document.sections],
+                preferred_section_ids=preferred_set,
+                doc_score_lookup=doc_score_lookup,
+            )
+            for section, score in local_pairs[:per_doc_candidate_limit]:
+                candidate_scores[section.section_id] = max(candidate_scores.get(section.section_id, score), score)
 
-            section_ids = [section.section_id for section in document.sections]
-            section_vectors = np.vstack([self.sections[section_id].summary_embedding for section_id in section_ids])
-            local_scores = cosine_similarity(query_vec, section_vectors)
+        rerank_limit = self._rerank_limit_for_query(query_analysis)
+        result_limit = self._section_result_limit_for_query(query_analysis)
+        global_candidate_limit = max(
+            rerank_limit * 2,
+            result_limit * 4,
+        )
+        global_pairs = self._score_sections(
+            query_vec=query_vec,
+            query_analysis=query_analysis,
+            section_ids=self.section_ids,
+            preferred_section_ids=preferred_set,
+            doc_score_lookup=doc_score_lookup,
+        )
+        for section, score in global_pairs[:global_candidate_limit]:
+            candidate_scores[section.section_id] = max(candidate_scores.get(section.section_id, score), score)
 
-            local_pairs: list[tuple[SectionRecord, float]] = []
-            for index, section_id in enumerate(section_ids):
-                section = self.sections[section_id]
-                score = float(local_scores[index])
-                score = (0.70 * score) + (0.30 * document_score)
-                if section_id in preferred_set:
-                    score += 0.08
-                local_pairs.append((section, score))
-
-            local_pairs.sort(key=lambda item: item[1], reverse=True)
-            candidate_sections.extend(local_pairs[: self.config.top_sections_per_doc])
-
+        candidate_sections = [
+            (self.sections[section_id], score)
+            for section_id, score in candidate_scores.items()
+            if section_id in self.sections
+        ]
         candidate_sections.sort(key=lambda item: item[1], reverse=True)
-        results = candidate_sections[: self.config.max_sections_to_llm]
+        reranked_sections = self._rerank_sections(
+            query_analysis=query_analysis,
+            candidate_sections=candidate_sections[:rerank_limit],
+        )
+        reranked_sections.sort(key=lambda item: item[1], reverse=True)
+        results = self._select_diverse_sections(
+            reranked_sections,
+            limit=result_limit,
+        )
 
         if self.config.debug:
             print("\nTop sections:")
@@ -303,6 +485,331 @@ class DocumentCorpus:
                 print(f"  {score:.4f} | {self.documents[section.doc_id].title} :: {section.title}")
 
         return results
+
+    def _doc_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
+        if query_analysis.multi_doc_expected:
+            return max(self.config.top_docs * 2, 6)
+        return self.config.top_docs
+
+    def _per_doc_section_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
+        base_limit = max(self.config.top_sections_per_doc, self.config.rerank_section_candidates)
+        if query_analysis.multi_doc_expected:
+            return max(base_limit, self.config.top_sections_per_doc * 2, 6)
+        return base_limit
+
+    def _rerank_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
+        if query_analysis.multi_doc_expected:
+            return max(self.config.rerank_section_candidates * 2, 24)
+        return self.config.rerank_section_candidates
+
+    def _section_result_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
+        if query_analysis.multi_doc_expected:
+            return max(self.config.max_sections_to_llm + 2, 6)
+        return self.config.max_sections_to_llm
+
+    def _score_sections(
+        self,
+        query_vec: np.ndarray,
+        query_analysis: QueryAnalysis,
+        section_ids: list[str],
+        preferred_section_ids: set[str],
+        doc_score_lookup: dict[str, float],
+    ) -> list[tuple[SectionRecord, float]]:
+        valid_section_ids = [section_id for section_id in section_ids if section_id in self.sections]
+        if not valid_section_ids:
+            return []
+
+        if valid_section_ids == self.section_ids and self.section_embedding_matrix is not None:
+            section_vectors = self.section_embedding_matrix
+        else:
+            section_vectors = np.vstack([self.sections[section_id].summary_embedding for section_id in valid_section_ids])
+
+        semantic_scores = {
+            section_id: float(score)
+            for section_id, score in zip(valid_section_ids, cosine_similarity(query_vec, section_vectors))
+        }
+        lexical_scores = {
+            section_id: self._bm25_score(
+                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
+                token_counts=self.sections[section_id].token_counts,
+                token_length=self.sections[section_id].token_length,
+                doc_freq=self.section_term_doc_freq,
+                total_items=len(self.section_ids),
+                average_length=self.avg_section_token_length,
+            )
+            for section_id in valid_section_ids
+        }
+        title_scores = {
+            section_id: self._term_overlap_score(
+                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
+                candidate_terms=self.sections[section_id].title_terms + self.sections[section_id].keywords,
+            )
+            for section_id in valid_section_ids
+        }
+        metadata_scores = {
+            section_id: self._section_metadata_score(
+                query_analysis,
+                self.sections[section_id],
+                self.documents[self.sections[section_id].doc_id],
+            )
+            for section_id in valid_section_ids
+        }
+
+        semantic_norm = self._normalize_score_map(semantic_scores)
+        lexical_norm = self._normalize_score_map(lexical_scores)
+        title_norm = self._normalize_score_map(title_scores)
+
+        scored_sections: list[tuple[SectionRecord, float]] = []
+        for section_id in valid_section_ids:
+            section = self.sections[section_id]
+            score = (
+                self.config.section_semantic_weight * semantic_norm.get(section_id, 0.0)
+                + self.config.section_lexical_weight * lexical_norm.get(section_id, 0.0)
+                + self.config.section_parent_weight * doc_score_lookup.get(section.doc_id, 0.0)
+                + self.config.section_title_weight * title_norm.get(section_id, 0.0)
+                + self.config.section_metadata_weight * metadata_scores.get(section_id, 0.0)
+            )
+            if section_id in preferred_section_ids:
+                score += 0.08
+            scored_sections.append((section, score))
+
+        scored_sections.sort(key=lambda item: item[1], reverse=True)
+        return scored_sections
+
+    @staticmethod
+    def _select_diverse_sections(
+        scored_sections: list[tuple[SectionRecord, float]],
+        limit: int,
+    ) -> list[tuple[SectionRecord, float]]:
+        if limit <= 0 or not scored_sections:
+            return []
+
+        first_per_doc: list[tuple[SectionRecord, float]] = []
+        overflow: list[tuple[SectionRecord, float]] = []
+        seen_doc_ids: set[str] = set()
+        for section, score in scored_sections:
+            if section.doc_id in seen_doc_ids:
+                overflow.append((section, score))
+                continue
+            seen_doc_ids.add(section.doc_id)
+            first_per_doc.append((section, score))
+
+        return (first_per_doc + overflow)[:limit]
+
+    def extract_evidence_snippets(
+        self,
+        section: SectionRecord,
+        query_analysis: QueryAnalysis,
+        limit: int | None = None,
+    ) -> list[str]:
+        snippet_limit = limit or self.config.max_evidence_snippets_per_section
+        raw_parts = [part.strip() for part in re.split(r"\n+|(?<=[.!?])\s+", section.raw_text) if part.strip()]
+        if not raw_parts:
+            return []
+
+        query_terms = unique_preserving_order(query_analysis.expanded_terms + query_analysis.focus_terms + section.title_terms)
+        scored_parts: list[tuple[int, float, str]] = []
+        for index, part in enumerate(raw_parts):
+            score = 0.0
+            normalized_part = normalize_text(part)
+            for term in query_terms:
+                phrase = term.replace("_", " ")
+                if phrase and phrase in normalized_part:
+                    score += 1.8 if "_" in term else 1.0
+            if section.section_type in query_analysis.expected_section_types:
+                score += 0.6
+            score += 0.8 * self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
+            if score > 0:
+                scored_parts.append((index, score, part))
+
+        if not scored_parts:
+            fallback = section.raw_text.strip()
+            if not fallback:
+                return []
+            return [self._truncate_text(fallback, self.config.evidence_snippet_char_limit)]
+
+        scored_parts.sort(key=lambda item: (item[1], -item[0]), reverse=True)
+        selected = sorted(scored_parts[:snippet_limit], key=lambda item: item[0])
+        return [self._truncate_text(part, self.config.evidence_snippet_char_limit) for _, _, part in selected]
+
+    def _rerank_sections(
+        self,
+        query_analysis: QueryAnalysis,
+        candidate_sections: list[tuple[SectionRecord, float]],
+    ) -> list[tuple[SectionRecord, float]]:
+        reranked: list[tuple[SectionRecord, float]] = []
+        for section, base_score in candidate_sections:
+            document = self.documents[section.doc_id]
+            snippets = self.extract_evidence_snippets(section, query_analysis, limit=2)
+            snippet_terms = keywordize_text(" ".join(snippets))
+            snippet_overlap = self._term_overlap_score(
+                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
+                candidate_terms=snippet_terms,
+            )
+            section_type_boost = 1.0 if section.section_type in query_analysis.expected_section_types else 0.0
+            tag_boost = self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
+            title_alignment = self._term_overlap_score(
+                query_terms=query_analysis.focus_terms + query_analysis.topic_hints,
+                candidate_terms=section.title_terms + document.title_terms,
+            )
+            reranked_score = (
+                (0.72 * base_score)
+                + (0.14 * snippet_overlap)
+                + (0.08 * section_type_boost)
+                + (0.04 * tag_boost)
+                + (0.02 * title_alignment)
+            )
+            reranked.append((section, reranked_score))
+        return reranked
+
+    def _document_metadata_score(self, query_analysis: QueryAnalysis, document: DocumentRecord) -> float:
+        score = 0.0
+        score += 0.55 * self.topic_alignment_score(query_analysis.topic_hints, document.metadata_tags)
+        if set(document.audiences).intersection(query_analysis.focus_terms):
+            score += 0.15
+        if query_analysis.intents:
+            intent_set = set(query_analysis.intents)
+            if "approval" in intent_set and document.document_type in {"policy", "matrix"}:
+                score += 0.15
+            if intent_set.intersection({"checklist", "process"}) and document.document_type in {"policy", "process", "checklist"}:
+                score += 0.15
+        return min(score, 1.0)
+
+    def _section_metadata_score(
+        self,
+        query_analysis: QueryAnalysis,
+        section: SectionRecord,
+        document: DocumentRecord,
+    ) -> float:
+        score = 0.0
+        if section.section_type in query_analysis.expected_section_types:
+            score += 0.45
+        score += 0.25 * self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
+        score += 0.15 * self.topic_alignment_score(query_analysis.topic_hints, document.metadata_tags)
+        if set(document.audiences).intersection(query_analysis.focus_terms):
+            score += 0.15
+        return min(score, 1.0)
+
+    def document_lookup_score(self, query_analysis: QueryAnalysis, document: DocumentRecord) -> float:
+        return self._document_lookup_score(query_analysis, document)
+
+    def _document_lookup_score(self, query_analysis: QueryAnalysis, document: DocumentRecord) -> float:
+        if "document_lookup" not in query_analysis.intents:
+            return 0.0
+
+        query_text = normalize_text(query_analysis.original_question)
+        title_basis = document.canonical_title or document.title
+        normalized_title = normalize_text(title_basis)
+        title_tokens = {
+            token
+            for token in tokenize_text(title_basis)
+            if token not in {"policy", "policies", "document", "documents", "process", "processes"}
+        }
+        if not normalized_title and not title_tokens:
+            return 0.0
+
+        phrase_hit = 1.0 if normalized_title and normalized_title in query_text else 0.0
+        if not title_tokens:
+            return phrase_hit
+
+        query_tokens = set(tokenize_text(query_analysis.original_question))
+        token_coverage = len(query_tokens.intersection(title_tokens)) / len(title_tokens)
+        term_overlap = self._term_overlap_score(
+            query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
+            candidate_terms=document.title_terms + document.keywords,
+        )
+        return min(1.0, (0.5 * phrase_hit) + (0.35 * token_coverage) + (0.15 * term_overlap))
+
+    def topic_alignment_score(self, topic_hints: list[str], metadata_tags: list[str]) -> float:
+        if not topic_hints or not metadata_tags:
+            return 0.0
+
+        best_score = 0.0
+        for topic in topic_hints:
+            normalized_topic = normalize_text(topic)
+            topic_tokens = self._topic_alignment_tokens(topic)
+            for tag in metadata_tags:
+                normalized_tag = normalize_text(tag)
+                tag_tokens = self._topic_alignment_tokens(tag)
+
+                score = 0.0
+                if normalized_topic and normalized_tag and normalized_topic == normalized_tag:
+                    score = 1.0
+                elif normalized_topic and normalized_tag and (
+                    normalized_topic in normalized_tag or normalized_tag in normalized_topic
+                ):
+                    score = 0.82
+                elif topic_tokens and tag_tokens:
+                    overlap = len(topic_tokens.intersection(tag_tokens))
+                    if overlap > 0:
+                        score = overlap / max(len(topic_tokens), len(tag_tokens))
+                        if overlap == min(len(topic_tokens), len(tag_tokens)):
+                            score = max(score, 0.72)
+
+                if score > best_score:
+                    best_score = score
+        return best_score
+
+    @classmethod
+    def _topic_alignment_tokens(cls, text: str) -> set[str]:
+        return {
+            token
+            for token in tokenize_text(text)
+            if token not in cls.TOPIC_ALIGNMENT_IGNORED_TOKENS
+        }
+
+    def _bm25_score(
+        self,
+        query_terms: list[str],
+        token_counts: dict[str, int],
+        token_length: int,
+        doc_freq: dict[str, int],
+        total_items: int,
+        average_length: float,
+        k1: float = 1.2,
+        b: float = 0.75,
+    ) -> float:
+        if not query_terms or not token_counts or total_items <= 0:
+            return 0.0
+
+        average_length = average_length or max(float(token_length), 1.0)
+        score = 0.0
+        for term in unique_preserving_order(query_terms):
+            frequency = token_counts.get(term, 0)
+            if frequency <= 0:
+                continue
+            df = doc_freq.get(term, 0)
+            idf = log(1 + ((total_items - df + 0.5) / (df + 0.5))) if df >= 0 else 0.0
+            denominator = frequency + k1 * (1 - b + b * (token_length / average_length))
+            score += idf * ((frequency * (k1 + 1)) / denominator)
+        return score
+
+    @staticmethod
+    def _term_overlap_score(query_terms: list[str], candidate_terms: list[str]) -> float:
+        if not query_terms or not candidate_terms:
+            return 0.0
+        candidate_set = set(candidate_terms)
+        if not candidate_set:
+            return 0.0
+        query_set = set(unique_preserving_order(query_terms))
+        if not query_set:
+            return 0.0
+        return len(query_set.intersection(candidate_set)) / len(query_set)
+
+    @staticmethod
+    def _normalize_score_map(score_map: dict[str, float]) -> dict[str, float]:
+        if not score_map:
+            return {}
+        values = list(score_map.values())
+        min_value = min(values)
+        max_value = max(values)
+        if abs(max_value - min_value) < 1e-9:
+            normalized_value = 1.0 if max_value > 0 else 0.0
+            return {key: normalized_value for key in score_map}
+        return {
+            key: (value - min_value) / (max_value - min_value)
+            for key, value in score_map.items()
+        }
 
     def list_supported_policy_files(self, folder_path: str) -> list[str]:
         folder = Path(folder_path)
@@ -394,7 +901,8 @@ class DocumentCorpus:
             f"Document text:\n{masked_text}\n\n"
             "Return a concise summary suitable for semantic retrieval."
         )
-        return self.ai.llm_text(
+        return self._llm_text_with_debug_log(
+            purpose="document_summary",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=self.config.doc_summary_max_output_tokens,
@@ -465,7 +973,8 @@ class DocumentCorpus:
             f"Chunk text:\n{chunk_text}\n\n"
             "Return a concise chunk summary suitable for later merging."
         )
-        return self.ai.llm_text(
+        return self._llm_text_with_debug_log(
+            purpose="document_chunk_summary",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=self.config.doc_summary_chunk_max_output_tokens,
@@ -483,7 +992,8 @@ class DocumentCorpus:
             f"Partial summaries:\n{summary_batch}\n\n"
             "Return one merged summary that can be used for another reduction pass if needed."
         )
-        return self.ai.llm_text(
+        return self._llm_text_with_debug_log(
+            purpose="document_summary_combine",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=self.config.doc_summary_chunk_max_output_tokens,
@@ -501,7 +1011,8 @@ class DocumentCorpus:
             f"Collected document notes:\n{summary_input}\n\n"
             "Return a concise summary suitable for semantic retrieval."
         )
-        return self.ai.llm_text(
+        return self._llm_text_with_debug_log(
+            purpose="document_summary_finalize",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=self.config.doc_summary_max_output_tokens,
@@ -574,7 +1085,8 @@ class DocumentCorpus:
             f"Section text:\n{section_text}\n\n"
             "Return a concise section summary suitable for semantic retrieval."
         )
-        return self.ai.llm_text(
+        return self._llm_text_with_debug_log(
+            purpose="section_summary",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=self.config.section_summary_max_output_tokens,
@@ -593,7 +1105,8 @@ class DocumentCorpus:
             f"Partial section summaries:\n{summary_batch}\n\n"
             "Return one merged section summary suitable for retrieval."
         )
-        return self.ai.llm_text(
+        return self._llm_text_with_debug_log(
+            purpose="section_summary_combine",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=self.config.section_summary_max_output_tokens,
@@ -612,7 +1125,8 @@ class DocumentCorpus:
             f"Collected section notes:\n{summary_input}\n\n"
             "Return a concise section summary suitable for semantic retrieval."
         )
-        return self.ai.llm_text(
+        return self._llm_text_with_debug_log(
+            purpose="section_summary_finalize",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=self.config.section_summary_max_output_tokens,
@@ -859,6 +1373,233 @@ class DocumentCorpus:
             chars_per_token=self.config.token_estimate_chars_per_token,
             tokens_per_word=self.config.token_estimate_tokens_per_word,
         )
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        compact = re.sub(r"\s+", " ", (text or "").strip())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
+    def _write_ingestion_log(self, document: DocumentRecord) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        ingestion_dir = log_root / "ingestion"
+        ingestion_dir.mkdir(parents=True, exist_ok=True)
+        file_name = f"{self._safe_log_name(Path(document.source_path).stem or document.title)}.txt"
+        output_path = ingestion_dir / file_name
+        self._append_ingestion_index_entry(
+            source_path=document.source_path,
+            status="ingested",
+            detail=f"ingested with {len(document.sections)} sections",
+            metadata_file_name=file_name,
+            section_count=len(document.sections),
+        )
+
+        lines: list[str] = [
+            f"Source path: {document.source_path}",
+            f"Source file name: {Path(document.source_path).name}",
+            f"Metadata file name: {file_name}",
+            f"Title: {document.title}",
+            f"Canonical title: {document.canonical_title or 'unknown'}",
+            f"Document type: {document.document_type or 'document'}",
+            f"Version: {document.version or 'unknown'}",
+            f"Effective date: {document.effective_date or 'unknown'}",
+            f"Tags: {', '.join(document.metadata_tags) or 'none'}",
+            f"Audiences: {', '.join(document.audiences) or 'none'}",
+            f"Keywords: {', '.join(document.keywords) or 'none'}",
+            f"Section count: {len(document.sections)}",
+            "",
+            "=== Document Summary ===",
+            self.redactor.unmask_text(document.summary).strip() or "(empty)",
+            "",
+        ]
+
+        for index, section in enumerate(document.sections, start=1):
+            lines.extend(
+                [
+                    f"=== Section {index}: {section.title} ===",
+                    f"Type: {section.section_type or 'general'}",
+                    f"Tags: {', '.join(section.metadata_tags) or 'none'}",
+                    f"Keywords: {', '.join(section.keywords) or 'none'}",
+                    "Summary:",
+                    self.redactor.unmask_text(section.summary).strip() or "(empty)",
+                    "",
+                    "Raw text:",
+                    section.raw_text.strip() or "(empty)",
+                    "",
+                ]
+            )
+
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+    def _write_ingestion_run_header(self, folder_path: str, file_paths: list[str]) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        index_path = log_root / "ingestion_index.txt"
+        lines = [
+            f"=== Ingestion Run: {utc_now_iso()} ===",
+            f"Run ID: {self._active_ingestion_run_id or 'unknown'}",
+            f"Folder: {folder_path}",
+            f"Discovered supported files: {len(file_paths)}",
+            "Files:",
+            *[f"- {Path(file_path).name} | {file_path}" for file_path in file_paths],
+            "",
+        ]
+        with index_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+
+    def _append_ingestion_index_entry(
+        self,
+        source_path: str,
+        status: str,
+        detail: str,
+        metadata_file_name: str = "",
+        section_count: int | None = None,
+    ) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        index_path = log_root / "ingestion_index.txt"
+        lines = [
+            f"Run ID: {self._active_ingestion_run_id or 'unknown'}",
+            f"Status: {status}",
+            f"Source file name: {Path(source_path).name}",
+            f"Source path: {source_path}",
+            f"Detail: {detail}",
+            "",
+        ]
+        if metadata_file_name:
+            lines.insert(-1, f"Metadata file name: {metadata_file_name}")
+        if section_count is not None:
+            lines.insert(-1, f"Section count: {section_count}")
+        with index_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+
+    def _write_ingestion_failure_log(
+        self,
+        source_path: str,
+        stage: str,
+        reason: str,
+        exc: Exception | None = None,
+    ) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        failures_dir = log_root / "ingestion_failures"
+        failures_dir.mkdir(parents=True, exist_ok=True)
+        output_path = failures_dir / f"{uuid.uuid4()}.txt"
+        lines = [
+            f"Run ID: {self._active_ingestion_run_id or 'unknown'}",
+            f"Source file name: {Path(source_path).name}",
+            f"Source path: {source_path}",
+            f"Stage: {stage}",
+            f"Reason: {reason}",
+        ]
+        if exc is not None:
+            lines.extend(
+                [
+                    "",
+                    "=== Traceback ===",
+                    traceback.format_exc().strip() or f"{type(exc).__name__}: {exc}",
+                ]
+            )
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+    def _llm_text_with_debug_log(
+        self,
+        purpose: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_output_tokens: int,
+    ) -> str:
+        try:
+            response_text = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=max_output_tokens,
+            )
+        except Exception as exc:
+            self._write_llm_debug_log(
+                purpose=purpose,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_text="",
+                max_output_tokens=max_output_tokens,
+                error_text=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        self._write_llm_debug_log(
+            purpose=purpose,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_text=response_text,
+            max_output_tokens=max_output_tokens,
+        )
+        return response_text
+
+    def _write_llm_debug_log(
+        self,
+        purpose: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_text: str,
+        max_output_tokens: int,
+        error_text: str = "",
+    ) -> None:
+        log_root = self._resolve_debug_log_dir()
+        if log_root is None:
+            return
+
+        llm_dir = log_root / "llm"
+        llm_dir.mkdir(parents=True, exist_ok=True)
+        output_path = llm_dir / f"{uuid.uuid4()}.txt"
+        lines = [
+            f"Purpose: {purpose}",
+            f"Model provider: {self.config.ai_provider}",
+            f"Max output tokens: {max_output_tokens}",
+            "",
+            "=== System Prompt ===",
+            self.redactor.unmask_text(system_prompt).strip() or "(empty)",
+            "",
+            "=== User Prompt ===",
+            self.redactor.unmask_text(user_prompt).strip() or "(empty)",
+            "",
+            "=== Response ===",
+            self.redactor.unmask_text(response_text).strip() or "(empty)",
+        ]
+        if error_text:
+            lines.extend(
+                [
+                    "",
+                    "=== Error ===",
+                    error_text,
+                ]
+            )
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+    def _resolve_debug_log_dir(self) -> Path | None:
+        if not self.config.debug:
+            return None
+        raw_path = (self.config.debug_log_dir or "").strip()
+        if not raw_path:
+            return None
+        base_path = Path(self.config.document_folder)
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = base_path / candidate
+        return candidate
+
+    @staticmethod
+    def _safe_log_name(value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+        return cleaned.strip("._") or "policygpt_log"
 
     @staticmethod
     def _estimate_tokens_static(

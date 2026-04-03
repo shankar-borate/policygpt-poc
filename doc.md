@@ -8,7 +8,7 @@ This POC has been refactored into a small package named `policygpt` so the main 
   Holds runtime configuration such as document folder, model provider, model names, retrieval limits, and section sizing.
 - `policygpt/services/`
   Contains reusable low-level services:
-  `file_extractor.py`, `openai_service.py`, `bedrock_service.py`, and `redaction.py`.
+  `file_extractor.py`, `metadata_extractor.py`, `query_analyzer.py`, `openai_service.py`, `bedrock_service.py`, and `redaction.py`.
 - `policygpt/corpus.py`
   Owns document ingestion, section generation, embeddings, and retrieval indexes.
 - `policygpt/conversations.py`
@@ -61,17 +61,26 @@ For each supported policy file:
    - extracts text from PDFs when the file is text-based
    - derives a document title
    - splits content into sections
-3. The corpus masks sensitive text using `Redactor`.
-4. The corpus creates:
+3. The corpus derives metadata for each document and section, such as:
+   - normalized titles
+   - auto-derived policy/topic tags from titles and filenames
+   - document type
+   - section type
+   - version/effective-date hints
+   - lexical keyword terms
+   The topic tags are now inferred from the document itself first. A small static synonym map is kept only as fallback for weak cases.
+4. The corpus masks sensitive text using `Redactor`.
+5. The corpus creates:
    - one retrieval summary for the whole document
    - one retrieval summary per section
-5. `OpenAIService` generates embeddings for those summaries.
-6. The corpus stores:
+6. The active AI service generates embeddings for those summaries.
+7. The corpus stores:
    - `DocumentRecord`
    - `SectionRecord`
-7. After all files are processed, the corpus builds:
+8. After all files are processed, the corpus builds:
    - a document embedding matrix
    - a section embedding matrix
+   - lexical document-frequency stats for hybrid retrieval
 
 ### 3. Title Cleanup Logic
 
@@ -96,22 +105,30 @@ User chat is handled by `PolicyGPTBot` in `policygpt/bot.py`.
 For every question:
 
 1. The bot loads the current thread from `ConversationManager`.
-2. It builds a retrieval query using:
+2. It runs the user question through `QueryAnalyzer`, which infers:
+   - likely policy topics from the indexed corpus first
+   - answer intent such as checklist/process/eligibility/approval/timeline
+   - explicit document-lookup intent for requests like `give me employee exit policy`
+   - expanded search terms from matching document titles, tags, and keywords
+3. It builds a richer retrieval query using:
    - conversation summary
    - current topic
    - active documents from the previous turn
+   - inferred topics/intents
    - current user question
-3. That retrieval query is embedded.
-4. `DocumentCorpus.retrieve_top_docs()` finds the best matching documents.
-5. `DocumentCorpus.retrieve_top_sections()` finds the best matching sections from those documents.
-6. The bot builds an answer prompt using:
+4. That retrieval query is embedded.
+5. `DocumentCorpus.retrieve_top_docs()` finds the best matching documents using hybrid scoring.
+6. `DocumentCorpus.retrieve_top_sections()` finds the best matching sections from those documents and reranks them.
+7. The bot builds an answer prompt using:
    - recent chat
    - retrieved document summaries
    - retrieved section summaries
-   - original section text
-7. `OpenAIService` generates the final answer.
-8. The bot appends a `Reference:` line using the top source file names.
-9. The thread state is updated with:
+   - focused evidence snippets instead of dumping whole sections
+   - answer-format guidance derived from the question type
+8. Before answering, the bot runs an answerability check. If the evidence is weak, it returns a grounded "not clearly stated" style response instead of forcing an answer.
+9. The active AI service generates the final answer.
+10. The bot appends a `Reference:` line using the top source file names.
+11. The thread state is updated with:
    - display messages
    - short-term memory
    - active docs/sections
@@ -151,6 +168,23 @@ This improves follow-up questions like:
 - "what about this policy"
 - "same policy"
 - "what is the eligibility"
+- "I am leaving company on 4th April. What process do I follow?"
+
+The query analyzer now does two things:
+
+- it uses the indexed corpus vocabulary to infer which policy family the question is most likely about
+- it falls back to a small synonym map only when the corpus signals are weak
+
+This makes the system more scalable as new policy domains are added, because new documents can contribute their own topic vocabulary without a code change.
+
+Examples:
+
+- `leaving company`, `last day`, `resignation`, `offboarding`, `clearance`
+  can now match an exit/separation policy through either corpus terms or fallback synonym support
+- `who approves`
+  adds approval/matrix/delegation intent
+- `checklist` or `process`
+  biases retrieval toward sections that describe steps and required actions
 
 ### Retrieval Levels
 
@@ -163,13 +197,27 @@ Retrieval happens in two stages:
 
 This keeps the answer context narrow while still allowing cross-document questions.
 
+Both stages now use hybrid retrieval rather than pure semantic similarity.
+
 ### Scoring
+
+Document ranking combines:
+
+- semantic similarity
+- lexical/BM25-style keyword matching
+- title overlap
+- exact title/phrase lookup boost for explicit policy-name requests
+- metadata/topic matches
+- a small continuity boost for active documents from the same thread
 
 Section ranking combines:
 
-- section similarity
-- parent document similarity
-- a small continuity boost for active sections/documents from the same thread
+- semantic similarity
+- lexical/BM25-style keyword matching
+- parent document score
+- section-title overlap
+- section/document metadata matches
+- a reranking pass based on evidence-snippet alignment and section type
 
 This helps maintain context across follow-up questions without locking the model into one document forever.
 
@@ -181,11 +229,16 @@ Accuracy is controlled in three places:
 
 - generated summary files are excluded
 - noisy HTML titles are corrected
+- document and section metadata are extracted and normalized
+- topic tags are inferred from document/section titles before falling back to static synonyms
+- topic matching is fuzzy rather than exact, so a user topic like `exit` can still align with tags like `employee exit`
+- title/version noise is reduced for matching
 
 ### 2. Narrow evidence selection
 
 - only top documents are considered
-- only top sections from those documents are passed to the answer prompt
+- only top reranked sections from those documents are passed to the answer prompt
+- evidence snippets are extracted from those sections instead of sending broad raw text
 
 ### 3. Answer prompt rules
 
@@ -196,6 +249,16 @@ The bot prompt explicitly tells the model to:
 - ignore semantically similar but off-topic evidence
 - say "not clearly stated" when the evidence does not support the answer
 - stay concise unless the user explicitly asks for detail
+
+### 4. Answerability guardrail
+
+Before the final answer call, the bot checks whether:
+
+- section scores are strong enough
+- evidence snippets actually match the query intent
+- the top section still aligns with the inferred policy topic
+
+If not, it returns a grounded fallback instead of guessing.
 
 ## Web Server Design
 

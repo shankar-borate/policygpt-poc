@@ -79,10 +79,8 @@ class FileExtractor:
                     units.append(("p", paragraph))
                 buffer = []
 
-        heading_pattern = re.compile(r"^(\d+(\.\d+)*[\)\.]?)\s+.+|^[A-Z][A-Z0-9 /&\-,]{4,}$")
-
         for line in lines:
-            is_heading = bool(heading_pattern.match(line)) and len(line) < 180
+            is_heading = self._looks_like_heading_line(line)
             is_bullet = re.match(r"^[-*\u2022]\s+.+", line) or re.match(r"^\d+[\.\)]\s+.+", line)
 
             if is_heading:
@@ -141,10 +139,8 @@ class FileExtractor:
                     units.append(("p", paragraph))
                 buffer = []
 
-        heading_pattern = re.compile(r"^(\d+(\.\d+)*[\)\.]?)\s+.+|^[A-Z][A-Z0-9 /&\-,]{4,}$")
-
         for line in lines:
-            is_heading = bool(heading_pattern.match(line)) and len(line) < 180
+            is_heading = self._looks_like_heading_line(line)
             is_bullet = re.match(r"^[-*\u2022]\s+.+", line) or re.match(r"^\d+[\.\)]\s+.+", line)
 
             if is_heading:
@@ -216,7 +212,16 @@ class FileExtractor:
 
         flush()
 
-        if len(sections) <= 1:
+        if len(sections) == 1:
+            title, text = sections[0]
+            if not text:
+                return []
+            if title and title != "Introduction":
+                if len(text) <= self.config.max_section_chars:
+                    return [(title, text)]
+                return self._split_large_text_into_synthetic_sections(text, title_prefix=title)
+
+        if len(sections) == 0:
             all_text = "\n".join(text for _, text in sections) if sections else ""
             if not all_text:
                 return []
@@ -301,6 +306,34 @@ class FileExtractor:
             chunks.append(separator.join(current).strip())
 
         return chunks
+
+    @staticmethod
+    def _looks_like_heading_line(line: str) -> bool:
+        compact = line.strip()
+        if not compact or len(compact) >= 180:
+            return False
+
+        if re.match(r"^(\d+(\.\d+)*[\)\.]?)\s+.+", compact):
+            return True
+        if re.match(r"^[A-Z][A-Z0-9 /&\-,]{4,}$", compact):
+            return True
+        if compact.endswith((".", "?", "!", ";")):
+            return False
+
+        words = compact.split()
+        if not (1 <= len(words) <= 12):
+            return False
+
+        alpha_words = [word for word in words if re.search(r"[A-Za-z]", word)]
+        if not alpha_words:
+            return False
+
+        title_like_words = sum(
+            1
+            for word in alpha_words
+            if word[:1].isupper() or word.upper() == word
+        )
+        return title_like_words / len(alpha_words) >= 0.75
 
     def _select_document_title(
         self,

@@ -26,7 +26,7 @@ AI_PROFILE_PRESETS: dict[str, dict[str, str]] = {
 
 @dataclass(frozen=True)
 class Config:
-    document_folder: str = r"D:\policy-mgmt\vcx_policies"
+    document_folder: str = r"D:\policy-mgmt\data\durandhar_html"
     supported_file_patterns: tuple[str, ...] = ("*.html", "*.htm", "*.txt", "*.pdf")
     excluded_file_name_parts: tuple[str, ...] = ("_summary",)
 
@@ -38,10 +38,14 @@ class Config:
     public_base_url: str = "http://127.0.0.1:8010"
     bedrock_region: str = "ap-south-1"
     bedrock_gpt_model_size: str = ""
+    debug_log_dir: str = r"D:\policy-mgmt\data\durandhar_html\metadata"
 
     top_docs: int = 3
     top_sections_per_doc: int = 3
     max_sections_to_llm: int = 4
+    rerank_section_candidates: int = 12
+    max_evidence_snippets_per_section: int = 3
+    evidence_snippet_char_limit: int = 320
 
     max_recent_messages: int = 6
     summarize_after_turns: int = 8
@@ -71,8 +75,19 @@ class Config:
     conversation_summary_max_output_tokens: int = 250
     ai_rate_limit_retries: int = 2
     ai_rate_limit_backoff_seconds: float = 8.0
+    doc_semantic_weight: float = 0.48
+    doc_lexical_weight: float = 0.24
+    doc_title_weight: float = 0.16
+    doc_metadata_weight: float = 0.12
+    section_semantic_weight: float = 0.36
+    section_lexical_weight: float = 0.24
+    section_parent_weight: float = 0.16
+    section_title_weight: float = 0.12
+    section_metadata_weight: float = 0.12
+    answerability_min_section_score: float = 0.24
+    answerability_min_support_matches: int = 1
 
-    debug: bool = False
+    debug: bool = True
 
     def __post_init__(self) -> None:
         profile = (self.ai_profile or "openai").strip().lower()
@@ -90,6 +105,8 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         base_config = cls()
+        debug_log_dir_env = os.getenv("POLICY_GPT_DEBUG_LOG_DIR")
+        debug_env = os.getenv("POLICY_GPT_DEBUG")
         return cls(
             ai_profile=base_config.ai_profile,
             chat_model=base_config.chat_model,
@@ -97,5 +114,6 @@ class Config:
             public_base_url=os.getenv("POLICY_GPT_PUBLIC_BASE_URL", base_config.public_base_url).rstrip("/"),
             bedrock_region=os.getenv("AWS_BEDROCK_REGION", os.getenv("AWS_REGION", base_config.bedrock_region)).strip()
             or base_config.bedrock_region,
-            debug=os.getenv("POLICY_GPT_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"},
+            debug_log_dir=base_config.debug_log_dir if debug_log_dir_env is None else debug_log_dir_env.strip(),
+            debug=base_config.debug if debug_env is None else debug_env.strip().lower() in {"1", "true", "yes", "on"},
         )
