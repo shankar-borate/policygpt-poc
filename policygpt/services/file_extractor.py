@@ -1,4 +1,5 @@
 import re
+from html import unescape
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -7,6 +8,33 @@ from policygpt.config import Config
 
 
 class FileExtractor:
+    HTML_SEMANTIC_TAGS = (
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "p", "li", "table", "tr", "td", "th",
+        "blockquote", "pre", "dd", "dt",
+    )
+    HTML_BLOCK_TAGS = (
+        "article", "section", "main", "aside", "header", "footer", "nav",
+        "div", "p", "li", "table", "tr", "td", "th", "blockquote", "pre",
+        "dd", "dt", "dl", "ul", "ol",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+    )
+    HTML_CONTAINER_TAGS = {
+        "article", "section", "main", "aside", "header", "footer", "nav",
+        "div", "table", "tr", "dl", "ul", "ol",
+    }
+    HTML_NOISE_MARKERS = {
+        "sidebar", "menu", "breadcrumb", "breadcrumbs", "pagination",
+        "table-of-contents", "toc", "toolbar", "share", "social",
+    }
+    HTML_HEADING_MARKERS = {
+        "title", "heading", "header", "question",
+    }
+    HTML_BODY_MARKERS = {
+        "body", "content", "copy", "text", "details", "description",
+        "answer", "summary", "subtitle", "issuer", "caption", "label",
+    }
+
     def __init__(self, config: Config):
         self.config = config
 
@@ -33,10 +61,22 @@ class FileExtractor:
 
     def extract_from_html(self, path: str) -> tuple[str, list[tuple[str, str]]]:
         html = Path(path).read_text(encoding="utf-8", errors="ignore")
+        raw_text = self._extract_text_from_raw_html(html)
+
         try:
             soup = BeautifulSoup(html, "lxml")
         except Exception:
-            soup = BeautifulSoup(html, "html.parser")
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception:
+                soup = None
+
+        if soup is None:
+            title = self._select_text_document_title(
+                path=path,
+                lines=[line.strip() for line in raw_text.split("\n") if line.strip()],
+            )
+            return title, self._group_units_into_sections(self._build_html_text_fallback_units(raw_text))
 
         for tag in soup(["script", "style", "noscript", "svg", "img", "meta", "link"]):
             tag.decompose()
@@ -45,17 +85,18 @@ class FileExtractor:
         if soup.title and soup.title.text.strip():
             html_title = self.clean_whitespace(soup.title.text)
 
-        candidates = soup.find_all([
-            "h1", "h2", "h3", "h4", "h5", "h6",
-            "p", "li", "table", "tr", "td", "th",
-        ])
+        primary_units = self._extract_html_semantic_units(soup)
+        fallback_units = self._extract_html_block_units(soup)
+        body_root = soup.body or soup
+        body_text = self.clean_whitespace(body_root.get_text("\n", strip=True))
+        fallback_text = body_text if len(body_text) >= len(raw_text) else raw_text
 
-        units: list[tuple[str, str]] = []
-        for node in candidates:
-            text = node.get_text(" ", strip=True)
-            if not text:
-                continue
-            units.append((node.name.lower(), text))
+        units = primary_units
+        if self._should_prefer_html_block_units(primary_units, fallback_units, body_text):
+            units = fallback_units
+
+        if not self._has_substantive_body_units(units) and fallback_text:
+            units = self._build_html_text_fallback_units(fallback_text)
 
         title = self._select_document_title(path=path, html_title=html_title, units=units)
         return title, self._group_units_into_sections(units)
@@ -190,6 +231,179 @@ class FileExtractor:
             return first_line_title
 
         return file_title or cleaned_metadata_title or Path(path).stem
+
+    def _extract_html_semantic_units(self, soup: BeautifulSoup) -> list[tuple[str, str]]:
+        units: list[tuple[str, str]] = []
+        seen_texts: set[str] = set()
+
+        for node in (soup.body or soup).find_all(list(self.HTML_SEMANTIC_TAGS)):
+            if self._is_html_noise_node(node) or self._has_html_noise_ancestor(node):
+                continue
+            text = self.clean_whitespace(node.get_text(" ", strip=True))
+            if not text:
+                continue
+            normalized = self._normalize_html_text(text)
+            if normalized in seen_texts:
+                continue
+            seen_texts.add(normalized)
+            units.append((node.name.lower(), text))
+
+        return units
+
+    def _extract_html_block_units(self, soup: BeautifulSoup) -> list[tuple[str, str]]:
+        units: list[tuple[str, str]] = []
+        seen_texts: set[str] = set()
+        root = soup.body or soup
+
+        for node in root.find_all(list(self.HTML_BLOCK_TAGS)):
+            if self._is_html_noise_node(node) or self._has_html_noise_ancestor(node):
+                continue
+            if self._should_skip_html_container(node):
+                continue
+
+            text = self.clean_whitespace(node.get_text(" ", strip=True))
+            if not text:
+                continue
+
+            normalized = self._normalize_html_text(text)
+            if normalized in seen_texts:
+                continue
+            seen_texts.add(normalized)
+
+            units.append((self._classify_html_block_tag(node=node, text=text), text))
+
+        return units
+
+    def _should_prefer_html_block_units(
+        self,
+        primary_units: list[tuple[str, str]],
+        fallback_units: list[tuple[str, str]],
+        body_text: str,
+    ) -> bool:
+        if not fallback_units:
+            return False
+
+        primary_body_chars = self._html_body_chars(primary_units)
+        fallback_body_chars = self._html_body_chars(fallback_units)
+
+        if not self._has_substantive_body_units(primary_units):
+            return True
+
+        if fallback_body_chars > primary_body_chars + 300 and fallback_body_chars >= int(primary_body_chars * 1.35):
+            return True
+
+        if not body_text:
+            return False
+
+        primary_coverage = primary_body_chars / max(1, len(body_text))
+        fallback_coverage = fallback_body_chars / max(1, len(body_text))
+        return fallback_coverage >= 0.45 and fallback_coverage > primary_coverage + 0.15
+
+    def _build_html_text_fallback_units(self, body_text: str) -> list[tuple[str, str]]:
+        lines = [line.strip() for line in body_text.split("\n") if line.strip()]
+        units = self._build_text_units(lines)
+        if self._has_substantive_body_units(units):
+            return units
+        return [("p", body_text)] if body_text else []
+
+    def _extract_text_from_raw_html(self, html: str) -> str:
+        if not html:
+            return ""
+
+        stripped = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+        stripped = re.sub(
+            r"<(script|style|noscript|svg|img|meta|link)\b.*?>.*?</\1\s*>",
+            " ",
+            stripped,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        stripped = re.sub(
+            r"<\s*(br|/p|/div|/section|/article|/li|/tr|/td|/th|/h[1-6]|hr)\b[^>]*>",
+            "\n",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        stripped = re.sub(r"<[^>]+>", " ", stripped)
+        stripped = unescape(stripped)
+        return self.clean_whitespace(stripped)
+
+    @staticmethod
+    def _normalize_html_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip().casefold()
+
+    @staticmethod
+    def _html_marker_tokens(node) -> set[str]:
+        class_names = " ".join(str(value) for value in node.get("class", []))
+        node_id = str(node.get("id", ""))
+        return {
+            token
+            for token in re.split(r"[^a-z0-9]+", f"{class_names} {node_id}".casefold())
+            if token
+        }
+
+    def _is_html_noise_node(self, node) -> bool:
+        marker_tokens = self._html_marker_tokens(node)
+        node_name = (node.name or "").casefold()
+
+        if node_name == "nav":
+            return True
+
+        return any(marker in marker_tokens for marker in self.HTML_NOISE_MARKERS)
+
+    def _has_html_noise_ancestor(self, node) -> bool:
+        for parent in node.parents:
+            if not getattr(parent, "name", ""):
+                continue
+            if self._is_html_noise_node(parent):
+                return True
+        return False
+
+    def _should_skip_html_container(self, node) -> bool:
+        node_name = (node.name or "").lower()
+        if node_name not in self.HTML_CONTAINER_TAGS:
+            return False
+
+        child_blocks = [
+            child
+            for child in node.find_all(list(self.HTML_BLOCK_TAGS), recursive=False)
+            if not self._is_html_noise_node(child)
+        ]
+        return bool(child_blocks)
+
+    def _classify_html_block_tag(self, node, text: str) -> str:
+        node_name = (node.name or "").lower()
+        if node_name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            return node_name
+        if self._looks_like_html_heading_block(node=node, text=text):
+            return "h3"
+        return "p"
+
+    def _looks_like_html_heading_block(self, node, text: str) -> bool:
+        marker_tokens = self._html_marker_tokens(node)
+
+        if (node.name or "").lower() in {"th", "dt"} and len(text) <= 200:
+            return True
+
+        has_heading_marker = any(marker in marker_tokens for marker in self.HTML_HEADING_MARKERS)
+        has_body_marker = any(marker in marker_tokens for marker in self.HTML_BODY_MARKERS)
+
+        if not has_heading_marker:
+            return False
+        if len(text) > 240:
+            return False
+        if has_body_marker and len(text) > 120:
+            return False
+        if text.endswith((".", "?", "!")) and len(text) > 80:
+            return False
+        return True
+
+    @staticmethod
+    def _html_body_chars(units: list[tuple[str, str]]) -> int:
+        return sum(len(text) for tag, text in units if not tag.startswith("h"))
+
+    @staticmethod
+    def _has_substantive_body_units(units: list[tuple[str, str]]) -> bool:
+        return any(text.strip() for tag, text in units if not tag.startswith("h"))
 
     def _group_units_into_sections(self, units: list[tuple[str, str]]) -> list[tuple[str, str]]:
         sections: list[tuple[str, str]] = []
