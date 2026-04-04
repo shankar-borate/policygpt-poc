@@ -101,17 +101,19 @@ class PolicyGPTBot:
             retrieval_query = self._build_retrieval_query(thread, query_analysis)
             masked_retrieval_query = self.redactor.mask_text(retrieval_query)
             query_vec = self._embed_one(masked_retrieval_query)
+            preferred_doc_ids = thread.active_doc_ids if query_analysis.context_dependent else []
+            preferred_section_ids = thread.active_section_ids if query_analysis.context_dependent else []
 
             top_docs = self.corpus.retrieve_top_docs(
                 query_vec,
                 query_analysis=query_analysis,
-                preferred_doc_ids=thread.active_doc_ids,
+                preferred_doc_ids=preferred_doc_ids,
             )
             top_sections = self.corpus.retrieve_top_sections(
                 query_vec,
                 query_analysis,
                 top_docs,
-                preferred_section_ids=thread.active_section_ids,
+                preferred_section_ids=preferred_section_ids,
             )
             top_docs = self._merge_retrieved_documents(top_docs, top_sections)
 
@@ -227,7 +229,7 @@ class PolicyGPTBot:
             "1. Answer only from the provided document evidence.\n"
             "2. If the answer is not clearly present, say that it is not clearly stated in the provided documents.\n"
             "3. Be conversational but precise.\n"
-            "4. Prefer the current conversation context when interpreting follow-up questions like 'what about this', 'same policy', 'that section'.\n"
+            "4. Use current conversation context only when the user's wording is clearly referential, such as 'what about this', 'same policy', or 'that section'.\n"
             "5. When relevant evidence comes from multiple documents or sections, synthesize across them and call out any document-specific differences clearly.\n"
             "6. Mention section titles and file names when useful.\n"
             "7. Do not hallucinate.\n"
@@ -245,7 +247,8 @@ class PolicyGPTBot:
             "19. Treat the question analysis as a retrieval aid, but only state things that are clearly supported by the evidence snippets.\n"
             "20. If the evidence covers only part of the answer, answer only that part and say what is not clearly stated.\n"
             "21. Prefer evidence snippets over broad summaries when they conflict.\n"
-            "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format."
+            "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format.\n"
+            "23. If recent chat suggests one document but the current retrieved evidence explicitly defines the asked term in another document, follow the current evidence and briefly note the difference if needed."
         )
 
     def _answer_format_guidance(self, query_analysis: QueryAnalysis) -> str:
@@ -414,11 +417,11 @@ class PolicyGPTBot:
 
     def _build_retrieval_query(self, thread, query_analysis: QueryAnalysis) -> str:
         parts: list[str] = []
-        if thread.conversation_summary:
+        if query_analysis.context_dependent and thread.conversation_summary:
             parts.append(f"Conversation summary: {thread.conversation_summary}")
-        if thread.current_topic:
+        if query_analysis.context_dependent and thread.current_topic:
             parts.append(f"Current topic: {thread.current_topic}")
-        if thread.active_doc_ids:
+        if query_analysis.context_dependent and thread.active_doc_ids:
             active_titles = [self.documents[doc_id].title for doc_id in thread.active_doc_ids if doc_id in self.documents]
             if active_titles:
                 parts.append(f"Current documents: {', '.join(active_titles)}")
@@ -455,6 +458,11 @@ class PolicyGPTBot:
         top_docs,
         top_sections,
     ) -> str:
+        context_guidance = (
+            "Treat recent chat as active context for resolving shorthand follow-ups."
+            if query_analysis.context_dependent
+            else "Treat recent chat as background only. If the current retrieved evidence points to a different document than the prior turn, follow the current evidence."
+        )
         recent_chat = "\n".join(
             f"{message.role.upper()}: {message.content}"
             for message in thread.recent_messages[-self.config.max_recent_messages :]
@@ -486,6 +494,7 @@ class PolicyGPTBot:
 
         return (
             f"Conversation summary:\n{thread.conversation_summary or 'None'}\n\n"
+            f"Conversation handling:\n{context_guidance}\n\n"
             f"Recent chat:\n{recent_chat}\n\n"
             f"Question analysis:\n{query_analysis.canonical_question}\n\n"
             f"Answer format guidance:\n{self._answer_format_guidance(query_analysis)}\n\n"

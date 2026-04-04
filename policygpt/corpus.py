@@ -562,12 +562,17 @@ class DocumentCorpus:
         scored_sections: list[tuple[SectionRecord, float]] = []
         for section_id in valid_section_ids:
             section = self.sections[section_id]
+            focus_match_score = self._focus_term_match_score(
+                query_analysis.focus_terms,
+                [section.title, section.summary, section.raw_text],
+            )
             score = (
                 self.config.section_semantic_weight * semantic_norm.get(section_id, 0.0)
                 + self.config.section_lexical_weight * lexical_norm.get(section_id, 0.0)
                 + self.config.section_parent_weight * doc_score_lookup.get(section.doc_id, 0.0)
                 + self.config.section_title_weight * title_norm.get(section_id, 0.0)
                 + self.config.section_metadata_weight * metadata_scores.get(section_id, 0.0)
+                + (0.08 * focus_match_score)
             )
             if section_id in preferred_section_ids:
                 score += 0.08
@@ -646,6 +651,10 @@ class DocumentCorpus:
                 query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
                 candidate_terms=snippet_terms,
             )
+            focus_match_score = self._focus_term_match_score(
+                query_analysis.focus_terms,
+                [section.title, section.summary, " ".join(snippets), section.raw_text],
+            )
             section_type_boost = 1.0 if section.section_type in query_analysis.expected_section_types else 0.0
             tag_boost = self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
             title_alignment = self._term_overlap_score(
@@ -658,6 +667,7 @@ class DocumentCorpus:
                 + (0.08 * section_type_boost)
                 + (0.04 * tag_boost)
                 + (0.02 * title_alignment)
+                + (0.06 * focus_match_score)
             )
             reranked.append((section, reranked_score))
         return reranked
@@ -749,6 +759,21 @@ class DocumentCorpus:
                 if score > best_score:
                     best_score = score
         return best_score
+
+    @staticmethod
+    def _focus_term_match_score(focus_terms: list[str], texts: list[str]) -> float:
+        combined_text = normalize_text(" ".join(text for text in texts if text))
+        if not combined_text:
+            return 0.0
+
+        score = 0.0
+        for term in unique_preserving_order(focus_terms):
+            phrase = term.replace("_", " ").strip()
+            if not phrase or phrase not in combined_text:
+                continue
+            score += 1.0 if "_" in term else 0.45
+
+        return min(score, 2.0)
 
     @classmethod
     def _topic_alignment_tokens(cls, text: str) -> set[str]:

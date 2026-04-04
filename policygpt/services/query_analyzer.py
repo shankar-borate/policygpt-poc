@@ -40,6 +40,49 @@ MULTI_DOC_COVERAGE_PHRASES: tuple[str, ...] = (
 )
 
 
+CONTEXT_REFERENCE_PHRASES: tuple[str, ...] = (
+    "what about",
+    "how about",
+    "same policy",
+    "same document",
+    "same contest",
+    "same doc",
+    "same section",
+    "this policy",
+    "this document",
+    "this contest",
+    "this section",
+    "that policy",
+    "that document",
+    "that contest",
+    "that section",
+    "this one",
+    "that one",
+    "from above",
+    "from below",
+    "why is it missing",
+    "why it's missing",
+    "why its missing",
+)
+
+
+CONTEXT_REFERENCE_TOKENS: set[str] = {
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "they",
+    "them",
+    "same",
+    "here",
+    "there",
+    "above",
+    "below",
+}
+
+
 DOCUMENT_LOOKUP_PHRASES: tuple[str, ...] = (
     "give me",
     "show me",
@@ -104,6 +147,7 @@ class QueryAnalysis:
     canonical_question: str
     detail_requested: bool
     multi_doc_expected: bool
+    context_dependent: bool
     intents: list[str] = field(default_factory=list)
     topic_hints: list[str] = field(default_factory=list)
     focus_terms: list[str] = field(default_factory=list)
@@ -136,6 +180,12 @@ class QueryAnalyzer:
             intents = ["general"]
         intents = unique_preserving_order(intents)
 
+        context_dependent = self._needs_conversation_context(
+            user_question=user_question,
+            normalized_question=normalized_question,
+            focus_terms=focus_terms,
+        )
+
         expanded_terms = list(focus_terms)
         expanded_terms.extend(corpus_expanded_terms)
         if not corpus_expanded_terms:
@@ -143,7 +193,7 @@ class QueryAnalyzer:
                 expanded_terms.append(topic.replace(" ", "_"))
                 expanded_terms.extend(keywordize_text(" ".join(DOMAIN_TOPIC_SYNONYMS.get(topic, ()))))
 
-        if active_document_titles:
+        if context_dependent and active_document_titles:
             for title in active_document_titles:
                 expanded_terms.extend(self._filter_informative_terms(keywordize_text(title)))
 
@@ -164,6 +214,8 @@ class QueryAnalyzer:
             canonical_lines.append(f"Inferred answer intent: {', '.join(intents)}")
         if multi_doc_expected:
             canonical_lines.append("Expected evidence coverage: multiple documents")
+        if context_dependent:
+            canonical_lines.append("Conversation context: active follow-up")
         if supporting_titles:
             canonical_lines.append(f"Likely matching documents: {', '.join(supporting_titles)}")
         if expanded_terms:
@@ -175,6 +227,7 @@ class QueryAnalyzer:
             canonical_question="\n".join(canonical_lines),
             detail_requested=detail_requested,
             multi_doc_expected=multi_doc_expected,
+            context_dependent=context_dependent,
             intents=intents,
             topic_hints=topic_hints,
             focus_terms=focus_terms,
@@ -383,5 +436,34 @@ class QueryAnalyzer:
             {"all", "every", "which", "across", "multiple", "different"}
         ):
             return True
+
+        return False
+
+    @staticmethod
+    def _needs_conversation_context(
+        user_question: str,
+        normalized_question: str,
+        focus_terms: list[str],
+    ) -> bool:
+        if any(phrase in normalized_question for phrase in CONTEXT_REFERENCE_PHRASES):
+            return True
+
+        raw_tokens = tokenize_text(user_question)
+        informative_tokens = [token for token in raw_tokens if token not in STOPWORDS]
+        if not informative_tokens:
+            return True
+
+        if any(token in CONTEXT_REFERENCE_TOKENS for token in raw_tokens):
+            return True
+
+        has_specific_phrase = any("_" in term for term in focus_terms)
+        if len(informative_tokens) == 1:
+            token = informative_tokens[0]
+            if not has_specific_phrase and not token.isdigit():
+                return True
+
+        if len(informative_tokens) <= 2 and not has_specific_phrase:
+            if all(token in {"missing", "more", "else", "also", "then"} or token.isdigit() for token in informative_tokens):
+                return True
 
         return False
