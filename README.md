@@ -73,6 +73,8 @@ Both scripts write to `app.log` and store the process id in `app.pid`.
 - While indexing is running, `/api/health` returns `status: "in_progress"` plus file progress details.
 - Thread state is stored in memory and resets when the server restarts.
 - Answers are returned in concise Markdown and end with `Reference: <policy-file-name>`.
+- When `Config.debug` is `True`, each LLM call writes a request file to `<debug_log_dir>\llm\requests` and a matching response file to `<debug_log_dir>\llm\responses`.
+- Override the LLM debug log location with `POLICY_GPT_DEBUG_LOG_DIR` and disable debug logging with `POLICY_GPT_DEBUG=0`.
 - The original CLI still works through `python policy_gpt_poc.py`.
 - `Config.ai_profile` is the single switch for model selection.
 - `openai` uses `gpt-4.1` with `text-embedding-3-large`.

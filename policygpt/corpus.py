@@ -11,6 +11,7 @@ import numpy as np
 from policygpt.config import Config
 from policygpt.models import DocumentRecord, SectionRecord, utc_now_iso
 from policygpt.services.base import AIRequestTooLargeError, AIService
+from policygpt.services.debug_logging import write_llm_debug_log_pair
 from policygpt.services.file_extractor import FileExtractor
 from policygpt.services.metadata_extractor import MetadataExtractor
 from policygpt.services.query_analyzer import QueryAnalysis
@@ -214,7 +215,7 @@ class DocumentCorpus:
             total_files=total_files,
             file_name=file_name,
         )
-        document_embedding = self._embed_one(document_summary)
+        document_embedding = self._build_enriched_embedding(title, document_summary, full_text)
 
         document_id = str(uuid.uuid4())
         document = DocumentRecord(
@@ -260,7 +261,7 @@ class DocumentCorpus:
                     section_title=masked_section_title,
                     section_text=masked_section_text,
                 )
-                section_embedding = self._embed_one(section_summary)
+                section_embedding = self._build_enriched_embedding(section_title, section_summary, section_text)
             except Exception as exc:
                 self._emit_progress(
                     progress_callback,
@@ -475,7 +476,8 @@ class DocumentCorpus:
         )
         reranked_sections.sort(key=lambda item: item[1], reverse=True)
         results = self._select_diverse_sections(
-            reranked_sections,
+            query_analysis=query_analysis,
+            scored_sections=reranked_sections,
             limit=result_limit,
         )
 
@@ -488,23 +490,35 @@ class DocumentCorpus:
 
     def _doc_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
-            return max(self.config.top_docs * 2, 6)
+            return max(self.config.broad_top_docs, self.config.top_docs)
+        if query_analysis.exact_match_expected:
+            return max(1, min(self.config.exact_top_docs, self.config.top_docs))
         return self.config.top_docs
 
     def _per_doc_section_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         base_limit = max(self.config.top_sections_per_doc, self.config.rerank_section_candidates)
         if query_analysis.multi_doc_expected:
-            return max(base_limit, self.config.top_sections_per_doc * 2, 6)
+            return max(base_limit, self.config.broad_top_sections_per_doc)
+        if query_analysis.exact_match_expected:
+            return max(self.config.exact_top_sections_per_doc, self.config.exact_max_sections_to_llm)
         return base_limit
 
     def _rerank_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
-            return max(self.config.rerank_section_candidates * 2, 24)
+            return max(self.config.broad_rerank_section_candidates, self.config.rerank_section_candidates)
+        if query_analysis.exact_match_expected:
+            return max(
+                self.config.exact_rerank_section_candidates,
+                self.config.exact_top_sections_per_doc * 2,
+                self.config.exact_max_sections_to_llm * 2,
+            )
         return self.config.rerank_section_candidates
 
     def _section_result_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
-            return max(self.config.max_sections_to_llm + 2, 6)
+            return max(self.config.broad_max_sections_to_llm, self.config.max_sections_to_llm)
+        if query_analysis.exact_match_expected:
+            return max(1, min(self.config.exact_max_sections_to_llm, self.config.max_sections_to_llm))
         return self.config.max_sections_to_llm
 
     def _score_sections(
@@ -566,13 +580,21 @@ class DocumentCorpus:
                 query_analysis.focus_terms,
                 [section.title, section.summary, section.raw_text],
             )
+            precise_match_score = self._precise_focus_match_score(
+                query_analysis.focus_terms,
+                [section.title, section.raw_text],
+            )
+            parent_weight = self.config.section_parent_weight
+            if query_analysis.exact_match_expected:
+                parent_weight *= self.config.exact_query_section_parent_weight_scale
             score = (
                 self.config.section_semantic_weight * semantic_norm.get(section_id, 0.0)
                 + self.config.section_lexical_weight * lexical_norm.get(section_id, 0.0)
-                + self.config.section_parent_weight * doc_score_lookup.get(section.doc_id, 0.0)
+                + parent_weight * doc_score_lookup.get(section.doc_id, 0.0)
                 + self.config.section_title_weight * title_norm.get(section_id, 0.0)
                 + self.config.section_metadata_weight * metadata_scores.get(section_id, 0.0)
                 + (0.08 * focus_match_score)
+                + (0.12 * precise_match_score)
             )
             if section_id in preferred_section_ids:
                 score += 0.08
@@ -581,13 +603,17 @@ class DocumentCorpus:
         scored_sections.sort(key=lambda item: item[1], reverse=True)
         return scored_sections
 
-    @staticmethod
     def _select_diverse_sections(
+        self,
+        query_analysis: QueryAnalysis,
         scored_sections: list[tuple[SectionRecord, float]],
         limit: int,
     ) -> list[tuple[SectionRecord, float]]:
         if limit <= 0 or not scored_sections:
             return []
+
+        if query_analysis.exact_match_expected:
+            return scored_sections[:limit]
 
         first_per_doc: list[tuple[SectionRecord, float]] = []
         overflow: list[tuple[SectionRecord, float]] = []
@@ -601,6 +627,170 @@ class DocumentCorpus:
 
         return (first_per_doc + overflow)[:limit]
 
+    def extract_answer_evidence_blocks(
+        self,
+        section: SectionRecord,
+        query_analysis: QueryAnalysis,
+        limit: int | None = None,
+    ) -> list[str]:
+        raw_text = section.raw_text.strip()
+        if not raw_text:
+            return []
+
+        block_limit = limit or self._answer_evidence_block_limit_for_query(query_analysis)
+        char_limit = self._answer_evidence_char_limit_for_query(query_analysis)
+        if len(raw_text) <= min(self.config.small_section_full_text_chars, char_limit):
+            return [raw_text]
+
+        units = self._split_text_into_evidence_units(raw_text)
+        if not units:
+            return [self._truncate_text(raw_text, char_limit)]
+
+        scored_units: list[tuple[int, float]] = []
+        for index, unit in enumerate(units):
+            score = self._score_evidence_unit(unit, section, query_analysis)
+            if score > 0:
+                scored_units.append((index, score))
+
+        if not scored_units:
+            return [self._truncate_text(raw_text, char_limit)]
+
+        scored_units.sort(key=lambda item: (item[1], -item[0]), reverse=True)
+        selected_spans: list[tuple[int, int]] = []
+        for index, _ in scored_units:
+            span_start = max(0, index - self.config.evidence_neighboring_units)
+            span_end = min(len(units) - 1, index + self.config.evidence_neighboring_units)
+            span = (span_start, span_end)
+            if any(not (span_end < existing_start or span_start > existing_end) for existing_start, existing_end in selected_spans):
+                continue
+            selected_spans.append(span)
+            if len(selected_spans) >= block_limit:
+                break
+
+        if not selected_spans:
+            return [self._truncate_text(raw_text, char_limit)]
+
+        merged_spans = self._merge_evidence_spans(selected_spans)
+        blocks: list[str] = []
+        for start, end in merged_spans:
+            block = "\n".join(units[start : end + 1]).strip()
+            if not block:
+                continue
+            blocks.append(self._truncate_text(block, char_limit))
+
+        return blocks or [self._truncate_text(raw_text, char_limit)]
+
+    def precise_evidence_match_count(
+        self,
+        section: SectionRecord,
+        query_analysis: QueryAnalysis,
+    ) -> int:
+        if not query_analysis.focus_terms:
+            return 0
+        score = self._precise_focus_match_score(
+            query_analysis.focus_terms,
+            [section.title, section.raw_text],
+        )
+        return max(0, int(score + 0.5))
+
+    def _answer_evidence_block_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
+        if query_analysis.multi_doc_expected:
+            return max(self.config.answer_evidence_block_limit_broad, 2)
+        return max(self.config.answer_evidence_block_limit_exact, 1)
+
+    def _answer_evidence_char_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
+        if query_analysis.multi_doc_expected:
+            return max(self.config.broad_answer_evidence_char_limit, self.config.evidence_chunk_char_limit)
+        if query_analysis.exact_match_expected:
+            return max(self.config.exact_answer_evidence_char_limit, self.config.small_section_full_text_chars)
+        return max(self.config.broad_answer_evidence_char_limit, self.config.evidence_chunk_char_limit)
+
+    def _score_evidence_unit(
+        self,
+        unit_text: str,
+        section: SectionRecord,
+        query_analysis: QueryAnalysis,
+    ) -> float:
+        normalized_unit = normalize_text(unit_text)
+        if not normalized_unit:
+            return 0.0
+
+        score = 0.0
+        expanded_terms = unique_preserving_order(query_analysis.expanded_terms or query_analysis.focus_terms)
+        for term in unique_preserving_order(query_analysis.focus_terms):
+            phrase = term.replace("_", " ").strip()
+            if phrase and phrase in normalized_unit:
+                score += 2.0 if "_" in term else 0.8
+        for term in expanded_terms:
+            if term in query_analysis.focus_terms:
+                continue
+            phrase = term.replace("_", " ").strip()
+            if phrase and phrase in normalized_unit:
+                score += 1.2 if "_" in term else 0.35
+
+        score += 0.9 * self._precise_focus_match_score(query_analysis.focus_terms, [unit_text])
+        if section.section_type in query_analysis.expected_section_types:
+            score += 0.35
+        score += 0.45 * self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
+        return score
+
+    def _split_text_into_evidence_units(self, text: str) -> list[str]:
+        normalized_text = text.replace("\r", "\n").strip()
+        if not normalized_text:
+            return []
+
+        paragraph_chunks = [
+            chunk.strip()
+            for chunk in re.split(r"\n\s*\n", normalized_text)
+            if chunk.strip()
+        ]
+
+        units: list[str] = []
+        for chunk in paragraph_chunks:
+            lines = [line.strip() for line in chunk.split("\n") if line.strip()]
+            if len(lines) >= 2 and all(len(line) <= 180 for line in lines):
+                units.extend(lines)
+                continue
+
+            bullet_like_lines = [
+                line
+                for line in lines
+                if re.match(r"^[-*\u2022]|\d+[\.\)]\s+", line)
+            ]
+            if bullet_like_lines:
+                units.extend(lines)
+                continue
+
+            units.append(chunk)
+
+        if len(units) > 1:
+            return units
+
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", normalized_text)
+            if sentence.strip()
+        ]
+        if len(sentences) > 1:
+            return sentences
+
+        lines = [line.strip() for line in normalized_text.split("\n") if line.strip()]
+        return lines if len(lines) > 1 else [normalized_text]
+
+    @staticmethod
+    def _merge_evidence_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if not spans:
+            return []
+
+        ordered = sorted(spans, key=lambda item: item[0])
+        merged: list[list[int]] = [[ordered[0][0], ordered[0][1]]]
+        for start, end in ordered[1:]:
+            if start <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return [(start, end) for start, end in merged]
+
     def extract_evidence_snippets(
         self,
         section: SectionRecord,
@@ -608,34 +798,17 @@ class DocumentCorpus:
         limit: int | None = None,
     ) -> list[str]:
         snippet_limit = limit or self.config.max_evidence_snippets_per_section
-        raw_parts = [part.strip() for part in re.split(r"\n+|(?<=[.!?])\s+", section.raw_text) if part.strip()]
-        if not raw_parts:
+        evidence_blocks = self.extract_answer_evidence_blocks(
+            section,
+            query_analysis,
+            limit=snippet_limit,
+        )
+        if not evidence_blocks:
             return []
-
-        query_terms = unique_preserving_order(query_analysis.expanded_terms + query_analysis.focus_terms + section.title_terms)
-        scored_parts: list[tuple[int, float, str]] = []
-        for index, part in enumerate(raw_parts):
-            score = 0.0
-            normalized_part = normalize_text(part)
-            for term in query_terms:
-                phrase = term.replace("_", " ")
-                if phrase and phrase in normalized_part:
-                    score += 1.8 if "_" in term else 1.0
-            if section.section_type in query_analysis.expected_section_types:
-                score += 0.6
-            score += 0.8 * self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
-            if score > 0:
-                scored_parts.append((index, score, part))
-
-        if not scored_parts:
-            fallback = section.raw_text.strip()
-            if not fallback:
-                return []
-            return [self._truncate_text(fallback, self.config.evidence_snippet_char_limit)]
-
-        scored_parts.sort(key=lambda item: (item[1], -item[0]), reverse=True)
-        selected = sorted(scored_parts[:snippet_limit], key=lambda item: item[0])
-        return [self._truncate_text(part, self.config.evidence_snippet_char_limit) for _, _, part in selected]
+        return [
+            self._truncate_text(block, self.config.evidence_snippet_char_limit)
+            for block in evidence_blocks[:snippet_limit]
+        ]
 
     def _rerank_sections(
         self,
@@ -655,6 +828,10 @@ class DocumentCorpus:
                 query_analysis.focus_terms,
                 [section.title, section.summary, " ".join(snippets), section.raw_text],
             )
+            precise_match_score = self._precise_focus_match_score(
+                query_analysis.focus_terms,
+                [section.title, " ".join(snippets), section.raw_text],
+            )
             section_type_boost = 1.0 if section.section_type in query_analysis.expected_section_types else 0.0
             tag_boost = self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
             title_alignment = self._term_overlap_score(
@@ -668,6 +845,7 @@ class DocumentCorpus:
                 + (0.04 * tag_boost)
                 + (0.02 * title_alignment)
                 + (0.06 * focus_match_score)
+                + (0.08 * precise_match_score)
             )
             reranked.append((section, reranked_score))
         return reranked
@@ -775,6 +953,25 @@ class DocumentCorpus:
 
         return min(score, 2.0)
 
+    @staticmethod
+    def _precise_focus_match_score(focus_terms: list[str], texts: list[str]) -> float:
+        combined_text = normalize_text(" ".join(text for text in texts if text))
+        if not combined_text:
+            return 0.0
+
+        score = 0.0
+        for term in unique_preserving_order(focus_terms):
+            phrase = term.replace("_", " ").strip()
+            if not phrase or phrase not in combined_text:
+                continue
+            has_numeric_part = any(part.isdigit() for part in term.split("_"))
+            if "_" in term or has_numeric_part:
+                score += 1.0
+            elif len(term) >= 3:
+                score += 0.5
+
+        return min(score, 3.0)
+
     @classmethod
     def _topic_alignment_tokens(cls, text: str) -> set[str]:
         return {
@@ -859,10 +1056,15 @@ class DocumentCorpus:
         total_files: int = 0,
         file_name: str = "",
     ) -> str:
+        # Fix #5: scale summary output budget with document size so large
+        # documents get richer summaries visible to retrieval.
+        doc_tokens = self._estimate_tokens(masked_text)
+        scaled_max_output = self._scaled_summary_budget(doc_tokens)
+
         input_budget = self.config.doc_summary_input_token_budget
-        if self._estimate_tokens(masked_text) <= input_budget:
+        if doc_tokens <= input_budget:
             try:
-                return self._summarize_document_text(masked_title, masked_text)
+                return self._summarize_document_text(masked_title, masked_text, max_output_tokens=scaled_max_output)
             except AIRequestTooLargeError:
                 pass
 
@@ -914,7 +1116,7 @@ class DocumentCorpus:
         except AIRequestTooLargeError:
             return reduced_summary_input
 
-    def _summarize_document_text(self, masked_title: str, masked_text: str) -> str:
+    def _summarize_document_text(self, masked_title: str, masked_text: str, max_output_tokens: int | None = None) -> str:
         system_prompt = (
             "You summarize enterprise documents for retrieval. "
             "Return a compact retrieval-oriented summary. "
@@ -930,7 +1132,7 @@ class DocumentCorpus:
             purpose="document_summary",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=self.config.doc_summary_max_output_tokens,
+            max_output_tokens=max_output_tokens or self.config.doc_summary_max_output_tokens,
         )
 
     def _summarize_document_chunk_with_fallback(
@@ -1162,6 +1364,15 @@ class DocumentCorpus:
 
     def embed_text(self, text: str) -> np.ndarray:
         return self._embed_one(text)
+
+    def _build_enriched_embedding(self, title: str, summary: str, raw_text: str) -> np.ndarray:
+        """Embed title + unmasked summary + raw text excerpt so the vector
+        captures original terminology users will search with, instead of
+        redacted placeholders or LLM-rephrased terms."""
+        unmasked_summary = self.redactor.unmask_text(summary)
+        raw_excerpt = raw_text[:self.config.embedding_raw_excerpt_chars].strip() if raw_text else ""
+        combined = f"{title}\n{unmasked_summary}\n{raw_excerpt}".strip()
+        return self._embed_one(combined)
 
     def _emit_progress(
         self,
@@ -1399,6 +1610,17 @@ class DocumentCorpus:
             tokens_per_word=self.config.token_estimate_tokens_per_word,
         )
 
+    def _scaled_summary_budget(self, doc_tokens: int) -> int:
+        """Scale summary output budget with document size.  Small docs
+        (<3000 tokens) use the base budget; larger docs get proportionally
+        more up to a cap."""
+        base = self.config.doc_summary_max_output_tokens
+        cap = self.config.doc_summary_max_output_tokens_cap
+        if doc_tokens <= 3000:
+            return base
+        scale_factor = min(doc_tokens / 3000, cap / base)
+        return min(int(base * scale_factor), cap)
+
     @staticmethod
     def _truncate_text(text: str, limit: int) -> str:
         compact = re.sub(r"\s+", " ", (text or "").strip())
@@ -1578,36 +1800,18 @@ class DocumentCorpus:
         max_output_tokens: int,
         error_text: str = "",
     ) -> None:
-        log_root = self._resolve_debug_log_dir()
-        if log_root is None:
-            return
-
-        llm_dir = log_root / "llm"
-        llm_dir.mkdir(parents=True, exist_ok=True)
-        output_path = llm_dir / f"{uuid.uuid4()}.txt"
-        lines = [
-            f"Purpose: {purpose}",
-            f"Model provider: {self.config.ai_provider}",
-            f"Max output tokens: {max_output_tokens}",
-            "",
-            "=== System Prompt ===",
-            self.redactor.unmask_text(system_prompt).strip() or "(empty)",
-            "",
-            "=== User Prompt ===",
-            self.redactor.unmask_text(user_prompt).strip() or "(empty)",
-            "",
-            "=== Response ===",
-            self.redactor.unmask_text(response_text).strip() or "(empty)",
-        ]
-        if error_text:
-            lines.extend(
-                [
-                    "",
-                    "=== Error ===",
-                    error_text,
-                ]
-            )
-        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+        write_llm_debug_log_pair(
+            log_root=self._resolve_debug_log_dir(),
+            redactor=self.redactor,
+            provider=self.config.ai_provider,
+            model_name=self.config.chat_model,
+            purpose=purpose,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+            response_text=response_text,
+            error_text=error_text,
+        )
 
     def _resolve_debug_log_dir(self) -> Path | None:
         if not self.config.debug:

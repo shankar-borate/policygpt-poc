@@ -35,7 +35,7 @@ class Config:
     ai_provider: str = ""
     chat_model: str = ""
     embedding_model: str = ""
-    public_base_url: str = "http://127.0.0.1:8010"
+    public_base_url: str = "http://127.0.0.1:8012"
     bedrock_region: str = "ap-south-1"
     bedrock_gpt_model_size: str = ""
     debug_log_dir: str = r"D:\policy-mgmt\data\durandhar_html\metadata"
@@ -44,8 +44,25 @@ class Config:
     top_sections_per_doc: int = 3
     max_sections_to_llm: int = 4
     rerank_section_candidates: int = 12
+    exact_top_docs: int = 2
+    exact_top_sections_per_doc: int = 4
+    exact_max_sections_to_llm: int = 3
+    exact_rerank_section_candidates: int = 10
+    broad_top_docs: int = 6
+    broad_top_sections_per_doc: int = 6
+    broad_max_sections_to_llm: int = 8
+    broad_rerank_section_candidates: int = 24
     max_evidence_snippets_per_section: int = 3
     evidence_snippet_char_limit: int = 320
+    embedding_raw_excerpt_chars: int = 600
+    answer_context_doc_summary_char_limit: int = 260
+    evidence_chunk_char_limit: int = 900
+    evidence_neighboring_units: int = 1
+    small_section_full_text_chars: int = 1500
+    exact_answer_evidence_char_limit: int = 1600
+    broad_answer_evidence_char_limit: int = 1200
+    answer_evidence_block_limit_exact: int = 2
+    answer_evidence_block_limit_broad: int = 2
 
     max_recent_messages: int = 6
     summarize_after_turns: int = 8
@@ -69,6 +86,7 @@ class Config:
     )
 
     doc_summary_max_output_tokens: int = 400
+    doc_summary_max_output_tokens_cap: int = 800
     doc_summary_chunk_max_output_tokens: int = 220
     section_summary_max_output_tokens: int = 220
     chat_max_output_tokens: int = 900
@@ -85,7 +103,11 @@ class Config:
     section_title_weight: float = 0.12
     section_metadata_weight: float = 0.12
     answerability_min_section_score: float = 0.24
+    answerability_high_confidence_score: float = 0.50
     answerability_min_support_matches: int = 1
+    answerability_min_support_matches_multi_doc: int = 2
+    answerability_min_exact_evidence_matches: int = 1
+    exact_query_section_parent_weight_scale: float = 0.75
 
     debug: bool = True
 

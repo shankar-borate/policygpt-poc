@@ -18,4 +18,4 @@ if __name__ == "__main__":
         "[Policy GPT] Starting server on http://127.0.0.1:8010 (plain HTTP, not HTTPS).",
         flush=True,
     )
-    uvicorn.run("app:app", host="0.0.0.0", port=8010, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=8012, reload=False)

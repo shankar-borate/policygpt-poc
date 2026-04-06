@@ -127,6 +127,7 @@ DOMAIN_TOPIC_PHRASE_TERMS: set[str] = {
 
 INTENT_TO_SECTION_TYPES: dict[str, tuple[str, ...]] = {
     "document_lookup": ("general", "scope", "process", "checklist"),
+    "aggregate": ("scope", "eligibility", "definitions", "timeline", "exceptions"),
     "checklist": ("checklist", "process", "documents_required"),
     "process": ("process", "checklist", "timeline", "responsibilities"),
     "eligibility": ("eligibility", "scope", "exceptions"),
@@ -147,6 +148,7 @@ class QueryAnalysis:
     canonical_question: str
     detail_requested: bool
     multi_doc_expected: bool
+    exact_match_expected: bool
     context_dependent: bool
     intents: list[str] = field(default_factory=list)
     topic_hints: list[str] = field(default_factory=list)
@@ -207,6 +209,13 @@ class QueryAnalyzer:
             normalized_question=normalized_question,
             intents=intents,
         )
+        exact_match_expected = self._prefers_precise_evidence(
+            user_question=user_question,
+            normalized_question=normalized_question,
+            intents=intents,
+            focus_terms=focus_terms,
+            multi_doc_expected=multi_doc_expected,
+        )
         canonical_lines = [f"User question: {user_question.strip()}"]
         if topic_hints:
             canonical_lines.append(f"Inferred policy topics: {', '.join(topic_hints)}")
@@ -214,6 +223,8 @@ class QueryAnalyzer:
             canonical_lines.append(f"Inferred answer intent: {', '.join(intents)}")
         if multi_doc_expected:
             canonical_lines.append("Expected evidence coverage: multiple documents")
+        if exact_match_expected:
+            canonical_lines.append("Evidence preference: exact raw policy wording")
         if context_dependent:
             canonical_lines.append("Conversation context: active follow-up")
         if supporting_titles:
@@ -227,6 +238,7 @@ class QueryAnalyzer:
             canonical_question="\n".join(canonical_lines),
             detail_requested=detail_requested,
             multi_doc_expected=multi_doc_expected,
+            exact_match_expected=exact_match_expected,
             context_dependent=context_dependent,
             intents=intents,
             topic_hints=topic_hints,
@@ -467,3 +479,44 @@ class QueryAnalyzer:
                 return True
 
         return False
+
+    @staticmethod
+    def _prefers_precise_evidence(
+        user_question: str,
+        normalized_question: str,
+        intents: list[str],
+        focus_terms: list[str],
+        multi_doc_expected: bool,
+    ) -> bool:
+        if multi_doc_expected or {"document_lookup", "aggregate", "comparison"}.intersection(intents):
+            return False
+
+        precision_phrases = (
+            "what is",
+            "what are",
+            "who is",
+            "when is",
+            "define",
+            "meaning of",
+            "stands for",
+            "what does",
+            "does it mention",
+            "is there",
+            "how much",
+            "how many",
+        )
+        if any(phrase in normalized_question for phrase in precision_phrases):
+            return True
+
+        informative_tokens = [
+            token
+            for token in tokenize_text(user_question)
+            if token not in STOPWORDS
+        ]
+        if any(any(part.isdigit() for part in term.split("_")) for term in focus_terms):
+            return True
+
+        if len(informative_tokens) <= 6 and any("_" in term for term in focus_terms):
+            return True
+
+        return len(informative_tokens) <= 4 and "process" not in intents and "checklist" not in intents

@@ -13,10 +13,12 @@ from policygpt.models import ChatResult, Message, SourceReference
 from policygpt.models import utc_now_iso
 from policygpt.services.base import AIService
 from policygpt.services.bedrock_service import BedrockService
+from policygpt.services.debug_logging import write_llm_debug_log_pair
 from policygpt.services.file_extractor import FileExtractor
 from policygpt.services.openai_service import OpenAIService
 from policygpt.services.query_analyzer import QueryAnalysis, QueryAnalyzer
 from policygpt.services.redaction import Redactor
+from policygpt.services.taxonomy import unique_preserving_order
 
 
 class PolicyGPTBot:
@@ -100,7 +102,12 @@ class PolicyGPTBot:
 
             retrieval_query = self._build_retrieval_query(thread, query_analysis)
             masked_retrieval_query = self.redactor.mask_text(retrieval_query)
-            query_vec = self._embed_one(masked_retrieval_query)
+            # Fix: embed only the user's question so the semantic vector is
+            # not diluted by conversation context or metadata labels.  The
+            # full retrieval_query feeds BM25/lexical channels via
+            # query_analysis.expanded_terms already.  Use unmasked text so
+            # the vector matches unmasked index vectors.
+            query_vec = self._embed_one(query_analysis.canonical_question)
             preferred_doc_ids = thread.active_doc_ids if query_analysis.context_dependent else []
             preferred_section_ids = thread.active_section_ids if query_analysis.context_dependent else []
 
@@ -248,7 +255,8 @@ class PolicyGPTBot:
             "20. If the evidence covers only part of the answer, answer only that part and say what is not clearly stated.\n"
             "21. Prefer evidence snippets over broad summaries when they conflict.\n"
             "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format.\n"
-            "23. If recent chat suggests one document but the current retrieved evidence explicitly defines the asked term in another document, follow the current evidence and briefly note the difference if needed."
+            "23. If recent chat suggests one document but the current retrieved evidence explicitly defines the asked term in another document, follow the current evidence and briefly note the difference if needed.\n"
+            "24. Treat raw policy evidence blocks as the source of truth. Use summaries only for orientation. If a raw evidence block and a summary differ, trust the raw evidence."
         )
 
     def _answer_format_guidance(self, query_analysis: QueryAnalysis) -> str:
@@ -261,6 +269,13 @@ class PolicyGPTBot:
             return (
                 "Start with the direct difference, then use short bullets for each item being compared. "
                 "Call out document-specific differences explicitly when the evidence comes from different sources."
+                + detail_suffix
+            )
+        if query_analysis.exact_match_expected:
+            return (
+                "Start with the exact answer in the first line. "
+                "Base labels, dates, numbers, thresholds, and definitions on the raw policy evidence blocks. "
+                "If the exact wording is not clearly supported, say so instead of generalizing."
                 + detail_suffix
             )
         if query_analysis.multi_doc_expected:
@@ -315,23 +330,39 @@ class PolicyGPTBot:
         if best_score < self.config.answerability_min_section_score:
             return False
 
+        # Fix #6: if retrieval score is high enough, trust semantic
+        # retrieval even when lexical term overlap is weak (user may use
+        # synonyms or different phrasing).
+        if best_score >= self.config.answerability_high_confidence_score:
+            return True
+
+        # Also trust strong topic/metadata alignment as an alternative
+        # to exact term match in evidence blocks.
+        section_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_section.metadata_tags)
+        document_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_document.metadata_tags)
+        if max(section_topic_alignment, document_topic_alignment) >= 0.55:
+            return True
+
         support_match_count = 0
         supporting_doc_ids: set[str] = set()
+        exact_evidence_match_count = 0
         for section, _ in top_sections:
-            snippets = self.corpus.extract_evidence_snippets(section, query_analysis, limit=2)
-            if any(
-                term.replace("_", " ") in re.sub(r"\s+", " ", snippet).casefold()
-                for term in (query_analysis.expanded_terms or query_analysis.focus_terms)
-                for snippet in snippets
-            ):
+            evidence_blocks = self.corpus.extract_answer_evidence_blocks(section, query_analysis, limit=2)
+            if self._evidence_blocks_support_query(evidence_blocks, query_analysis):
                 support_match_count += 1
                 supporting_doc_ids.add(section.doc_id)
+            if query_analysis.exact_match_expected:
+                exact_evidence_match_count += self.corpus.precise_evidence_match_count(section, query_analysis)
 
         if support_match_count < self.config.answerability_min_support_matches:
             return False
 
+        if query_analysis.exact_match_expected:
+            if exact_evidence_match_count < self.config.answerability_min_exact_evidence_matches:
+                return False
+
         if query_analysis.multi_doc_expected and len({document.doc_id for document, _ in top_docs}) > 1:
-            if len(supporting_doc_ids) < 2:
+            if len(supporting_doc_ids) < self.config.answerability_min_support_matches_multi_doc:
                 return False
 
         section_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_section.metadata_tags)
@@ -407,6 +438,35 @@ class PolicyGPTBot:
         return cleaned.strip()
 
     @staticmethod
+    def _truncate_context_text(text: str, limit: int) -> str:
+        compact = re.sub(r"\s+", " ", (text or "").strip())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _evidence_blocks_support_query(evidence_blocks: list[str], query_analysis: QueryAnalysis) -> bool:
+        if not evidence_blocks:
+            return False
+
+        query_terms = unique_preserving_order(
+            query_analysis.focus_terms if query_analysis.exact_match_expected else (query_analysis.expanded_terms or query_analysis.focus_terms)
+        )
+        for block in evidence_blocks:
+            normalized_block = re.sub(r"\s+", " ", block).casefold()
+            if any(term.replace("_", " ") in normalized_block for term in query_terms):
+                return True
+        return False
+
+    @staticmethod
+    def _document_context_limit(query_analysis: QueryAnalysis) -> int:
+        if query_analysis.multi_doc_expected:
+            return 4
+        if query_analysis.exact_match_expected:
+            return 2
+        return 3
+
+    @staticmethod
     def _derive_thread_title(text: str, limit: int = 56) -> str:
         cleaned = re.sub(r"\s+", " ", text).strip()
         if not cleaned:
@@ -469,27 +529,61 @@ class PolicyGPTBot:
         ) or "None"
 
         doc_context_parts = []
-        for document, score in top_docs:
+        for document, score in top_docs[: self._document_context_limit(query_analysis)]:
+            orientation_summary = self._truncate_context_text(
+                self.redactor.unmask_text(document.summary),
+                self.config.answer_context_doc_summary_char_limit,
+            )
             doc_context_parts.append(
                 f"[Document: {document.title} | Score: {score:.4f} | File: {document.source_path}]\n"
                 f"Metadata: type={document.document_type or 'document'}; "
                 f"tags={', '.join(document.metadata_tags) or 'none'}; "
                 f"audience={', '.join(document.audiences) or 'none'}; "
                 f"version={document.version or 'unknown'}; "
-                f"effective_date={document.effective_date or 'unknown'}\n"
-                f"Document summary:\n{self.redactor.unmask_text(document.summary)}"
+                f"effective_date={document.effective_date or 'unknown'}"
+                + (
+                    ""
+                    if query_analysis.exact_match_expected
+                    else f"\nDocument orientation:\n{orientation_summary or '(empty)'}"
+                )
             )
 
         section_context_parts = []
+        seen_evidence: set[str] = set()
         for section, score in top_sections:
             document = self.documents[section.doc_id]
-            evidence_snippets = self.corpus.extract_evidence_snippets(section, query_analysis)
-            evidence_block = "\n".join(f"- {snippet}" for snippet in evidence_snippets) or "- No focused snippet extracted."
+            raw_evidence_blocks = self.corpus.extract_answer_evidence_blocks(section, query_analysis)
+
+            # Fix #9: deduplicate evidence blocks across sections so the
+            # LLM doesn't see the same raw text twice (common when two
+            # sections from the same document are retrieved).
+            unique_blocks: list[str] = []
+            for block in raw_evidence_blocks:
+                block_key = re.sub(r"\s+", " ", block).strip().casefold()
+                if block_key not in seen_evidence:
+                    seen_evidence.add(block_key)
+                    unique_blocks.append(block)
+
+            raw_evidence_text = (
+                "\n\n".join(
+                    f"Raw evidence block {index}:\n{block}"
+                    for index, block in enumerate(unique_blocks, start=1)
+                )
+                or "Raw evidence block 1:\n(no focused raw evidence extracted)"
+            )
+            section_orientation = self._truncate_context_text(
+                self.redactor.unmask_text(section.summary),
+                self.config.answer_context_doc_summary_char_limit,
+            )
             section_context_parts.append(
                 f"[Document: {document.title} | Section: {section.title} | Score: {score:.4f} | File: {section.source_path}]\n"
                 f"Section type: {section.section_type or 'general'} | Tags: {', '.join(section.metadata_tags) or 'none'}\n"
-                f"Section summary:\n{self.redactor.unmask_text(section.summary)}\n\n"
-                f"Relevant evidence snippets:\n{evidence_block}"
+                + (
+                    ""
+                    if query_analysis.exact_match_expected
+                    else f"Section orientation:\n{section_orientation or '(empty)'}\n\n"
+                )
+                + f"Raw policy evidence:\n{raw_evidence_text}"
             )
 
         return (
@@ -498,11 +592,16 @@ class PolicyGPTBot:
             f"Recent chat:\n{recent_chat}\n\n"
             f"Question analysis:\n{query_analysis.canonical_question}\n\n"
             f"Answer format guidance:\n{self._answer_format_guidance(query_analysis)}\n\n"
-            f"Retrieved document context:\n{chr(10).join(doc_context_parts)}\n\n"
             f"Retrieved section evidence:\n{chr(10).join(section_context_parts)}\n\n"
+            f"Retrieved document context:\n{chr(10).join(doc_context_parts) or 'None'}\n\n"
+            "Evidence priority:\n"
+            "1. Raw policy evidence blocks\n"
+            "2. Section orientation summaries\n"
+            "3. Document orientation summaries\n\n"
             "Answer the user conversationally, but ground every claim in the provided evidence. "
             "Synthesize the policy into a clean, readable answer instead of copying document structure or wording. "
-            "When multiple documents contribute, combine the overlapping evidence and point out any differences instead of flattening them into one rule."
+            "When multiple documents contribute, combine the overlapping evidence and point out any differences instead of flattening them into one rule. "
+            "For exact labels, numbers, thresholds, dates, and definitions, cite only what the raw policy evidence blocks clearly support."
         )
 
     def _write_retrieval_log(
@@ -770,48 +869,52 @@ class PolicyGPTBot:
         max_output_tokens: int,
         error_text: str = "",
     ) -> None:
-        log_root = self._resolve_debug_log_dir()
-        if log_root is None:
-            return
-
-        llm_dir = log_root / "llm"
-        llm_dir.mkdir(parents=True, exist_ok=True)
-        output_path = llm_dir / f"{uuid.uuid4()}.txt"
-        lines = [
-            f"Purpose: {purpose}",
-            f"Model provider: {self.config.ai_provider}",
-            f"Max output tokens: {max_output_tokens}",
-            "",
-            "=== System Prompt ===",
-            self.redactor.unmask_text(system_prompt).strip() or "(empty)",
-            "",
-            "=== User Prompt ===",
-            self.redactor.unmask_text(user_prompt).strip() or "(empty)",
-            "",
-            "=== Response ===",
-            self.redactor.unmask_text(response_text).strip() or "(empty)",
-        ]
-        if error_text:
-            lines.extend(
-                [
-                    "",
-                    "=== Error ===",
-                    error_text,
-                ]
-            )
-        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+        write_llm_debug_log_pair(
+            log_root=self._resolve_debug_log_dir(),
+            redactor=self.redactor,
+            provider=self.config.ai_provider,
+            model_name=self.config.chat_model,
+            purpose=purpose,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+            response_text=response_text,
+            error_text=error_text,
+        )
 
     def _refresh_conversation_summary(self, thread) -> str:
         recent_chat = "\n".join(f"{message.role.upper()}: {message.content}" for message in thread.recent_messages)
+
+        # Fix: include which documents and sections were referenced so
+        # follow-up questions can retrieve the same context.
+        source_context_parts: list[str] = []
+        if thread.active_doc_ids:
+            active_titles = [
+                self.documents[doc_id].title
+                for doc_id in thread.active_doc_ids
+                if doc_id in self.documents
+            ]
+            if active_titles:
+                source_context_parts.append(f"Documents referenced: {', '.join(active_titles)}")
+        if thread.last_answer_sources:
+            section_labels = [
+                f"{src.document_title} > {src.section_title}"
+                for src in thread.last_answer_sources[:6]
+            ]
+            source_context_parts.append(f"Sections referenced: {', '.join(section_labels)}")
+        source_context = "\n".join(source_context_parts)
+
         system_prompt = (
             "Summarize this conversation for future retrieval and follow-up handling. "
-            "Capture current document, current topic, key answered points, and unresolved questions. "
+            "Capture the specific document names, section titles, current topic, "
+            "key answered points, and unresolved questions. "
             "Be concise and factual."
         )
+        user_prompt = f"{recent_chat}\n\n{source_context}" if source_context else recent_chat
         summary = self._llm_text_with_debug_log(
             purpose="conversation_summary",
             system_prompt=self.redactor.mask_text(system_prompt),
-            user_prompt=self.redactor.mask_text(recent_chat),
+            user_prompt=self.redactor.mask_text(user_prompt),
             max_output_tokens=self.config.conversation_summary_max_output_tokens,
         )
         return self.redactor.unmask_text(summary)
