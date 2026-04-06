@@ -5,6 +5,8 @@ from fastapi import HTTPException
 from policygpt.bot import PolicyGPTBot
 from policygpt.config import Config
 from policygpt.factory import create_ready_bot
+from policygpt.services.pricing_loader import ModelPricingLoader
+from policygpt.services.usage_metrics import LLMUsageTracker
 
 
 class ServerRuntime:
@@ -12,6 +14,8 @@ class ServerRuntime:
         self.config = config
         self.lock = RLock()
         self.bot: PolicyGPTBot | None = None
+        self.usage_tracker = LLMUsageTracker(config.chat_model)
+        self.pricing_loader = ModelPricingLoader()
         self.status = "starting"
         self.error: str | None = None
         self.document_folder = config.document_folder
@@ -28,6 +32,8 @@ class ServerRuntime:
                 return
 
             self.bot = None
+            self.usage_tracker.reset(self.config.chat_model)
+            self.usage_tracker.set_pricing_snapshot(self.pricing_loader.load_snapshot(self.config))
             self.status = "in_progress"
             self.error = None
             self.indexing_processed_files = 0
@@ -73,6 +79,7 @@ class ServerRuntime:
                 folder=self.document_folder,
                 progress_callback=self._update_progress,
                 config=self.config,
+                usage_tracker=self.usage_tracker,
             )
             with self.lock:
                 self.bot = bot
@@ -113,3 +120,6 @@ class ServerRuntime:
             self.indexing_current_file = current_file
             self.document_count = document_count
             self.section_count = section_count
+
+    def usage_payload(self) -> dict:
+        return self.usage_tracker.snapshot()

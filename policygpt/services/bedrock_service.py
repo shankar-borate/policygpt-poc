@@ -7,6 +7,7 @@ import numpy as np
 from botocore.exceptions import BotoCoreError, ClientError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 
 from policygpt.services.base import AIRequestTooLargeError
+from policygpt.services.usage_metrics import LLMUsageTracker, estimate_text_tokens
 
 
 class BedrockService:
@@ -17,6 +18,7 @@ class BedrockService:
         region_name: str,
         rate_limit_retries: int = 2,
         rate_limit_backoff_seconds: float = 8.0,
+        usage_tracker: LLMUsageTracker | None = None,
         client: Any | None = None,
     ) -> None:
         self.client = client or boto3.client("bedrock-runtime", region_name=region_name)
@@ -25,6 +27,7 @@ class BedrockService:
         self.region_name = region_name
         self.rate_limit_retries = max(0, rate_limit_retries)
         self.rate_limit_backoff_seconds = max(0.0, rate_limit_backoff_seconds)
+        self.usage_tracker = usage_tracker
 
     def embed_texts(self, texts: list[str]) -> list[np.ndarray]:
         vectors: list[np.ndarray] = []
@@ -59,7 +62,14 @@ class BedrockService:
                 converse_request["system"] = [{"text": system_prompt}]
 
             response = self._run_with_retries(lambda: self.client.converse(**converse_request))
-            return self._extract_converse_text(response)
+            response_text = self._extract_converse_text(response)
+            self._record_usage(
+                usage=self._extract_converse_usage(response),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_text=response_text,
+            )
+            return response_text
 
         native_request = {
             "model": self.chat_model,
@@ -77,7 +87,14 @@ class BedrockService:
             )
         )
         payload = json.loads(response["body"].read())
-        return self._extract_chat_text(payload)
+        response_text = self._extract_chat_text(payload)
+        self._record_usage(
+            usage=self._extract_payload_usage(payload),
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_text=response_text,
+        )
+        return response_text
 
     def _uses_converse_api(self) -> bool:
         normalized_model = (self.chat_model or "").strip().lower()
@@ -143,6 +160,50 @@ class BedrockService:
                 if isinstance(text, str):
                     text_parts.append(text)
         return "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
+
+    @staticmethod
+    def _extract_payload_usage(payload: dict[str, Any]) -> dict[str, int]:
+        usage = payload.get("usage") or {}
+        return {
+            "input_tokens": int(
+                usage.get("prompt_tokens")
+                or usage.get("input_tokens")
+                or usage.get("inputTokens")
+                or 0
+            ),
+            "output_tokens": int(
+                usage.get("completion_tokens")
+                or usage.get("output_tokens")
+                or usage.get("outputTokens")
+                or 0
+            ),
+        }
+
+    @staticmethod
+    def _extract_converse_usage(payload: dict[str, Any]) -> dict[str, int]:
+        usage = payload.get("usage") or {}
+        return {
+            "input_tokens": int(usage.get("inputTokens") or usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("outputTokens") or usage.get("output_tokens") or 0),
+        }
+
+    def _record_usage(self, *, usage: dict[str, int], system_prompt: str, user_prompt: str, response_text: str) -> None:
+        if self.usage_tracker is None:
+            return
+
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+
+        if input_tokens <= 0:
+            input_tokens = estimate_text_tokens(system_prompt) + estimate_text_tokens(user_prompt)
+        if output_tokens <= 0:
+            output_tokens = estimate_text_tokens(response_text)
+
+        self.usage_tracker.record_call(
+            model_name=self.chat_model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
 
     @staticmethod
     def is_request_too_large_error(exc: Exception) -> bool:

@@ -19,6 +19,7 @@ from policygpt.services.openai_service import OpenAIService
 from policygpt.services.query_analyzer import QueryAnalysis, QueryAnalyzer
 from policygpt.services.redaction import Redactor
 from policygpt.services.taxonomy import unique_preserving_order
+from policygpt.services.usage_metrics import LLMUsageTracker
 
 
 class PolicyGPTBot:
@@ -26,12 +27,14 @@ class PolicyGPTBot:
         self,
         config: Config,
         ai: AIService | None = None,
+        usage_tracker: LLMUsageTracker | None = None,
         redactor: Redactor | None = None,
         extractor: FileExtractor | None = None,
         corpus: DocumentCorpus | None = None,
         conversations: ConversationManager | None = None,
     ) -> None:
         self.config = config
+        self.usage_tracker = usage_tracker
         self.redactor = redactor or Redactor(config.redaction_rules)
         self.ai = ai or self._build_ai_service()
         self.extractor = extractor or FileExtractor(config)
@@ -217,6 +220,7 @@ class PolicyGPTBot:
                 region_name=self.config.bedrock_region,
                 rate_limit_retries=self.config.ai_rate_limit_retries,
                 rate_limit_backoff_seconds=self.config.ai_rate_limit_backoff_seconds,
+                usage_tracker=self.usage_tracker,
             )
 
         if self.config.ai_provider == "openai":
@@ -225,6 +229,7 @@ class PolicyGPTBot:
                 self.config.embedding_model,
                 rate_limit_retries=self.config.ai_rate_limit_retries,
                 rate_limit_backoff_seconds=self.config.ai_rate_limit_backoff_seconds,
+                usage_tracker=self.usage_tracker,
             )
 
         raise ValueError(f"Unsupported AI provider: {self.config.ai_provider}")

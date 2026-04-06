@@ -35,6 +35,7 @@ class PolicyApiServer:
 
         app.add_api_route("/", self.index, methods=["GET"], response_class=HTMLResponse)
         app.add_api_route("/api/health", self.health, methods=["GET"])
+        app.add_api_route("/api/usage", self.usage, methods=["GET"])
         app.add_api_route("/api/threads", self.list_threads, methods=["GET"])
         app.add_api_route("/api/threads", self.create_thread, methods=["POST"])
         app.add_api_route("/api/threads/{thread_id}", self.get_thread, methods=["GET"])
@@ -58,6 +59,10 @@ class PolicyApiServer:
                 "thread_count": len(bot.threads) if bot else 0,
                 "progress": self.runtime.progress_payload(),
             }
+
+    def usage(self) -> dict:
+        with self.runtime.lock:
+            return self.runtime.usage_payload()
 
     def list_threads(self) -> dict:
         with self.runtime.lock:

@@ -87,6 +87,8 @@ Both scripts write to `app.log` and store the process id in `app.pid`.
 - The server starts immediately and indexes documents in the background.
 - Use `http://127.0.0.1:8010`, not `https://127.0.0.1:8010`. TLS is not configured in `app.py`.
 - While indexing is running, `/api/health` returns `status: "in_progress"` plus file progress details.
+- The bottom-left usage widget shows the active LLM, cumulative since-startup input/output tokens, and estimated total cost using a pricing snapshot read once at startup.
+- The usage widget refreshes every 10 seconds from `/api/usage`.
 - Thread state is stored in memory and resets when the server restarts.
 - Answers are returned in concise Markdown and end with `Reference: <policy-file-name>`.
 - When `Config.debug` is `True`, each LLM call writes a request file to `<debug_log_dir>\llm\requests` and a matching response file to `<debug_log_dir>\llm\responses`.

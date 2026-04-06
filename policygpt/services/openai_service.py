@@ -4,6 +4,7 @@ import numpy as np
 from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 
 from policygpt.services.base import AIRequestTooLargeError
+from policygpt.services.usage_metrics import LLMUsageTracker, estimate_text_tokens
 
 
 class OpenAIService:
@@ -13,12 +14,15 @@ class OpenAIService:
         embedding_model: str,
         rate_limit_retries: int = 2,
         rate_limit_backoff_seconds: float = 8.0,
+        usage_tracker: LLMUsageTracker | None = None,
+        client=None,
     ):
-        self.client = OpenAI()
+        self.client = client or OpenAI()
         self.chat_model = chat_model
         self.embedding_model = embedding_model
         self.rate_limit_retries = max(0, rate_limit_retries)
         self.rate_limit_backoff_seconds = max(0.0, rate_limit_backoff_seconds)
+        self.usage_tracker = usage_tracker
 
     def embed_texts(self, texts: list[str]) -> list[np.ndarray]:
         if not texts:
@@ -44,7 +48,28 @@ class OpenAIService:
             )
         )
         content = response.choices[0].message.content
-        return (content or "").strip()
+        response_text = (content or "").strip()
+        self._record_usage(response, system_prompt=system_prompt, user_prompt=user_prompt, response_text=response_text)
+        return response_text
+
+    def _record_usage(self, response, *, system_prompt: str, user_prompt: str, response_text: str) -> None:
+        if self.usage_tracker is None:
+            return
+
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+        output_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
+
+        if input_tokens is None:
+            input_tokens = estimate_text_tokens(system_prompt) + estimate_text_tokens(user_prompt)
+        if output_tokens is None:
+            output_tokens = estimate_text_tokens(response_text)
+
+        self.usage_tracker.record_call(
+            model_name=self.chat_model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
 
     def _run_with_retries(self, operation):
         attempts = self.rate_limit_retries + 1

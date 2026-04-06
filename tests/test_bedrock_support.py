@@ -3,6 +3,7 @@ import unittest
 
 from policygpt.config import Config
 from policygpt.services.bedrock_service import BedrockService
+from policygpt.services.usage_metrics import LLMUsageTracker
 
 
 class _FakeStreamingBody:
@@ -47,12 +48,17 @@ class ConfigProfileTests(unittest.TestCase):
 class BedrockServiceRoutingTests(unittest.TestCase):
     def test_gpt_oss_profiles_continue_using_invoke_model(self) -> None:
         client = _FakeBedrockClient(
-            invoke_response={"choices": [{"message": {"content": "invoke-model-answer"}}]}
+            invoke_response={
+                "choices": [{"message": {"content": "invoke-model-answer"}}],
+                "usage": {"prompt_tokens": 31, "completion_tokens": 9},
+            }
         )
+        tracker = LLMUsageTracker("openai.gpt-oss-20b-1:0")
         service = BedrockService(
             chat_model="openai.gpt-oss-20b-1:0",
             embedding_model="amazon.titan-embed-text-v2:0",
             region_name="ap-south-1",
+            usage_tracker=tracker,
             client=client,
         )
 
@@ -71,10 +77,16 @@ class BedrockServiceRoutingTests(unittest.TestCase):
         self.assertEqual(request_body["max_completion_tokens"], 123)
         self.assertEqual(request_body["messages"][0]["role"], "system")
         self.assertEqual(request_body["messages"][1]["role"], "user")
+        self.assertEqual(tracker.snapshot()["input_tokens"], 31)
+        self.assertEqual(tracker.snapshot()["output_tokens"], 9)
 
     def test_claude_profiles_use_converse(self) -> None:
         client = _FakeBedrockClient(
             converse_response={
+                "usage": {
+                    "inputTokens": 44,
+                    "outputTokens": 12,
+                },
                 "output": {
                     "message": {
                         "content": [
@@ -84,10 +96,12 @@ class BedrockServiceRoutingTests(unittest.TestCase):
                 }
             }
         )
+        tracker = LLMUsageTracker("global.anthropic.claude-sonnet-4-6")
         service = BedrockService(
             chat_model="global.anthropic.claude-sonnet-4-6",
             embedding_model="amazon.titan-embed-text-v2:0",
             region_name="ap-south-1",
+            usage_tracker=tracker,
             client=client,
         )
 
@@ -106,6 +120,8 @@ class BedrockServiceRoutingTests(unittest.TestCase):
         self.assertEqual(request["system"], [{"text": "You are helpful."}])
         self.assertEqual(request["messages"], [{"role": "user", "content": [{"text": "Hello"}]}])
         self.assertEqual(request["inferenceConfig"], {"maxTokens": 456})
+        self.assertEqual(tracker.snapshot()["input_tokens"], 44)
+        self.assertEqual(tracker.snapshot()["output_tokens"], 12)
 
 
 if __name__ == "__main__":

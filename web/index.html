@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Policy GPT</title>
     <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/usage-widget.css">
 </head>
 <body>
     <div class="app-shell">
@@ -42,6 +43,31 @@
                     <span>Corpus</span>
                 </div>
                 <div id="corpus-summary" class="corpus-summary"></div>
+            </section>
+
+            <section class="sidebar-section">
+                <div class="section-heading">
+                    <span>LLM Meter</span>
+                </div>
+                <aside id="usage-widget" class="usage-widget" aria-live="polite" aria-atomic="true">
+                    <p class="usage-widget-eyebrow">Usage and Cost</p>
+                    <p id="usage-model" class="usage-widget-model">Loading model usage...</p>
+                    <div class="usage-widget-grid">
+                        <div>
+                            <span class="usage-widget-label">Input</span>
+                            <strong id="usage-input-tokens" class="usage-widget-value">0</strong>
+                        </div>
+                        <div>
+                            <span class="usage-widget-label">Output</span>
+                            <strong id="usage-output-tokens" class="usage-widget-value">0</strong>
+                        </div>
+                        <div class="usage-widget-total">
+                            <span class="usage-widget-label">Total price</span>
+                            <strong id="usage-total-price" class="usage-widget-value">$0.000000</strong>
+                        </div>
+                    </div>
+                    <p id="usage-meta" class="usage-widget-meta">Reading pricing snapshot from startup...</p>
+                </aside>
             </section>
         </aside>
 
@@ -92,5 +118,6 @@
     </div>
 
     <script src="/static/app.js"></script>
+    <script src="/static/usage-widget.js"></script>
 </body>
 </html>
