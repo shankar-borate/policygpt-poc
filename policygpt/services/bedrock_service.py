@@ -17,8 +17,9 @@ class BedrockService:
         region_name: str,
         rate_limit_retries: int = 2,
         rate_limit_backoff_seconds: float = 8.0,
+        client: Any | None = None,
     ) -> None:
-        self.client = boto3.client("bedrock-runtime", region_name=region_name)
+        self.client = client or boto3.client("bedrock-runtime", region_name=region_name)
         self.chat_model = chat_model
         self.embedding_model = embedding_model
         self.region_name = region_name
@@ -43,6 +44,23 @@ class BedrockService:
         return vectors
 
     def llm_text(self, system_prompt: str, user_prompt: str, max_output_tokens: int) -> str:
+        if self._uses_converse_api():
+            converse_request = {
+                "modelId": self.chat_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": user_prompt}],
+                    }
+                ],
+                "inferenceConfig": {"maxTokens": max_output_tokens},
+            }
+            if system_prompt.strip():
+                converse_request["system"] = [{"text": system_prompt}]
+
+            response = self._run_with_retries(lambda: self.client.converse(**converse_request))
+            return self._extract_converse_text(response)
+
         native_request = {
             "model": self.chat_model,
             "messages": [
@@ -60,6 +78,10 @@ class BedrockService:
         )
         payload = json.loads(response["body"].read())
         return self._extract_chat_text(payload)
+
+    def _uses_converse_api(self) -> bool:
+        normalized_model = (self.chat_model or "").strip().lower()
+        return normalized_model.startswith("anthropic.") or ".anthropic." in normalized_model
 
     def _run_with_retries(self, operation):
         attempts = self.rate_limit_retries + 1
@@ -101,6 +123,26 @@ class BedrockService:
                         text_parts.append(text)
             return "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
         return str(content).strip()
+
+    @staticmethod
+    def _extract_converse_text(payload: dict[str, Any]) -> str:
+        output = payload.get("output") or {}
+        message = output.get("message") or {}
+        content = message.get("content") or []
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return str(content).strip()
+
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        return "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
 
     @staticmethod
     def is_request_too_large_error(exc: Exception) -> bool:

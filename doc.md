@@ -36,9 +36,13 @@ The app now supports two AI providers through config:
   By config profile:
   - `ai_profile = "bedrock-20b"` maps to `openai.gpt-oss-20b-1:0`
   - `ai_profile = "bedrock-120b"` maps to `openai.gpt-oss-120b-1:0`
+  - `ai_profile = "bedrock-claude-sonnet-4-6"` maps to `global.anthropic.claude-sonnet-4-6`
+  - `ai_profile = "bedrock-claude-opus-4-6"` maps to `global.anthropic.claude-opus-4-6-v1`
   - embeddings use `amazon.titan-embed-text-v2:0`
+  - Claude Bedrock profiles use the Bedrock `Converse` API; GPT-OSS Bedrock profiles keep using the OpenAI-compatible `InvokeModel` request format
 
-The single model switch is `Config.ai_profile` in `policygpt/config.py`.
+The model switch is `Config.ai_profile` in `policygpt/config.py`.
+The shared cost/quality switch is `Config.accuracy_profile`, with `high`, `medium`, and `low` presets that adjust retrieval breadth, evidence/context sizes, and LLM output budgets for every model.
 `PolicyGPTBot` chooses the correct low-level AI service based on the resolved `Config.ai_provider`, so retrieval and chat orchestration do not need provider-specific branching.
 
 ### 1. Startup

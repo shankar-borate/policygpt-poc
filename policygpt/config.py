@@ -21,6 +21,129 @@ AI_PROFILE_PRESETS: dict[str, dict[str, str]] = {
         "embedding_model": "amazon.titan-embed-text-v2:0",
         "bedrock_gpt_model_size": "120b",
     },
+    "bedrock-claude-sonnet-4-6": {
+        "ai_provider": "bedrock",
+        "chat_model": "global.anthropic.claude-sonnet-4-6",
+        "embedding_model": "amazon.titan-embed-text-v2:0",
+        "bedrock_gpt_model_size": "",
+    },
+    "bedrock-claude-opus-4-6": {
+        "ai_provider": "bedrock",
+        "chat_model": "global.anthropic.claude-opus-4-6-v1",
+        "embedding_model": "amazon.titan-embed-text-v2:0",
+        "bedrock_gpt_model_size": "",
+    },
+}
+
+ACCURACY_PROFILE_PRESETS: dict[str, dict[str, int]] = {
+    "high": {
+        "top_docs": 3,
+        "top_sections_per_doc": 3,
+        "max_sections_to_llm": 4,
+        "rerank_section_candidates": 12,
+        "exact_top_docs": 2,
+        "exact_top_sections_per_doc": 4,
+        "exact_max_sections_to_llm": 3,
+        "exact_rerank_section_candidates": 10,
+        "broad_top_docs": 6,
+        "broad_top_sections_per_doc": 6,
+        "broad_max_sections_to_llm": 8,
+        "broad_rerank_section_candidates": 24,
+        "max_evidence_snippets_per_section": 3,
+        "evidence_snippet_char_limit": 320,
+        "embedding_raw_excerpt_chars": 600,
+        "answer_context_doc_summary_char_limit": 260,
+        "evidence_chunk_char_limit": 900,
+        "evidence_neighboring_units": 1,
+        "small_section_full_text_chars": 1500,
+        "exact_answer_evidence_char_limit": 1600,
+        "broad_answer_evidence_char_limit": 1200,
+        "answer_evidence_block_limit_exact": 2,
+        "answer_evidence_block_limit_broad": 2,
+        "max_recent_messages": 6,
+        "doc_summary_input_token_budget": 6000,
+        "doc_summary_combine_token_budget": 4500,
+        "section_summary_input_token_budget": 2500,
+        "min_recursive_summary_token_budget": 250,
+        "doc_summary_max_output_tokens": 400,
+        "doc_summary_max_output_tokens_cap": 800,
+        "doc_summary_chunk_max_output_tokens": 220,
+        "section_summary_max_output_tokens": 220,
+        "chat_max_output_tokens": 900,
+        "conversation_summary_max_output_tokens": 250,
+    },
+    "medium": {
+        "top_docs": 2,
+        "top_sections_per_doc": 2,
+        "max_sections_to_llm": 3,
+        "rerank_section_candidates": 8,
+        "exact_top_docs": 2,
+        "exact_top_sections_per_doc": 3,
+        "exact_max_sections_to_llm": 2,
+        "exact_rerank_section_candidates": 6,
+        "broad_top_docs": 4,
+        "broad_top_sections_per_doc": 4,
+        "broad_max_sections_to_llm": 5,
+        "broad_rerank_section_candidates": 12,
+        "max_evidence_snippets_per_section": 2,
+        "evidence_snippet_char_limit": 240,
+        "embedding_raw_excerpt_chars": 350,
+        "answer_context_doc_summary_char_limit": 180,
+        "evidence_chunk_char_limit": 650,
+        "evidence_neighboring_units": 1,
+        "small_section_full_text_chars": 1000,
+        "exact_answer_evidence_char_limit": 1100,
+        "broad_answer_evidence_char_limit": 850,
+        "answer_evidence_block_limit_exact": 1,
+        "answer_evidence_block_limit_broad": 2,
+        "max_recent_messages": 4,
+        "doc_summary_input_token_budget": 4200,
+        "doc_summary_combine_token_budget": 3000,
+        "section_summary_input_token_budget": 1800,
+        "min_recursive_summary_token_budget": 250,
+        "doc_summary_max_output_tokens": 280,
+        "doc_summary_max_output_tokens_cap": 500,
+        "doc_summary_chunk_max_output_tokens": 160,
+        "section_summary_max_output_tokens": 160,
+        "chat_max_output_tokens": 650,
+        "conversation_summary_max_output_tokens": 160,
+    },
+    "low": {
+        "top_docs": 2,
+        "top_sections_per_doc": 2,
+        "max_sections_to_llm": 2,
+        "rerank_section_candidates": 5,
+        "exact_top_docs": 1,
+        "exact_top_sections_per_doc": 2,
+        "exact_max_sections_to_llm": 1,
+        "exact_rerank_section_candidates": 4,
+        "broad_top_docs": 3,
+        "broad_top_sections_per_doc": 3,
+        "broad_max_sections_to_llm": 3,
+        "broad_rerank_section_candidates": 8,
+        "max_evidence_snippets_per_section": 1,
+        "evidence_snippet_char_limit": 180,
+        "embedding_raw_excerpt_chars": 180,
+        "answer_context_doc_summary_char_limit": 120,
+        "evidence_chunk_char_limit": 450,
+        "evidence_neighboring_units": 0,
+        "small_section_full_text_chars": 700,
+        "exact_answer_evidence_char_limit": 800,
+        "broad_answer_evidence_char_limit": 600,
+        "answer_evidence_block_limit_exact": 1,
+        "answer_evidence_block_limit_broad": 1,
+        "max_recent_messages": 3,
+        "doc_summary_input_token_budget": 2600,
+        "doc_summary_combine_token_budget": 1800,
+        "section_summary_input_token_budget": 1200,
+        "min_recursive_summary_token_budget": 250,
+        "doc_summary_max_output_tokens": 180,
+        "doc_summary_max_output_tokens_cap": 320,
+        "doc_summary_chunk_max_output_tokens": 120,
+        "section_summary_max_output_tokens": 120,
+        "chat_max_output_tokens": 400,
+        "conversation_summary_max_output_tokens": 100,
+    },
 }
 
 
@@ -31,7 +154,11 @@ class Config:
     excluded_file_name_parts: tuple[str, ...] = ("_summary",)
 
     # Change this one value to switch model stack.
-    ai_profile: str = "openai"  # openai | bedrock-20b | bedrock-120b
+    ai_profile: str = (
+        "bedrock-claude-sonnet-4-6"  # openai | bedrock-20b | bedrock-120b | bedrock-claude-sonnet-4-6 | bedrock-claude-opus-4-6
+    )
+    # Change this one value to tune cost/quality across all models.
+    accuracy_profile: str = "high"  # high | medium | low
     ai_provider: str = ""
     chat_model: str = ""
     embedding_model: str = ""
@@ -112,17 +239,34 @@ class Config:
     debug: bool = True
 
     def __post_init__(self) -> None:
-        profile = (self.ai_profile or "openai").strip().lower()
-        preset = AI_PROFILE_PRESETS.get(profile)
-        if preset is None:
+        ai_profile = (self.ai_profile or "openai").strip().lower()
+        ai_preset = AI_PROFILE_PRESETS.get(ai_profile)
+        if ai_preset is None:
             supported_profiles = ", ".join(sorted(AI_PROFILE_PRESETS))
             raise ValueError(f"Config.ai_profile must be one of: {supported_profiles}")
 
-        object.__setattr__(self, "ai_profile", profile)
-        object.__setattr__(self, "ai_provider", preset["ai_provider"])
-        object.__setattr__(self, "chat_model", (self.chat_model or "").strip() or preset["chat_model"])
-        object.__setattr__(self, "embedding_model", (self.embedding_model or "").strip() or preset["embedding_model"])
-        object.__setattr__(self, "bedrock_gpt_model_size", preset["bedrock_gpt_model_size"])
+        accuracy_profile = (self.accuracy_profile or "high").strip().lower()
+        accuracy_preset = ACCURACY_PROFILE_PRESETS.get(accuracy_profile)
+        if accuracy_preset is None:
+            supported_profiles = ", ".join(sorted(ACCURACY_PROFILE_PRESETS))
+            raise ValueError(f"Config.accuracy_profile must be one of: {supported_profiles}")
+
+        object.__setattr__(self, "ai_profile", ai_profile)
+        object.__setattr__(self, "accuracy_profile", accuracy_profile)
+        object.__setattr__(self, "ai_provider", ai_preset["ai_provider"])
+        object.__setattr__(self, "chat_model", (self.chat_model or "").strip() or ai_preset["chat_model"])
+        object.__setattr__(self, "embedding_model", (self.embedding_model or "").strip() or ai_preset["embedding_model"])
+        object.__setattr__(self, "bedrock_gpt_model_size", ai_preset["bedrock_gpt_model_size"])
+
+        # Accuracy profiles provide model-agnostic defaults for retrieval
+        # breadth, prompt context size, and output budgets. If a field has
+        # already been tuned away from the high-accuracy baseline, preserve
+        # that explicit override instead of replacing it with the preset.
+        high_accuracy_preset = ACCURACY_PROFILE_PRESETS["high"]
+        for field_name, preset_value in accuracy_preset.items():
+            current_value = getattr(self, field_name)
+            if accuracy_profile == "high" or current_value == high_accuracy_preset[field_name]:
+                object.__setattr__(self, field_name, preset_value)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -131,6 +275,8 @@ class Config:
         debug_env = os.getenv("POLICY_GPT_DEBUG")
         return cls(
             ai_profile=base_config.ai_profile,
+            accuracy_profile=os.getenv("POLICY_GPT_ACCURACY_PROFILE", base_config.accuracy_profile).strip()
+            or base_config.accuracy_profile,
             chat_model=base_config.chat_model,
             embedding_model=base_config.embedding_model,
             public_base_url=os.getenv("POLICY_GPT_PUBLIC_BASE_URL", base_config.public_base_url).rstrip("/"),
