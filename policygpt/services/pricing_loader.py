@@ -10,7 +10,10 @@ from policygpt.config import Config
 from policygpt.services.usage_metrics import ModelPricingSnapshot
 
 
-OPENAI_GPT41_PRICING_URL = "https://developers.openai.com/api/docs/models/gpt-4.1"
+OPENAI_MODEL_PRICING_URLS: dict[str, str] = {
+    "gpt-4.1": "https://developers.openai.com/api/docs/models/gpt-4.1",
+    "gpt-5.4": "https://developers.openai.com/api/docs/models/gpt-5.4",
+}
 AWS_BEDROCK_PRICING_URL = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrock/current/index.json"
 AWS_BEDROCK_FOUNDATION_MODELS_PRICING_URL = (
     "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrockFoundationModels/current/index.json"
@@ -29,7 +32,13 @@ FALLBACK_PRICING_BY_MODEL: dict[str, dict[str, Any]] = {
         "display_name": "OpenAI GPT-4.1",
         "input_price_per_million_usd": 2.0,
         "output_price_per_million_usd": 8.0,
-        "source_url": OPENAI_GPT41_PRICING_URL,
+        "source_url": OPENAI_MODEL_PRICING_URLS["gpt-4.1"],
+    },
+    "gpt-5.4": {
+        "display_name": "OpenAI GPT-5.4",
+        "input_price_per_million_usd": 2.5,
+        "output_price_per_million_usd": 15.0,
+        "source_url": OPENAI_MODEL_PRICING_URLS["gpt-5.4"],
     },
     "openai.gpt-oss-20b-1:0": {
         "display_name": "OpenAI GPT OSS 20B via Bedrock",
@@ -62,8 +71,8 @@ class ModelPricingLoader:
     def load_snapshot(self, config: Config) -> ModelPricingSnapshot:
         model_name = config.chat_model
         try:
-            if model_name == "gpt-4.1":
-                return self._load_openai_gpt41_snapshot(model_name)
+            if model_name in OPENAI_MODEL_PRICING_URLS:
+                return self._load_openai_model_snapshot(model_name)
             if model_name.startswith("openai.gpt-oss-20b"):
                 return self._load_bedrock_gpt_oss_snapshot(config, model_name, model_slug="gpt-oss-20b")
             if model_name.startswith("openai.gpt-oss-120b"):
@@ -95,15 +104,16 @@ class ModelPricingLoader:
             source_status="unavailable",
         )
 
-    def _load_openai_gpt41_snapshot(self, model_name: str) -> ModelPricingSnapshot:
-        html = self._fetch_text(OPENAI_GPT41_PRICING_URL)
-        input_price, output_price = self._parse_openai_gpt41_pricing(html)
+    def _load_openai_model_snapshot(self, model_name: str) -> ModelPricingSnapshot:
+        pricing_url = OPENAI_MODEL_PRICING_URLS[model_name]
+        html = self._fetch_text(pricing_url)
+        input_price, output_price = self._parse_openai_model_pricing(html)
         return ModelPricingSnapshot(
             model_name=model_name,
-            display_name="OpenAI GPT-4.1",
+            display_name=f"OpenAI {model_name.upper()}",
             input_price_per_million_usd=input_price,
             output_price_per_million_usd=output_price,
-            source_url=OPENAI_GPT41_PRICING_URL,
+            source_url=pricing_url,
             source_status="live",
         )
 
@@ -119,7 +129,11 @@ class ModelPricingLoader:
             region_code=config.bedrock_region,
             matcher=lambda attrs: attrs.get("model") == model_slug and self._is_standard_output_tokens(attrs),
         )
-        display_name = "OpenAI GPT OSS 20B via Bedrock" if model_slug.endswith("20b") else "OpenAI GPT OSS 120B via Bedrock"
+        display_name = (
+            "OpenAI GPT OSS 20B via Bedrock"
+            if model_slug == "gpt-oss-20b"
+            else "OpenAI GPT OSS 120B via Bedrock"
+        )
         return ModelPricingSnapshot(
             model_name=model_name,
             display_name=display_name,
@@ -159,7 +173,7 @@ class ModelPricingLoader:
         )
 
     @staticmethod
-    def _parse_openai_gpt41_pricing(html: str) -> tuple[float, float]:
+    def _parse_openai_model_pricing(html: str) -> tuple[float, float]:
         input_match = re.search(
             r"<div>\s*Input\s*</div>\s*<div[^>]*>\$([0-9]+(?:\.[0-9]+)?)</div>",
             html,
@@ -171,7 +185,7 @@ class ModelPricingLoader:
             flags=re.IGNORECASE,
         )
         if not input_match or not output_match:
-            raise ValueError("Could not parse GPT-4.1 pricing from the OpenAI model page.")
+            raise ValueError("Could not parse pricing from the OpenAI model page.")
         return float(input_match.group(1)), float(output_match.group(1))
 
     @staticmethod

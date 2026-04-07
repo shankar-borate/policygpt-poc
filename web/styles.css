@@ -189,8 +189,7 @@ button {
     color: rgba(255, 255, 255, 0.66);
 }
 
-.chat-shell .section-heading,
-.reference-panel .section-heading {
+.chat-shell .section-heading {
     color: #6b7280;
 }
 
@@ -284,8 +283,7 @@ button {
 }
 
 .thread-preview,
-.thread-empty,
-.source-empty {
+.thread-empty {
     margin: 0;
     color: rgba(255, 255, 255, 0.68);
     line-height: 1.45;
@@ -316,7 +314,6 @@ button {
 }
 
 .hero-card,
-.reference-panel,
 .messages,
 .composer {
     width: min(900px, calc(100% - 56px));
@@ -324,7 +321,6 @@ button {
 }
 
 .hero-card,
-.reference-panel,
 .composer {
     background: rgba(255, 255, 255, 0.88);
     border: 1px solid rgba(229, 231, 235, 0.94);
@@ -508,13 +504,6 @@ button {
     animation-delay: 280ms;
 }
 
-.reference-panel {
-    margin-bottom: 18px;
-    padding: 16px 18px;
-    border-radius: var(--radius-md);
-}
-
-.source-list,
 .corpus-summary {
     display: flex;
     flex-wrap: wrap;
@@ -522,18 +511,10 @@ button {
     margin-top: 10px;
 }
 
-.source-chip,
 .corpus-card {
     border-radius: 14px;
     border: 1px solid var(--border);
     background: var(--surface-soft);
-}
-
-.source-chip {
-    padding: 10px 12px;
-    color: var(--text);
-    font-size: 0.92rem;
-    line-height: 1.4;
 }
 
 .corpus-card {
@@ -651,7 +632,6 @@ button {
     }
 
     .hero-card,
-    .reference-panel,
     .messages,
     .composer {
         width: min(100%, calc(100% - 24px));
@@ -673,8 +653,4 @@ button {
     .send-button {
         width: 100%;
     }
-}
-
-.reference-panel .source-empty {
-    color: var(--text-soft);
 }

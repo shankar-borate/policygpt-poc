@@ -14,7 +14,10 @@ class ServerRuntime:
         self.config = config
         self.lock = RLock()
         self.bot: PolicyGPTBot | None = None
-        self.usage_tracker = LLMUsageTracker(config.chat_model)
+        self.usage_tracker = LLMUsageTracker(
+            config.chat_model,
+            usd_to_inr_exchange_rate=config.usd_to_inr_exchange_rate,
+        )
         self.pricing_loader = ModelPricingLoader()
         self.status = "starting"
         self.error: str | None = None
@@ -32,7 +35,10 @@ class ServerRuntime:
                 return
 
             self.bot = None
-            self.usage_tracker.reset(self.config.chat_model)
+            self.usage_tracker.reset(
+                self.config.chat_model,
+                usd_to_inr_exchange_rate=self.config.usd_to_inr_exchange_rate,
+            )
             self.usage_tracker.set_pricing_snapshot(self.pricing_loader.load_snapshot(self.config))
             self.status = "in_progress"
             self.error = None

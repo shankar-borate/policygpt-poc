@@ -14,7 +14,6 @@ const elements = {
     chatTitle: document.getElementById("chat-title"),
     messages: document.getElementById("messages"),
     hero: document.getElementById("hero"),
-    sourceList: document.getElementById("source-list"),
     corpusSummary: document.getElementById("corpus-summary"),
     statusPill: document.getElementById("status-pill"),
     statusMeta: document.getElementById("status-meta"),
@@ -281,20 +280,6 @@ function renderMessages() {
     elements.messages.scrollTop = elements.messages.scrollHeight;
 }
 
-function renderSources() {
-    const sources = state.activeThread?.sources || [];
-    const uniqueFiles = [...new Set(sources.map((source) => source.file_name).filter(Boolean))];
-
-    if (!uniqueFiles.length) {
-        elements.sourceList.innerHTML = '<p class="source-empty">Reference file names for the latest answer will appear here.</p>';
-        return;
-    }
-
-    elements.sourceList.innerHTML = uniqueFiles
-        .map((fileName) => `<div class="source-chip">${escapeHtml(fileName)}</div>`)
-        .join("");
-}
-
 function renderCorpusSummary() {
     const health = state.health;
 
@@ -351,7 +336,6 @@ function render() {
     renderThreadList();
     renderHeader();
     renderMessages();
-    renderSources();
     renderCorpusSummary();
 }
 

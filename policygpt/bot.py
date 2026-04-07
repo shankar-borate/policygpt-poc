@@ -1,14 +1,15 @@
 import re
 import traceback
 import uuid
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 
 import numpy as np
 
 from policygpt.config import Config
 from policygpt.conversations import ConversationManager
 from policygpt.corpus import DocumentCorpus, ProgressCallback
+from policygpt.document_links import build_document_view_url
 from policygpt.models import ChatResult, Message, SourceReference
 from policygpt.models import utc_now_iso
 from policygpt.services.base import AIService
@@ -133,6 +134,7 @@ class PolicyGPTBot:
                     section_title=section.title,
                     source_path=section.source_path,
                     score=score,
+                    section_order_index=section.order_index,
                 )
                 for section, score in top_sections
             ]
@@ -156,7 +158,7 @@ class PolicyGPTBot:
             else:
                 answer_text = self._build_unanswerable_response(query_analysis, top_docs)
 
-            final_answer = self._append_reference_file_names(answer_text, sources)
+            final_answer = self._sanitize_answer_for_user(answer_text.strip())
             self._write_retrieval_log(
                 thread_id=thread.thread_id,
                 user_question=user_question,
@@ -170,9 +172,19 @@ class PolicyGPTBot:
                 sources=sources,
             )
 
+            recent_message_limit = max(0, self.config.max_recent_messages)
             thread.recent_messages.append(Message(role="user", content=user_question))
-            thread.recent_messages.append(Message(role="assistant", content=final_answer))
-            thread.recent_messages = thread.recent_messages[-self.config.max_recent_messages :]
+            thread.recent_messages.append(
+                Message(
+                    role="assistant",
+                    content=self._compact_history_message(answer_text),
+                )
+            )
+            thread.recent_messages = (
+                thread.recent_messages[-recent_message_limit:]
+                if recent_message_limit
+                else []
+            )
             thread.display_messages.append(Message(role="user", content=user_question))
             thread.display_messages.append(Message(role="assistant", content=final_answer))
             thread.active_doc_ids = [document.doc_id for document, _ in top_docs]
@@ -235,34 +247,55 @@ class PolicyGPTBot:
         raise ValueError(f"Unsupported AI provider: {self.config.ai_provider}")
 
     def _system_prompt(self) -> str:
+        if self._uses_open_weight_prompt_profile():
+            return (
+                "You are a conversational enterprise document assistant.\n"
+                "Rules:\n"
+                "1. Answer only from the provided document evidence.\n"
+                "2. If the answer is not clearly present, say that it is not clearly stated in the provided documents.\n"
+                "3. Be conversational but precise.\n"
+                "4. Use current conversation context only when the user's wording is clearly referential, such as 'what about this', 'same policy', or 'that section'.\n"
+                "5. When relevant evidence comes from multiple documents or sections, synthesize across them and call out any document-specific differences clearly.\n"
+                "6. Mention section titles and file names when useful.\n"
+                "7. Do not hallucinate.\n"
+                "8. Format the answer in clean Markdown with short sections or bullets when helpful.\n"
+                "9. Default to a sharp, concise answer that gets to the point quickly.\n"
+                "10. Give more detail only when the user explicitly asks for it, such as 'in detail', 'detailed', 'step by step', or similar.\n"
+                "11. Do not add unnecessary background, repetition, or long caveats.\n"
+                "12. For direct questions, lead with the answer in the first line.\n"
+                "13. Ignore retrieved text that is about a different policy or a different topic than the user's question, even if it appears semantically similar.\n"
+                "14. If the evidence does not explicitly support the asked point, say it is not clearly stated instead of inferring.\n"
+                "15. Rewrite policy language into plain, user-friendly business English. Do not paste long policy wording back to the user.\n"
+                "16. For list, eligibility, process, approval, and comparison questions, prefer short bullets with bold labels instead of long paragraphs.\n"
+                "17. Avoid horizontal rules, deep heading hierarchies, raw policy numbering, and document-style formatting.\n"
+                "18. Do not add a separate source/citation section in the answer body. References are added separately.\n"
+                "19. Treat the question analysis as a retrieval aid, but only state things that are clearly supported by the evidence snippets.\n"
+                "20. If the evidence covers only part of the answer, answer only that part and say what is not clearly stated.\n"
+                "21. Prefer evidence snippets over broad summaries when they conflict.\n"
+                "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format.\n"
+                "23. If recent chat suggests one document but the current retrieved evidence explicitly defines the asked term in another document, follow the current evidence and briefly note the difference if needed.\n"
+                "24. Treat raw policy evidence blocks as the source of truth. Use summaries only for orientation. If a raw evidence block and a summary differ, trust the raw evidence.\n"
+                "25. Never show internal IDs or evidence labels in the final answer body. Sources are shown separately."
+            )
         return (
-            "You are a conversational enterprise document assistant.\n"
-            "Rules:\n"
-            "1. Answer only from the provided document evidence.\n"
-            "2. If the answer is not clearly present, say that it is not clearly stated in the provided documents.\n"
-            "3. Be conversational but precise.\n"
-            "4. Use current conversation context only when the user's wording is clearly referential, such as 'what about this', 'same policy', or 'that section'.\n"
-            "5. When relevant evidence comes from multiple documents or sections, synthesize across them and call out any document-specific differences clearly.\n"
-            "6. Mention section titles and file names when useful.\n"
-            "7. Do not hallucinate.\n"
-            "8. Format the answer in clean Markdown with short sections or bullets when helpful.\n"
-            "9. Default to a sharp, concise answer that gets to the point quickly.\n"
-            "10. Give more detail only when the user explicitly asks for it, such as 'in detail', 'detailed', 'step by step', or similar.\n"
-            "11. Do not add unnecessary background, repetition, or long caveats.\n"
-            "12. For direct questions, lead with the answer in the first line.\n"
-            "13. Ignore retrieved text that is about a different policy or a different topic than the user's question, even if it appears semantically similar.\n"
-            "14. If the evidence does not explicitly support the asked point, say it is not clearly stated instead of inferring.\n"
-            "15. Rewrite policy language into plain, user-friendly business English. Do not paste long policy wording back to the user.\n"
-            "16. For list, eligibility, process, approval, and comparison questions, prefer short bullets with bold labels instead of long paragraphs.\n"
-            "17. Avoid horizontal rules, deep heading hierarchies, raw policy numbering, and document-style formatting.\n"
-            "18. Do not add a separate source/citation section in the answer body. References are added separately.\n"
-            "19. Treat the question analysis as a retrieval aid, but only state things that are clearly supported by the evidence snippets.\n"
-            "20. If the evidence covers only part of the answer, answer only that part and say what is not clearly stated.\n"
-            "21. Prefer evidence snippets over broad summaries when they conflict.\n"
-            "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format.\n"
-            "23. If recent chat suggests one document but the current retrieved evidence explicitly defines the asked term in another document, follow the current evidence and briefly note the difference if needed.\n"
-            "24. Treat raw policy evidence blocks as the source of truth. Use summaries only for orientation. If a raw evidence block and a summary differ, trust the raw evidence."
+            "You are an enterprise document assistant.\n"
+            "Answer only from the provided evidence; if unclear, say it is not clearly stated.\n"
+            "Use recent chat only for referential follow-ups.\n"
+            "Prefer raw evidence blocks over summaries; summaries are orientation only.\n"
+            "Ignore off-topic retrieved text.\n"
+            "When multiple documents apply, combine them and note differences.\n"
+            "State only supported points.\n"
+            "Reply in concise Markdown. Lead with the answer. Use short bullets for list, eligibility, process, approval, comparison, and timeline questions.\n"
+            "Use plain English. Avoid long quotes and repetition.\n"
+            "No Evidence:, Source:, or Reference: lines in the answer body.\n"
+            "Never show internal IDs or evidence labels. Sources are shown separately."
         )
+
+    def _uses_open_weight_prompt_profile(self) -> bool:
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        return config.ai_provider == "bedrock" and config.bedrock_gpt_model_size in {"20b", "120b"}
 
     def _answer_format_guidance(self, query_analysis: QueryAnalysis) -> str:
         detail_suffix = (
@@ -281,6 +314,15 @@ class PolicyGPTBot:
                 "Start with the exact answer in the first line. "
                 "Base labels, dates, numbers, thresholds, and definitions on the raw policy evidence blocks. "
                 "If the exact wording is not clearly supported, say so instead of generalizing."
+                + detail_suffix
+            )
+        if "aggregate" in query_analysis.intents:
+            return (
+                "Start with the direct answer, then list each relevant item in short bullets. "
+                "For every bullet, use 'Name - short description' and keep the description to one concise phrase based on the evidence. "
+                "Prefer standalone contest names from document titles or sections that explicitly name the contest. "
+                "Do not treat comparison-only mentions, incomplete-sentence mentions, or verification notes as main contest items. "
+                "Do not output bare names without context."
                 + detail_suffix
             )
         if query_analysis.multi_doc_expected:
@@ -405,12 +447,21 @@ class PolicyGPTBot:
         seen: set[str] = set()
         for source in sources:
             file_name = Path(source.source_path).name
-            if not file_name or file_name in seen:
+            if not file_name:
                 continue
-            seen.add(file_name)
-            encoded_path = quote(source.source_path, safe="")
-            url = f"{self.config.public_base_url}/api/documents/open?path={encoded_path}"
-            reference_links.append(f"[{file_name}]({url})")
+            section_title = self._derive_thread_title(source.section_title, limit=48)
+            label = file_name if not section_title or section_title.casefold() == "introduction" else f"{file_name} | {section_title}"
+            url = build_document_view_url(
+                self.config.public_base_url,
+                source_path=source.source_path,
+                section_index=source.section_order_index,
+                section_title=source.section_title,
+            )
+            dedupe_key = f"{label}|{url}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            reference_links.append(f"[{label}]({url})")
 
         if not reference_links:
             return answer.strip()
@@ -449,6 +500,248 @@ class PolicyGPTBot:
             return compact
         return compact[: limit - 3].rstrip() + "..."
 
+    def _compact_history_message(self, text: str) -> str:
+        compact = self._sanitize_answer_for_user((text or "").strip())
+        compact = re.sub(r"\n{2,}Reference:\s.*$", "", compact, flags=re.DOTALL | re.IGNORECASE)
+        limit = max(0, self.config.recent_chat_message_char_limit)
+        if limit:
+            return self._truncate_context_text(compact, limit)
+        return compact
+
+    @staticmethod
+    def _sanitize_answer_for_user(answer: str) -> str:
+        cleaned = re.sub(r"\*?\((?:D\d+(?::S\d+)?)\)\*?", "", (answer or "").strip())
+        cleaned = re.sub(r"(?m)^\s*\[(?:D\d+(?::S\d+)?)\]\s*", "", cleaned)
+        cleaned = re.sub(r"(?m)^(\s*[-*]\s*)?\*{0,2}(?:D\d+(?::S\d+)?)\*{0,2}\s*(?:-|:|—)\s*", r"\1", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _sanitize_answer_for_user(answer: str) -> str:
+        cleaned = (answer or "").strip()
+        for pattern in (
+            r"<reasoning\b[^>]*>[\s\S]*?</reasoning>",
+            r"<thinking\b[^>]*>[\s\S]*?</thinking>",
+            r"<think\b[^>]*>[\s\S]*?</think>",
+            r"<analysis\b[^>]*>[\s\S]*?</analysis>",
+        ):
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+        cleaned = re.sub(r"</?(?:reasoning|thinking|think|analysis)\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?mi)^\s*(?:evidence|source|sources|reference|references)\s*:.*$", "", cleaned)
+        cleaned = re.sub(r"(?mi)^\s*(?:evidence|source|sources|reference|references)\s*$", "", cleaned)
+        cleaned = re.sub(r"\*?\((?:(?:D\d+:)?S\d+(?:\.E\d+)?|D\d+(?::S\d+(?:\.E\d+)?)?)\)\*?", "", cleaned)
+        cleaned = re.sub(r"(?m)^\s*\[(?:(?:D\d+:)?S\d+(?:\.E\d+)?|D\d+(?::S\d+(?:\.E\d+)?)?)\]\s*", "", cleaned)
+        cleaned = re.sub(r"(?m)^(\s*[-*]\s*)?\*{0,2}(?:(?:D\d+:)?S\d+(?:\.E\d+)?|D\d+(?::S\d+(?:\.E\d+)?)?)\*{0,2}\s*(?:-|:)\s*", r"\1", cleaned)
+        cleaned = re.sub(r"\b(?:(?:D\d+:)?S\d+(?:\.E\d+)?|D\d+(?::S\d+(?:\.E\d+)?)?)\b", "", cleaned)
+        cleaned = re.sub(r"[【\[]\s*[】\]]", "", cleaned)
+        cleaned = re.sub(r"(?m)^\s*[-*]\s*$", "", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+        cleaned = re.sub(r"\n\s*\n(?=[-*]\s)", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _compact_query_brief(query_analysis: QueryAnalysis) -> str:
+        lines = [query_analysis.original_question.strip()]
+        modes: list[str] = []
+        if query_analysis.exact_match_expected:
+            modes.append("exact")
+        if query_analysis.context_dependent:
+            modes.append("follow-up")
+        if query_analysis.multi_doc_expected:
+            modes.append("multi-doc")
+        if "document_lookup" in query_analysis.intents:
+            modes.append("lookup")
+        if modes:
+            lines.append(f"Mode: {', '.join(modes)}")
+        if query_analysis.topic_hints:
+            lines.append(f"Topics: {', '.join(query_analysis.topic_hints[:4])}")
+        return "\n".join(lines)
+
+    def _build_document_aliases(self, top_docs: list[tuple], top_sections: list[tuple]) -> dict[str, str]:
+        ordered_doc_ids: list[str] = []
+        seen: set[str] = set()
+        for document, _ in top_docs:
+            if document.doc_id in seen:
+                continue
+            seen.add(document.doc_id)
+            ordered_doc_ids.append(document.doc_id)
+        for section, _ in top_sections:
+            if section.doc_id in seen:
+                continue
+            seen.add(section.doc_id)
+            ordered_doc_ids.append(section.doc_id)
+        return {doc_id: f"D{index}" for index, doc_id in enumerate(ordered_doc_ids, start=1)}
+
+    def _use_minimal_answer_context(self, query_analysis: QueryAnalysis) -> bool:
+        return (
+            not self._uses_open_weight_prompt_profile()
+            and "aggregate" in query_analysis.intents
+            and not query_analysis.exact_match_expected
+        )
+
+    @staticmethod
+    def _needs_current_date_context(query_analysis: QueryAnalysis) -> bool:
+        if {"eligibility", "timeline"} & set(query_analysis.intents):
+            return True
+
+        normalized_question = query_analysis.normalized_question.casefold()
+        relative_date_markers = (
+            "today",
+            "current",
+            "currently",
+            "now",
+            "as of",
+            "right now",
+            "at present",
+        )
+        return any(marker in normalized_question for marker in relative_date_markers)
+
+    @staticmethod
+    def _current_date_prompt_line() -> str:
+        return (
+            f"Current date: {datetime.now().astimezone().date().isoformat()}\n"
+            "Interpret relative dates such as today, current, and now against this date."
+        )
+
+    @staticmethod
+    def _aggregate_section_signal(section) -> int:
+        text = " ".join(
+            part for part in (
+                section.title or "",
+                section.summary or "",
+                section.raw_text[:500] if section.raw_text else "",
+            )
+            if part
+        ).casefold()
+
+        positive_markers = (
+            "contest name",
+            "name and purpose",
+            "contest identity",
+            "contest overview",
+            "contest structure",
+            "structure summary",
+            "contest is named",
+            "contest is titled",
+            "the contest is named",
+            "the contest is titled",
+        )
+        negative_markers = (
+            "incomplete sentence",
+            "requiring verification",
+            "items requiring verification",
+            "higher-of",
+            "higher of",
+            "qualification rule",
+            "allocation",
+            "eligibility",
+            "audience",
+            "persistency",
+            "tax",
+            "net off all applicable taxes",
+        )
+
+        signal = 0
+        if any(marker in text for marker in positive_markers):
+            signal += 5
+        if "component" in text or "components" in text:
+            signal += 2
+        if section.section_type == "general":
+            signal += 1
+        if any(marker in text for marker in negative_markers):
+            signal -= 6
+        return signal
+
+    def _sections_for_answer_context(
+        self,
+        query_analysis: QueryAnalysis,
+        top_sections: list[tuple],
+        top_docs: list[tuple] | None = None,
+    ) -> list[tuple]:
+        if query_analysis.exact_match_expected:
+            best_score = top_sections[0][1] if top_sections else 0.0
+            score_floor = max(best_score * 0.65, 0.55) if best_score else 0.0
+            filtered_sections: list[tuple] = []
+            noisy_markers = (
+                "requiring verification",
+                "not explicitly defined",
+                "specifics not provided",
+                "incomplete sentence",
+            )
+
+            for section, score in top_sections:
+                section_text = " ".join(
+                    part for part in (
+                        section.title or "",
+                        section.summary or "",
+                    )
+                    if part
+                ).casefold()
+                if score < score_floor and filtered_sections:
+                    continue
+                if score < (best_score * 0.8 if best_score else 0.0) and any(marker in section_text for marker in noisy_markers):
+                    continue
+                filtered_sections.append((section, score))
+
+            return filtered_sections or top_sections[:3]
+
+        if "aggregate" not in query_analysis.intents:
+            return top_sections
+
+        ranked_sections = sorted(
+            top_sections,
+            key=lambda item: (self._aggregate_section_signal(item[0]), item[1]),
+            reverse=True,
+        )
+
+        selected: list[tuple] = []
+        seen_section_ids: set[str] = set()
+        seen_doc_ids: set[str] = set()
+
+        for section, score in ranked_sections:
+            signal = self._aggregate_section_signal(section)
+            if signal <= 0:
+                continue
+            if section.doc_id in seen_doc_ids and signal < 6:
+                continue
+            selected.append((section, score))
+            seen_section_ids.add(section.section_id)
+            seen_doc_ids.add(section.doc_id)
+
+        for section, score in ranked_sections:
+            if len(selected) >= len(top_sections):
+                break
+            if section.section_id in seen_section_ids:
+                continue
+            if self._aggregate_section_signal(section) < 4:
+                continue
+            selected.append((section, score))
+            seen_section_ids.add(section.section_id)
+
+        for document, _ in top_docs or []:
+            if document.doc_id in seen_doc_ids:
+                continue
+            fallback = next(
+                (
+                    (section, score)
+                    for section, score in ranked_sections
+                    if section.doc_id == document.doc_id and section.section_id not in seen_section_ids
+                ),
+                None,
+            )
+            if fallback is None:
+                continue
+            selected.append(fallback)
+            seen_section_ids.add(fallback[0].section_id)
+            seen_doc_ids.add(document.doc_id)
+
+        return selected or top_sections
+
     @staticmethod
     def _evidence_blocks_support_query(evidence_blocks: list[str], query_analysis: QueryAnalysis) -> bool:
         if not evidence_blocks:
@@ -463,13 +756,21 @@ class PolicyGPTBot:
                 return True
         return False
 
-    @staticmethod
-    def _document_context_limit(query_analysis: QueryAnalysis) -> int:
-        if query_analysis.multi_doc_expected:
-            return 4
-        if query_analysis.exact_match_expected:
+    def _document_context_limit(self, query_analysis: QueryAnalysis) -> int:
+        if self._uses_open_weight_prompt_profile():
+            if "document_lookup" in query_analysis.intents:
+                return 2
+            if query_analysis.multi_doc_expected or "aggregate" in query_analysis.intents:
+                return 3
+            return 1
+
+        if query_analysis.exact_match_expected or query_analysis.context_dependent:
+            return 0
+        if "document_lookup" in query_analysis.intents:
             return 2
-        return 3
+        if query_analysis.multi_doc_expected:
+            return 3
+        return 1
 
     @staticmethod
     def _derive_thread_title(text: str, limit: int = 56) -> str:
@@ -523,41 +824,63 @@ class PolicyGPTBot:
         top_docs,
         top_sections,
     ) -> str:
-        context_guidance = (
-            "Treat recent chat as active context for resolving shorthand follow-ups."
-            if query_analysis.context_dependent
-            else "Treat recent chat as background only. If the current retrieved evidence points to a different document than the prior turn, follow the current evidence."
-        )
+        minimal_context = self._use_minimal_answer_context(query_analysis)
+        doc_aliases = self._build_document_aliases(top_docs, top_sections)
+        doc_index_lines = [
+            f"{alias}={self.documents[doc_id].title}"
+            for doc_id, alias in doc_aliases.items()
+            if doc_id in self.documents
+        ]
+        recent_message_limit = max(0, self.config.max_recent_messages)
         recent_chat = "\n".join(
-            f"{message.role.upper()}: {message.content}"
-            for message in thread.recent_messages[-self.config.max_recent_messages :]
+            f"{message.role.upper()}: {self._compact_history_message(message.content)}"
+            for message in (
+                thread.recent_messages[-recent_message_limit:]
+                if recent_message_limit
+                else []
+            )
         ) or "None"
 
         doc_context_parts = []
-        for document, score in top_docs[: self._document_context_limit(query_analysis)]:
+        for document, _ in top_docs[: self._document_context_limit(query_analysis)]:
+            doc_alias = doc_aliases.get(document.doc_id, "D?")
             orientation_summary = self._truncate_context_text(
                 self.redactor.unmask_text(document.summary),
                 self.config.answer_context_doc_summary_char_limit,
             )
-            doc_context_parts.append(
-                f"[Document: {document.title} | Score: {score:.4f} | File: {document.source_path}]\n"
-                f"Metadata: type={document.document_type or 'document'}; "
-                f"tags={', '.join(document.metadata_tags) or 'none'}; "
-                f"audience={', '.join(document.audiences) or 'none'}; "
-                f"version={document.version or 'unknown'}; "
-                f"effective_date={document.effective_date or 'unknown'}"
-                + (
-                    ""
-                    if query_analysis.exact_match_expected
-                    else f"\nDocument orientation:\n{orientation_summary or '(empty)'}"
+            doc_context_lines = [
+                f"[{doc_alias}]",
+            ]
+            if not minimal_context and self.config.include_document_metadata_in_answers:
+                doc_context_lines.append(
+                    f"Metadata: type={document.document_type or 'document'}; "
+                    f"tags={', '.join(document.metadata_tags) or 'none'}; "
+                    f"audience={', '.join(document.audiences) or 'none'}; "
+                    f"version={document.version or 'unknown'}; "
+                    f"effective_date={document.effective_date or 'unknown'}"
                 )
-            )
+            if (
+                not minimal_context
+                and not query_analysis.exact_match_expected
+                and self.config.include_document_orientation_in_answers
+            ):
+                doc_context_lines.append(f"Summary:\n{orientation_summary or '(empty)'}")
+            if len(doc_context_lines) > 1:
+                doc_context_parts.append("\n".join(doc_context_lines))
 
+        prompt_sections = self._sections_for_answer_context(query_analysis, top_sections, top_docs)
         section_context_parts = []
         seen_evidence: set[str] = set()
-        for section, score in top_sections:
-            document = self.documents[section.doc_id]
-            raw_evidence_blocks = self.corpus.extract_answer_evidence_blocks(section, query_analysis)
+        section_alias_counts: dict[str, int] = {}
+        for section, _ in prompt_sections:
+            doc_alias = doc_aliases.get(section.doc_id, "D?")
+            section_alias_counts[section.doc_id] = section_alias_counts.get(section.doc_id, 0) + 1
+            section_alias = f"S{section_alias_counts[section.doc_id]}"
+            evidence_tag = f"{doc_alias}:{section_alias}"
+            if minimal_context:
+                raw_evidence_blocks = self.corpus.extract_evidence_snippets(section, query_analysis, limit=1)
+            else:
+                raw_evidence_blocks = self.corpus.extract_answer_evidence_blocks(section, query_analysis)
 
             # Fix #9: deduplicate evidence blocks across sections so the
             # LLM doesn't see the same raw text twice (common when two
@@ -571,43 +894,47 @@ class PolicyGPTBot:
 
             raw_evidence_text = (
                 "\n\n".join(
-                    f"Raw evidence block {index}:\n{block}"
+                    f"{evidence_tag}.E{index}\n{block}"
                     for index, block in enumerate(unique_blocks, start=1)
                 )
-                or "Raw evidence block 1:\n(no focused raw evidence extracted)"
+                or f"{evidence_tag}.E1\n(no focused raw evidence extracted)"
             )
             section_orientation = self._truncate_context_text(
                 self.redactor.unmask_text(section.summary),
                 self.config.answer_context_doc_summary_char_limit,
             )
-            section_context_parts.append(
-                f"[Document: {document.title} | Section: {section.title} | Score: {score:.4f} | File: {section.source_path}]\n"
-                f"Section type: {section.section_type or 'general'} | Tags: {', '.join(section.metadata_tags) or 'none'}\n"
-                + (
-                    ""
-                    if query_analysis.exact_match_expected
-                    else f"Section orientation:\n{section_orientation or '(empty)'}\n\n"
+            section_context_lines = [
+                f"[{evidence_tag} {section.title}]",
+            ]
+            if not minimal_context and self.config.include_section_metadata_in_answers:
+                section_context_lines.append(
+                    f"Section type: {section.section_type or 'general'} | Tags: {', '.join(section.metadata_tags) or 'none'}"
                 )
-                + f"Raw policy evidence:\n{raw_evidence_text}"
-            )
+            if (
+                not minimal_context
+                and not query_analysis.exact_match_expected
+                and self.config.include_section_orientation_in_answers
+            ):
+                section_context_lines.append(f"Summary:\n{section_orientation or '(empty)'}")
+            section_context_lines.append(f"Evidence:\n{raw_evidence_text}")
+            section_context_parts.append("\n".join(section_context_lines))
 
-        return (
-            f"Conversation summary:\n{thread.conversation_summary or 'None'}\n\n"
-            f"Conversation handling:\n{context_guidance}\n\n"
-            f"Recent chat:\n{recent_chat}\n\n"
-            f"Question analysis:\n{query_analysis.canonical_question}\n\n"
-            f"Answer format guidance:\n{self._answer_format_guidance(query_analysis)}\n\n"
-            f"Retrieved section evidence:\n{chr(10).join(section_context_parts)}\n\n"
-            f"Retrieved document context:\n{chr(10).join(doc_context_parts) or 'None'}\n\n"
-            "Evidence priority:\n"
-            "1. Raw policy evidence blocks\n"
-            "2. Section orientation summaries\n"
-            "3. Document orientation summaries\n\n"
-            "Answer the user conversationally, but ground every claim in the provided evidence. "
-            "Synthesize the policy into a clean, readable answer instead of copying document structure or wording. "
-            "When multiple documents contribute, combine the overlapping evidence and point out any differences instead of flattening them into one rule. "
-            "For exact labels, numbers, thresholds, dates, and definitions, cite only what the raw policy evidence blocks clearly support."
-        )
+        prompt_parts: list[str] = []
+        if thread.conversation_summary.strip():
+            prompt_parts.append(f"Summary:\n{thread.conversation_summary.strip()}")
+        if recent_chat != "None":
+            prompt_parts.append(f"Recent:\n{recent_chat}")
+        prompt_parts.append(f"Question:\n{self._compact_query_brief(query_analysis)}")
+        if self._needs_current_date_context(query_analysis):
+            prompt_parts.append(self._current_date_prompt_line())
+        prompt_parts.append(f"Style:\n{self._answer_format_guidance(query_analysis)}")
+        if doc_index_lines:
+            prompt_parts.append(f"Docs:\n{chr(10).join(doc_index_lines)}")
+        prompt_parts.append(f"Evidence:\n{chr(10).join(section_context_parts)}")
+        if doc_context_parts and ("document_lookup" in query_analysis.intents or self._uses_open_weight_prompt_profile()):
+            prompt_parts.append(f"Doc notes:\n{chr(10).join(doc_context_parts)}")
+        prompt_parts.append("Answer only from the evidence. Prefer raw evidence over summaries. Never mention internal IDs.")
+        return "\n\n".join(part for part in prompt_parts if part.strip())
 
     def _write_retrieval_log(
         self,

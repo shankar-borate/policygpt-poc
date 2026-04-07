@@ -71,3 +71,86 @@
     font-size: 0.74rem;
     line-height: 1.45;
 }
+
+.usage-widget-footer {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.usage-widget-footer-line {
+    margin: 0;
+    color: rgba(241, 245, 249, 0.76);
+    font-size: 0.74rem;
+    line-height: 1.5;
+}
+
+.usage-widget-footer-line + .usage-widget-footer-line {
+    margin-top: 4px;
+}
+
+.usage-widget-history-link {
+    margin-top: 10px;
+    padding: 0;
+    border: 0;
+    color: #93c5fd;
+    background: transparent;
+    font: inherit;
+    font-size: 0.74rem;
+    line-height: 1.5;
+    text-align: left;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+}
+
+.usage-widget-history-link:hover,
+.usage-widget-history-link:focus-visible {
+    color: #bfdbfe;
+}
+
+.usage-history-panel {
+    margin-top: 12px;
+}
+
+.usage-history-table-wrap {
+    overflow-x: auto;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    background: rgba(2, 6, 23, 0.34);
+}
+
+.usage-history-table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 420px;
+}
+
+.usage-history-table th,
+.usage-history-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    color: rgba(241, 245, 249, 0.82);
+    font-size: 0.72rem;
+    line-height: 1.4;
+    text-align: left;
+    vertical-align: top;
+}
+
+.usage-history-table th {
+    color: rgba(241, 245, 249, 0.66);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.usage-history-table tbody tr:last-child td {
+    border-bottom: 0;
+}
+
+.usage-history-empty {
+    color: rgba(241, 245, 249, 0.66);
+    text-align: center;
+}

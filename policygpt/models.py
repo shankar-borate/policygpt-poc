@@ -63,6 +63,7 @@ class SourceReference:
     section_title: str
     source_path: str
     score: float
+    section_order_index: int = 0
 
 
 @dataclass

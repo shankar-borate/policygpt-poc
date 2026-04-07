@@ -13,7 +13,7 @@
             <div class="brand-block">
                 <p class="eyebrow">Policy GPT</p>
                 <h1>Chat with policy docs</h1>
-                <p class="muted">Ask questions across the policy folder and get grounded answers with a reference file at the end.</p>
+                <p class="muted">Ask questions across the policy folder and get grounded answers.</p>
             </div>
 
             <button id="new-chat-btn" class="primary-button" type="button">New chat</button>
@@ -63,10 +63,44 @@
                         </div>
                         <div class="usage-widget-total">
                             <span class="usage-widget-label">Total price</span>
-                            <strong id="usage-total-price" class="usage-widget-value">$0.000000</strong>
+                            <strong id="usage-total-price" class="usage-widget-value">Rs 0.000000</strong>
                         </div>
                     </div>
                     <p id="usage-meta" class="usage-widget-meta">Reading pricing snapshot from startup...</p>
+                    <div class="usage-widget-footer">
+                        <p id="usage-last-request" class="usage-widget-footer-line">Last request: Rs 0.000000</p>
+                        <p id="usage-last-response" class="usage-widget-footer-line">Last response: Rs 0.000000</p>
+                        <p id="usage-total-request" class="usage-widget-footer-line">Last total cost: Rs 0.000000</p>
+                        <button
+                            id="usage-history-toggle"
+                            class="usage-widget-history-link"
+                            type="button"
+                            aria-expanded="false"
+                            aria-controls="usage-history-panel"
+                        >
+                            View request/response cost history
+                        </button>
+                        <div id="usage-history-panel" class="usage-history-panel" hidden>
+                            <div class="usage-history-table-wrap">
+                                <table class="usage-history-table">
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">Request ID</th>
+                                            <th scope="col">Request</th>
+                                            <th scope="col">Response</th>
+                                            <th scope="col">Total</th>
+                                            <th scope="col">Time</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="usage-history-body">
+                                        <tr>
+                                            <td colspan="5">No request history yet.</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
                 </aside>
             </section>
         </aside>
@@ -83,7 +117,7 @@
             <section id="hero" class="hero">
                 <div class="hero-card">
                     <p class="eyebrow">Ask policy questions</p> 
-                    <p class="muted">The answer stays concise, and the final line shows only the reference policy file name.</p>
+                    <p class="muted">The answer stays concise, focused, and grounded in the indexed policy content.</p>
                     <div class="prompt-row">
                         <button class="prompt-chip" type="button" data-prompt="Summarize the employee leave policy in 5 bullets.">Leave policy summary</button>
                         <button class="prompt-chip" type="button" data-prompt="What are the approval steps for reimbursement requests?">Reimbursement approvals</button>
@@ -93,13 +127,6 @@
             </section>
 
             <div id="messages" class="messages"></div>
-
-            <section class="reference-panel">
-                <div class="section-heading">
-                    <span>Reference files</span>
-                </div>
-                <div id="source-list" class="source-list"></div>
-            </section>
 
             <form id="composer-form" class="composer">
                 <label class="composer-label" for="composer-input">Message</label>

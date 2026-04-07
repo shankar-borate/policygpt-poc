@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from typing import Any
 
@@ -47,6 +48,7 @@ class BedrockService:
         return vectors
 
     def llm_text(self, system_prompt: str, user_prompt: str, max_output_tokens: int) -> str:
+        started_at = time.perf_counter()
         if self._uses_converse_api():
             converse_request = {
                 "modelId": self.chat_model,
@@ -63,11 +65,13 @@ class BedrockService:
 
             response = self._run_with_retries(lambda: self.client.converse(**converse_request))
             response_text = self._extract_converse_text(response)
+            duration_ms = int(round((time.perf_counter() - started_at) * 1000))
             self._record_usage(
                 usage=self._extract_converse_usage(response),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response_text=response_text,
+                duration_ms=duration_ms,
             )
             return response_text
 
@@ -88,11 +92,13 @@ class BedrockService:
         )
         payload = json.loads(response["body"].read())
         response_text = self._extract_chat_text(payload)
+        duration_ms = int(round((time.perf_counter() - started_at) * 1000))
         self._record_usage(
             usage=self._extract_payload_usage(payload),
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_text=response_text,
+            duration_ms=duration_ms,
         )
         return response_text
 
@@ -128,18 +134,25 @@ class BedrockService:
         message = choices[0].get("message") or {}
         content = message.get("content", "")
         if isinstance(content, str):
-            return content.strip()
+            return BedrockService._strip_reasoning_content(content)
         if isinstance(content, list):
             text_parts: list[str] = []
             for item in content:
                 if isinstance(item, str):
-                    text_parts.append(item)
+                    cleaned = BedrockService._strip_reasoning_content(item)
+                    if cleaned:
+                        text_parts.append(cleaned)
                 elif isinstance(item, dict):
+                    item_type = str(item.get("type") or item.get("content_type") or "").strip().lower()
+                    if "reasoning" in item_type or "thinking" in item_type:
+                        continue
                     text = item.get("text")
                     if isinstance(text, str):
-                        text_parts.append(text)
+                        cleaned = BedrockService._strip_reasoning_content(text)
+                        if cleaned:
+                            text_parts.append(cleaned)
             return "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
-        return str(content).strip()
+        return BedrockService._strip_reasoning_content(str(content))
 
     @staticmethod
     def _extract_converse_text(payload: dict[str, Any]) -> str:
@@ -147,19 +160,45 @@ class BedrockService:
         message = output.get("message") or {}
         content = message.get("content") or []
         if isinstance(content, str):
-            return content.strip()
+            return BedrockService._strip_reasoning_content(content)
         if not isinstance(content, list):
-            return str(content).strip()
+            return BedrockService._strip_reasoning_content(str(content))
 
         text_parts: list[str] = []
         for item in content:
             if isinstance(item, str):
-                text_parts.append(item)
+                cleaned = BedrockService._strip_reasoning_content(item)
+                if cleaned:
+                    text_parts.append(cleaned)
             elif isinstance(item, dict):
+                item_type = str(item.get("type") or item.get("content_type") or "").strip().lower()
+                if "reasoning" in item_type or "thinking" in item_type:
+                    continue
                 text = item.get("text")
                 if isinstance(text, str):
-                    text_parts.append(text)
+                    cleaned = BedrockService._strip_reasoning_content(text)
+                    if cleaned:
+                        text_parts.append(cleaned)
         return "\n".join(part.strip() for part in text_parts if part and part.strip()).strip()
+
+    @staticmethod
+    def _strip_reasoning_content(text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+
+        patterns = (
+            r"<reasoning\b[^>]*>[\s\S]*?</reasoning>",
+            r"<thinking\b[^>]*>[\s\S]*?</thinking>",
+            r"<think\b[^>]*>[\s\S]*?</think>",
+            r"<analysis\b[^>]*>[\s\S]*?</analysis>",
+        )
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+        cleaned = re.sub(r"</?(?:reasoning|thinking|think|analysis)\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
 
     @staticmethod
     def _extract_payload_usage(payload: dict[str, Any]) -> dict[str, int]:
@@ -187,7 +226,15 @@ class BedrockService:
             "output_tokens": int(usage.get("outputTokens") or usage.get("output_tokens") or 0),
         }
 
-    def _record_usage(self, *, usage: dict[str, int], system_prompt: str, user_prompt: str, response_text: str) -> None:
+    def _record_usage(
+        self,
+        *,
+        usage: dict[str, int],
+        system_prompt: str,
+        user_prompt: str,
+        response_text: str,
+        duration_ms: int = 0,
+    ) -> None:
         if self.usage_tracker is None:
             return
 
@@ -203,6 +250,7 @@ class BedrockService:
             model_name=self.chat_model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            duration_ms=duration_ms,
         )
 
     @staticmethod

@@ -256,11 +256,17 @@ class DocumentCorpus:
             masked_section_text = self.redactor.mask_text(section_text)
             section_metadata = self.metadata_extractor.extract_section_metadata(title, section_title, section_text)
             try:
-                section_summary = self._create_section_summary(
-                    doc_title=masked_title,
-                    section_title=masked_section_title,
-                    section_text=masked_section_text,
-                )
+                if self.config.skip_section_summary:
+                    section_summary = self._build_fallback_section_summary(
+                        section_title=masked_section_title,
+                        section_text=masked_section_text,
+                    )
+                else:
+                    section_summary = self._create_section_summary(
+                        doc_title=masked_title,
+                        section_title=masked_section_title,
+                        section_text=masked_section_text,
+                    )
                 section_embedding = self._build_enriched_embedding(section_title, section_summary, section_text)
             except Exception as exc:
                 self._emit_progress(
@@ -1373,6 +1379,17 @@ class DocumentCorpus:
         raw_excerpt = raw_text[:self.config.embedding_raw_excerpt_chars].strip() if raw_text else ""
         combined = f"{title}\n{unmasked_summary}\n{raw_excerpt}".strip()
         return self._embed_one(combined)
+
+    def _build_fallback_section_summary(self, section_title: str, section_text: str) -> str:
+        compact_text = re.sub(r"\s+", " ", (section_text or "").strip())
+        compact_title = re.sub(r"\s+", " ", (section_title or "").strip())
+        char_limit = max(120, self.config.evidence_snippet_char_limit)
+        if compact_text:
+            summary_body = self._truncate_text(compact_text, char_limit)
+            if compact_title and not summary_body.casefold().startswith(compact_title.casefold()):
+                return f"{compact_title}: {summary_body}"
+            return summary_body
+        return compact_title or "(empty)"
 
     def _emit_progress(
         self,

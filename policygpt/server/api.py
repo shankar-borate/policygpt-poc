@@ -1,6 +1,5 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -8,8 +7,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from policygpt.config import Config
+from policygpt.document_links import build_document_open_url, build_document_view_url
+from policygpt.server.document_viewer import DocumentViewerRenderer
 from policygpt.server.runtime import ServerRuntime
 from policygpt.server.ui import WebUIRenderer
+from policygpt.services.file_extractor import FileExtractor
 
 
 class ChatRequest(BaseModel):
@@ -23,6 +25,8 @@ class PolicyApiServer:
         self.web_dir = web_dir
         self.runtime = ServerRuntime(config)
         self.ui_renderer = WebUIRenderer(web_dir)
+        self.document_viewer = DocumentViewerRenderer(web_dir)
+        self.extractor = FileExtractor(config)
 
     def build_app(self) -> FastAPI:
         @asynccontextmanager
@@ -42,6 +46,7 @@ class PolicyApiServer:
         app.add_api_route("/api/threads/{thread_id}/reset", self.reset_thread, methods=["POST"])
         app.add_api_route("/api/chat", self.chat, methods=["POST"])
         app.add_api_route("/api/documents/open", self.open_document, methods=["GET"], response_class=FileResponse)
+        app.add_api_route("/api/documents/view", self.view_document, methods=["GET"], response_class=HTMLResponse)
         return app
 
     def index(self) -> HTMLResponse:
@@ -109,22 +114,61 @@ class PolicyApiServer:
             }
 
     def open_document(self, path: str) -> FileResponse:
-        requested_path = Path(path).resolve()
-        allowed_root = Path(self.config.document_folder).resolve()
-
-        try:
-            requested_path.relative_to(allowed_root)
-        except ValueError as exc:
-            raise HTTPException(status_code=403, detail="Document path is outside the policy folder.") from exc
-
-        if not requested_path.is_file():
-            raise HTTPException(status_code=404, detail="Document not found.")
+        requested_path = self._resolve_document_path(path)
 
         return FileResponse(
             path=str(requested_path),
             filename=requested_path.name,
             content_disposition_type="inline",
         )
+
+    def view_document(
+        self,
+        path: str,
+        section_index: int | None = None,
+        section_title: str = "",
+    ) -> HTMLResponse:
+        requested_path = self._resolve_document_path(path)
+        document_title, sections = self._load_document_sections(requested_path)
+        normalized_sections = [
+            {
+                "dom_id": f"section-{index}",
+                "title": item["title"],
+                "text": item["text"],
+                "order_index": item["order_index"],
+            }
+            for index, item in enumerate(sections)
+        ]
+
+        target_dom_id = normalized_sections[0]["dom_id"] if normalized_sections else ""
+        target_title = normalized_sections[0]["title"] if normalized_sections else ""
+
+        if normalized_sections:
+            matched_section = None
+            if section_index is not None:
+                matched_section = next(
+                    (item for item in normalized_sections if item["order_index"] == section_index),
+                    None,
+                )
+            if matched_section is None and section_title.strip():
+                normalized_title = section_title.strip().casefold()
+                matched_section = next(
+                    (item for item in normalized_sections if str(item["title"]).strip().casefold() == normalized_title),
+                    None,
+                )
+            if matched_section is not None:
+                target_dom_id = str(matched_section["dom_id"])
+                target_title = str(matched_section["title"])
+
+        html = self.document_viewer.render(
+            document_title=document_title,
+            source_path=str(requested_path),
+            sections=normalized_sections,
+            target_section_id=target_dom_id,
+            target_section_title=target_title or section_title or "Matched section",
+            open_url=build_document_open_url("", str(requested_path)),
+        )
+        return HTMLResponse(html)
 
     @staticmethod
     def build_preview(text: str, limit: int = 96) -> str:
@@ -147,10 +191,16 @@ class PolicyApiServer:
         return {
             "document_title": source.document_title,
             "section_title": source.section_title,
+            "section_order_index": source.section_order_index,
             "source_path": source.source_path,
             "file_name": Path(source.source_path).name,
             "score": round(source.score, 4),
-            "document_url": f"/api/documents/open?path={quote(source.source_path, safe='')}",
+            "document_url": build_document_view_url(
+                "",
+                source_path=source.source_path,
+                section_index=source.section_order_index,
+                section_title=source.section_title,
+            ),
         }
 
     def serialize_thread_summary(self, thread) -> dict:
@@ -171,3 +221,47 @@ class PolicyApiServer:
             "sources": [self.serialize_source(source) for source in thread.last_answer_sources],
             "conversation_summary": thread.conversation_summary,
         }
+
+    def _resolve_document_path(self, path: str) -> Path:
+        requested_path = Path(path).resolve()
+        allowed_root = Path(self.config.document_folder).resolve()
+
+        try:
+            requested_path.relative_to(allowed_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail="Document path is outside the policy folder.") from exc
+
+        if not requested_path.is_file():
+            raise HTTPException(status_code=404, detail="Document not found.")
+
+        return requested_path
+
+    def _load_document_sections(self, requested_path: Path) -> tuple[str, list[dict[str, object]]]:
+        with self.runtime.lock:
+            bot = self.runtime.bot
+            if bot is not None:
+                for document in bot.documents.values():
+                    if Path(document.source_path).resolve() != requested_path:
+                        continue
+                    return (
+                        document.title,
+                        [
+                            {
+                                "title": section.title,
+                                "text": section.raw_text,
+                                "order_index": section.order_index,
+                            }
+                            for section in document.sections
+                        ],
+                    )
+
+        title, extracted_sections = self.extractor.extract(str(requested_path))
+        sections = [
+            {
+                "title": section_title,
+                "text": section_text,
+                "order_index": index,
+            }
+            for index, (section_title, section_text) in enumerate(extracted_sections)
+        ]
+        return title, sections

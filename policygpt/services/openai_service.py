@@ -1,3 +1,4 @@
+import re
 import time
 
 import numpy as np
@@ -37,6 +38,7 @@ class OpenAIService:
         return [np.array(item.embedding, dtype=np.float32) for item in response.data]
 
     def llm_text(self, system_prompt: str, user_prompt: str, max_output_tokens: int) -> str:
+        started_at = time.perf_counter()
         response = self._run_with_retries(
             lambda: self.client.chat.completions.create(
                 model=self.chat_model,
@@ -48,11 +50,18 @@ class OpenAIService:
             )
         )
         content = response.choices[0].message.content
-        response_text = (content or "").strip()
-        self._record_usage(response, system_prompt=system_prompt, user_prompt=user_prompt, response_text=response_text)
+        response_text = self._strip_reasoning_content((content or "").strip())
+        duration_ms = int(round((time.perf_counter() - started_at) * 1000))
+        self._record_usage(
+            response,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_text=response_text,
+            duration_ms=duration_ms,
+        )
         return response_text
 
-    def _record_usage(self, response, *, system_prompt: str, user_prompt: str, response_text: str) -> None:
+    def _record_usage(self, response, *, system_prompt: str, user_prompt: str, response_text: str, duration_ms: int = 0) -> None:
         if self.usage_tracker is None:
             return
 
@@ -69,7 +78,27 @@ class OpenAIService:
             model_name=self.chat_model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            duration_ms=duration_ms,
         )
+
+    @staticmethod
+    def _strip_reasoning_content(text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+
+        patterns = (
+            r"<reasoning\b[^>]*>[\s\S]*?</reasoning>",
+            r"<thinking\b[^>]*>[\s\S]*?</thinking>",
+            r"<think\b[^>]*>[\s\S]*?</think>",
+            r"<analysis\b[^>]*>[\s\S]*?</analysis>",
+        )
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+        cleaned = re.sub(r"</?(?:reasoning|thinking|think|analysis)\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
 
     def _run_with_retries(self, operation):
         attempts = self.rate_limit_retries + 1

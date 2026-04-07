@@ -80,6 +80,34 @@ class BedrockServiceRoutingTests(unittest.TestCase):
         self.assertEqual(tracker.snapshot()["input_tokens"], 31)
         self.assertEqual(tracker.snapshot()["output_tokens"], 9)
 
+    def test_gpt_oss_reasoning_tags_are_removed_from_visible_answer(self) -> None:
+        client = _FakeBedrockClient(
+            invoke_response={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "<reasoning>internal chain of thought</reasoning>\nFinal visible answer"
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 7},
+            }
+        )
+        service = BedrockService(
+            chat_model="openai.gpt-oss-20b-1:0",
+            embedding_model="amazon.titan-embed-text-v2:0",
+            region_name="ap-south-1",
+            client=client,
+        )
+
+        response_text = service.llm_text(
+            system_prompt="You are helpful.",
+            user_prompt="Hello",
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(response_text, "Final visible answer")
+
     def test_claude_profiles_use_converse(self) -> None:
         client = _FakeBedrockClient(
             converse_response={
@@ -122,6 +150,38 @@ class BedrockServiceRoutingTests(unittest.TestCase):
         self.assertEqual(request["inferenceConfig"], {"maxTokens": 456})
         self.assertEqual(tracker.snapshot()["input_tokens"], 44)
         self.assertEqual(tracker.snapshot()["output_tokens"], 12)
+
+    def test_converse_reasoning_blocks_are_filtered_out(self) -> None:
+        client = _FakeBedrockClient(
+            converse_response={
+                "usage": {
+                    "inputTokens": 44,
+                    "outputTokens": 12,
+                },
+                "output": {
+                    "message": {
+                        "content": [
+                            {"type": "reasoning", "text": "hidden thoughts"},
+                            {"type": "text", "text": "Visible answer"},
+                        ]
+                    }
+                }
+            }
+        )
+        service = BedrockService(
+            chat_model="global.anthropic.claude-sonnet-4-6",
+            embedding_model="amazon.titan-embed-text-v2:0",
+            region_name="ap-south-1",
+            client=client,
+        )
+
+        response_text = service.llm_text(
+            system_prompt="You are helpful.",
+            user_prompt="Hello",
+            max_output_tokens=456,
+        )
+
+        self.assertEqual(response_text, "Visible answer")
 
 
 if __name__ == "__main__":
