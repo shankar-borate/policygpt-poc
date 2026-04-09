@@ -240,9 +240,13 @@ class DocumentCorpus:
             if document_faq and self.config.faq_fastpath_enabled:
                 faq_qa_pairs = self._parse_faq_qa_pairs(document_faq)
                 if faq_qa_pairs:
-                    questions = [q for q, _ in faq_qa_pairs]
+                    # Embed "Q: ... A: ..." combined so the vector captures
+                    # answer content (rewards, locations, entities) not just
+                    # question phrasing. Fast-path exact match still works
+                    # because the question dominates short Q+A pairs.
+                    combined_texts = [f"Q: {q}\nA: {a}" for q, a in faq_qa_pairs]
                     try:
-                        raw_embeddings = self.ai.embed_texts(questions)
+                        raw_embeddings = self.ai.embed_texts(combined_texts)
                         faq_q_embeddings = [l2_normalize(e) for e in raw_embeddings]
                     except Exception:
                         faq_q_embeddings = []
@@ -975,6 +979,12 @@ class DocumentCorpus:
             )
             heuristic.append((section, h_score))
 
+        # Skip LLM re-rank when heuristic is already highly confident — saves
+        # one LLM call per query when retrieval is unambiguous.
+        top_h_score = max((score for _, score in heuristic), default=0.0)
+        if top_h_score >= 0.82:
+            return heuristic
+
         # Step 2: LLM relevance scoring — one call for all candidates
         llm_scores = self._llm_rerank_sections(query_analysis, heuristic)
 
@@ -1508,13 +1518,26 @@ class DocumentCorpus:
             return reduced_summary_input
 
     def _summarize_section_text(self, doc_title: str, section_title: str, section_text: str) -> str:
+        # Detect table-like content — pipe-separated rows or HTML tables need
+        # special handling so the summary captures cell values in natural language.
+        is_table_section = section_text.count("|") >= 6 or "<table" in section_text.lower()
+        table_note = (
+            " The text contains tabular data. Describe what the table represents and "
+            "list ALL specific values, amounts, thresholds, role names, and row-by-row "
+            "data exactly as they appear — so a user querying those values can find this section."
+            if is_table_section else ""
+        )
         system_prompt = (
             f"Context: {self.config.domain_context}\n"
             "You summarize a section from a document in this domain for retrieval. "
             "Return a concise summary that helps a sales agent find answers later. "
-            "Capture: eligible roles, qualification thresholds, reward details, "
-            "locations, timelines, exceptions, definitions, and any rules specific to this section. "
-            "Do not invent facts."
+            "Capture: eligible roles, qualification thresholds with EXACT amounts, reward details "
+            "with EXACT values, locations, timelines with EXACT dates or periods, exceptions, "
+            "definitions, and rules specific to this section. "
+            "Always state specific numbers, percentages, and currency amounts verbatim — "
+            "do not round or paraphrase them."
+            + table_note
+            + " Do not invent facts."
         )
         user_prompt = (
             f"Document title:\n{doc_title}\n\n"
@@ -1556,8 +1579,10 @@ class DocumentCorpus:
             f"Context: {self.config.domain_context}\n"
             "You summarize a section from a document in this domain for retrieval. "
             "Return a concise summary that helps a sales agent find answers later. "
-            "Capture: eligible roles, qualification thresholds, reward details, "
-            "locations, timelines, exceptions, definitions, and any rules specific to this section. "
+            "Capture: eligible roles, qualification thresholds with EXACT amounts, reward details "
+            "with EXACT values, locations, timelines with EXACT dates or periods, exceptions, "
+            "definitions, and rules specific to this section. "
+            "Always state specific numbers, percentages, and currency amounts verbatim. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1688,7 +1713,13 @@ class DocumentCorpus:
             "Cover where present: eligibility criteria, reward amounts, key thresholds, timelines, locations, "
             "exceptions, role definitions, qualification rules, and contest structure.\n"
             "Use natural conversational English for questions (the way someone would type in a chat).\n"
-            "Keep answers concise (1–3 sentences) and grounded strictly in the document above.\n"
+            "Answer quality rules:\n"
+            "- Always include specific numbers, amounts, percentages, and dates verbatim — never paraphrase them.\n"
+            "- For simple factual questions (a single threshold, date, or name), one clear sentence is enough.\n"
+            "- For eligibility, reward, or process questions, write 2–4 sentences covering the key conditions, "
+            "amounts, and any exceptions. Use short bullets if there are 3 or more distinct conditions.\n"
+            "- Never add caveats like 'as per the document' or 'subject to terms' — just state the facts.\n"
+            "Answers must be grounded strictly in the document above.\n"
             "Format each pair exactly as:\n"
             "Q: <question>\n"
             "A: <answer>\n\n"

@@ -49,6 +49,9 @@ class PolicyGPTBot:
         )
         self.conversations = conversations or ConversationManager()
         self._supplementary_facts: str = self._load_supplementary_facts()
+        # In-memory answer cache: (normalized_question, frozenset(active_doc_ids)) → (answer, sources).
+        # Only caches non-context-dependent queries. Cleared on process restart.
+        self._answer_cache: dict[tuple, tuple[str, list[SourceReference]]] = {}
 
     @property
     def documents(self):
@@ -146,6 +149,24 @@ class PolicyGPTBot:
             preferred_doc_ids = thread.active_doc_ids if query_analysis.context_dependent else []
             preferred_section_ids = thread.active_section_ids if query_analysis.context_dependent else []
 
+            # Answer cache — skip for context-dependent follow-ups where the
+            # answer may differ based on which doc was last referenced.
+            _cache_key: tuple | None = None
+            if not query_analysis.context_dependent:
+                _norm_q = re.sub(r"\s+", " ", user_question.strip().casefold())
+                _cache_key = (_norm_q, frozenset(thread.active_doc_ids))
+                _cached = self._answer_cache.get(_cache_key)
+                if _cached is not None:
+                    cached_answer, cached_sources = _cached
+                    thread.display_messages.append(Message(role="user", content=user_question))
+                    thread.display_messages.append(Message(role="assistant", content=cached_answer))
+                    thread.recent_messages.append(Message(role="user", content=user_question))
+                    thread.recent_messages.append(
+                        Message(role="assistant", content=self._compact_history_message(cached_answer))
+                    )
+                    thread.updated_at = utc_now_iso()
+                    return ChatResult(thread_id=thread_id, answer=cached_answer, sources=cached_sources)
+
             answer_text = ""
             is_answerable = False
 
@@ -193,6 +214,12 @@ class PolicyGPTBot:
                     )
                     for section, score in top_sections
                 ]
+                # Drop very low-scoring sources that barely contributed — keeps
+                # the reference list focused on genuinely relevant sections.
+                if len(sources) > 1:
+                    best_src_score = sources[0].score
+                    min_src = max(self.config.answerability_min_section_score, best_src_score * 0.45)
+                    sources = [s for s in sources if s.score >= min_src] or sources[:1]
 
                 is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
                 if is_answerable:
@@ -215,6 +242,14 @@ class PolicyGPTBot:
                             "\n\n_Note: some details in this answer could not be fully verified "
                             "against the retrieved evidence. Please cross-check with the source document._"
                         )
+                    # Confidence indicator — show only when not high confidence
+                    confidence = self._compute_confidence(top_sections)
+                    if confidence != "High":
+                        answer_text += f"\n\n_Confidence: {confidence}_"
+                    # Suggest related questions from the FAQ corpus
+                    related = self._find_related_questions(query_vec, user_question)
+                    if related:
+                        answer_text += "\n\n**You might also ask:**\n" + "\n".join(f"- {q}" for q in related)
                 else:
                     # Pattern pre-filter missed this (e.g. "looks nice.. thanks").
                     # Ask the LLM to classify intent before showing a retrieval
@@ -224,9 +259,15 @@ class PolicyGPTBot:
                     if llm_intent != "policy":
                         answer_text = self._conversational_reply(llm_intent, user_question)
                     else:
-                        answer_text = self._build_unanswerable_response(query_analysis, top_docs)
+                        # Try a clarifying question before giving up — useful for
+                        # ambiguous or overly-broad queries where more context helps.
+                        clarifying = self._generate_clarifying_question(user_question, query_analysis, top_docs)
+                        answer_text = clarifying if clarifying else self._build_unanswerable_response(query_analysis, top_docs)
 
             final_answer = self._sanitize_answer_for_user(answer_text.strip())
+            # Populate cache for eligible queries (non-context-dependent + answerable)
+            if _cache_key is not None and is_answerable:
+                self._answer_cache[_cache_key] = (final_answer, sources)
             self._write_retrieval_log(
                 thread_id=thread.thread_id,
                 user_question=user_question,
@@ -399,6 +440,11 @@ class PolicyGPTBot:
             return True
         if not answer.strip() or not evidence_context.strip():
             return True
+        # Skip the expensive LLM check for answers that contain no verifiable
+        # numeric or date claims — pure narrative answers can't be "ungrounded"
+        # in the sense of wrong numbers.
+        if not re.search(r"\d", answer[:600]):
+            return True
         system_prompt = (
             "You are a factual grounding checker. "
             "Given an answer and the evidence it was derived from, decide whether "
@@ -523,6 +569,83 @@ class PolicyGPTBot:
         answer = self._normalize_answer_markdown(self.redactor.unmask_text(masked))
         return answer, all_sources
 
+    @staticmethod
+    def _compute_confidence(top_sections: list[tuple]) -> str:
+        """Return 'High', 'Medium', or 'Low' based on the best section retrieval score."""
+        if not top_sections:
+            return "Low"
+        best_score = top_sections[0][1]
+        if best_score >= 0.55:
+            return "High"
+        if best_score >= 0.38:
+            return "Medium"
+        return "Low"
+
+    def _find_related_questions(self, query_vec, asked_question: str, top_k: int = 3) -> list[str]:
+        """Return up to top_k FAQ questions related to the current query.
+
+        Filters out the question that was just asked so suggestions are
+        genuinely new.  Returns an empty list when FAQ embeddings are absent
+        or when no related questions score above a basic threshold.
+        """
+        candidates = self.corpus.search_faq_questions(query_vec, top_k=top_k + 5)
+        asked_lower = asked_question.strip().casefold()
+        seen: set[str] = set()
+        related: list[str] = []
+        for score, q, _, _ in candidates:
+            if score < 0.55:
+                break  # Results are sorted descending — stop when score drops off
+            q_lower = q.strip().casefold()
+            if q_lower == asked_lower or q_lower in seen:
+                continue
+            seen.add(q_lower)
+            related.append(q)
+            if len(related) >= top_k:
+                break
+        return related
+
+    def _generate_clarifying_question(
+        self,
+        user_question: str,
+        query_analysis: QueryAnalysis,
+        top_docs: list,
+    ) -> str:
+        """Ask the user one clarifying question when retrieval fails for ambiguous queries.
+
+        Returns the clarifying question string, or empty string when the query
+        is specific enough that clarification wouldn't help.
+        """
+        # Only ask for clarification when the query is genuinely ambiguous:
+        # very short, multi-intent, or multi-doc expected but unclear scope.
+        is_ambiguous = (
+            len(user_question.strip()) < 35
+            or len(query_analysis.intents) > 2
+            or (query_analysis.multi_doc_expected and len(query_analysis.topic_hints) == 0)
+        )
+        if not is_ambiguous or not top_docs:
+            return ""
+        doc_titles = [doc.title for doc, _ in top_docs[:3]]
+        system_prompt = (
+            "You are a helpful policy assistant. The user asked a question but retrieval "
+            "did not return a clear answer. Ask ONE short, specific clarifying question "
+            "that would help you give a better answer. Reference the available documents if helpful. "
+            "Do not explain why you are asking — just ask the question naturally."
+        )
+        user_prompt = (
+            f"User question: {user_question}\n"
+            f"Documents available: {', '.join(doc_titles)}\n\n"
+            "Ask one clarifying question."
+        )
+        try:
+            reply = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=60,
+            ).strip()
+            return reply if reply else ""
+        except Exception:
+            return ""
+
     def _load_supplementary_facts(self) -> str:
         """Load supplementary facts from file if configured and present.
 
@@ -632,6 +755,17 @@ class PolicyGPTBot:
             if query_analysis.detail_requested
             else " Keep it tight and focused."
         )
+
+        # Structured format for explicitly detailed questions — avoids walls of text
+        if query_analysis.detail_requested and not self._user_wants_table(query_analysis):
+            return (
+                "The user has asked for a detailed explanation. "
+                "Structure your answer as follows (skip any section that has no relevant content): "
+                "1. **Summary** — one or two sentences with the direct answer. "
+                "2. **Details** — bullet points with exact values, thresholds, role names, and conditions from the evidence. "
+                "3. **Exceptions / Conditions** — any exclusions, disqualifications, or special rules if stated in the evidence. "
+                "Keep each section tight. Lead with facts, not preamble."
+            )
 
         if self._user_wants_table(query_analysis):
             return (
@@ -1385,8 +1519,16 @@ class PolicyGPTBot:
                     self.redactor.unmask_text(section.summary),
                     self.config.answer_context_doc_summary_char_limit,
                 )
+                # Content-type hint helps the LLM interpret the evidence correctly
+                _raw_text = section.raw_text or ""
+                if "<table" in _raw_text.lower() or _raw_text.count("|") >= 6:
+                    _ctype = "table"
+                elif bool(re.search(r"\n\s{0,4}[-*\u2022]\s", _raw_text)):
+                    _ctype = "list"
+                else:
+                    _ctype = "prose"
                 section_context_lines = [
-                    f"[{evidence_tag} {section.title}]",
+                    f"[{evidence_tag} {section.title}] [{_ctype}]",
                 ]
                 if not minimal_context and self.config.include_section_metadata_in_answers:
                     section_context_lines.append(
@@ -1420,7 +1562,11 @@ class PolicyGPTBot:
                 f"Background facts (use to supplement retrieved evidence; do not cite as a source):\n"
                 f"{self._supplementary_facts}"
             )
-        prompt_parts.append("Answer only from the evidence. Prefer raw evidence over summaries. Never mention internal IDs.")
+        prompt_parts.append(
+            "Answer only from the evidence. Prefer raw evidence over summaries. Never mention internal IDs. "
+            "If the evidence states explicit exclusions, exceptions, or disqualifying conditions, include them in the answer — "
+            "do not silently omit negative conditions."
+        )
         return "\n\n".join(part for part in prompt_parts if part.strip())
 
     def _write_retrieval_log(
