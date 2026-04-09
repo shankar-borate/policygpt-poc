@@ -130,13 +130,20 @@ function renderMarkdown(text) {
     }
 
     const parts = [];
-    const fencePattern = /```([\s\S]*?)```/g;
+    // Match code fences OR block-level HTML elements — both bypass escaping.
+    const blockPattern = /```([\s\S]*?)```|(<(?:table|div|figure|details)[^>]*>[\s\S]*?<\/(?:table|div|figure|details)>)/gi;
     let lastIndex = 0;
     let match;
 
-    while ((match = fencePattern.exec(text)) !== null) {
+    while ((match = blockPattern.exec(text)) !== null) {
         parts.push(renderMarkdownBlock(text.slice(lastIndex, match.index)));
-        parts.push(`<pre><code>${escapeHtml(match[1].trim())}</code></pre>`);
+        if (match[1] !== undefined) {
+            // Code fence
+            parts.push(`<pre><code>${escapeHtml(match[1].trim())}</code></pre>`);
+        } else {
+            // HTML block — pass through as-is so tables render correctly
+            parts.push(match[2]);
+        }
         lastIndex = match.index + match[0].length;
     }
 

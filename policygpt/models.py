@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 import numpy as np
 
@@ -49,6 +50,16 @@ class DocumentRecord:
     title_terms: list[str] = field(default_factory=list)
     token_counts: dict[str, int] = field(default_factory=dict)
     token_length: int = 0
+    faq: str = ""
+    # Per-question embeddings for FAQ fast-path retrieval.
+    # List of (question_text, embedding) pairs — built during ingest when
+    # generate_faq=True and used at query time to short-circuit RAG for
+    # near-exact FAQ matches (cosine ≥ faq_fastpath_min_score).
+    faq_qa_pairs: list[tuple[str, str]] = field(default_factory=list)
+    faq_q_embeddings: list[np.ndarray] = field(default_factory=list)
+    # DocumentEntityMap instance — stored as Any to avoid a circular import.
+    # Access via corpus.entity_lookup which is rebuilt on every ingest.
+    entity_map: Any = None
 
 
 @dataclass

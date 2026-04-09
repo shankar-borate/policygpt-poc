@@ -17,7 +17,7 @@ from policygpt.services.bedrock_service import BedrockService
 from policygpt.services.debug_logging import write_llm_debug_log_pair
 from policygpt.services.file_extractor import FileExtractor
 from policygpt.services.openai_service import OpenAIService
-from policygpt.services.query_analyzer import QueryAnalysis, QueryAnalyzer
+from policygpt.services.query_analyzer import QueryAnalysis, QueryAnalyzer, detect_conversational_intent
 from policygpt.services.redaction import Redactor
 from policygpt.services.taxonomy import unique_preserving_order
 from policygpt.services.usage_metrics import LLMUsageTracker
@@ -47,6 +47,7 @@ class PolicyGPTBot:
             redactor=self.redactor,
         )
         self.conversations = conversations or ConversationManager()
+        self._supplementary_facts: str = self._load_supplementary_facts()
 
     @property
     def documents(self):
@@ -92,6 +93,15 @@ class PolicyGPTBot:
                 raise RuntimeError("No documents ingested. Call ingest_folder() first.")
 
             thread = self.get_thread(thread_id)
+
+            conversational_intent = detect_conversational_intent(user_question)
+            if conversational_intent:
+                reply = self._conversational_reply(conversational_intent, user_question)
+                thread.display_messages.append(Message(role="user", content=user_question))
+                thread.display_messages.append(Message(role="assistant", content=reply))
+                thread.updated_at = utc_now_iso()
+                return ChatResult(thread_id=thread_id, answer=reply, sources=[])
+
             first_user_message = not any(message.role == "user" for message in thread.display_messages)
             active_document_titles = [
                 self.documents[doc_id].title
@@ -102,61 +112,117 @@ class PolicyGPTBot:
                 user_question=user_question,
                 active_document_titles=active_document_titles,
                 candidate_documents=list(self.documents.values()),
+                entity_lookup=self.corpus.entity_lookup,
             )
 
             retrieval_query = self._build_retrieval_query(thread, query_analysis)
             masked_retrieval_query = self.redactor.mask_text(retrieval_query)
-            # Fix: embed only the user's question so the semantic vector is
-            # not diluted by conversation context or metadata labels.  The
-            # full retrieval_query feeds BM25/lexical channels via
-            # query_analysis.expanded_terms already.  Use unmasked text so
-            # the vector matches unmasked index vectors.
-            query_vec = self._embed_one(query_analysis.canonical_question)
+            # Embed only the raw user question so the semantic vector is not
+            # diluted by injected metadata labels ("Inferred policy topics:",
+            # "Expanded search terms:", etc.).  The canonical_question drives
+            # BM25/lexical channels via expanded_terms already; mixing it
+            # into the embedding vector hurts cosine similarity against the
+            # clean document embeddings.
+            query_vec = self._embed_one(query_analysis.original_question)
+
+            # FAQ fast-path: if the question nearly exactly matches a stored
+            # FAQ question (cosine ≥ faq_fastpath_min_score), return the FAQ
+            # answer directly without running the full RAG pipeline.
+            faq_hit = self.corpus.faq_fastpath_lookup(
+                query_vec,
+                min_score=self.config.faq_fastpath_min_score,
+            )
+            if faq_hit:
+                final_faq = self._normalize_answer_markdown(faq_hit)
+                thread.display_messages.append(Message(role="user", content=user_question))
+                thread.display_messages.append(Message(role="assistant", content=final_faq))
+                thread.recent_messages.append(Message(role="user", content=user_question))
+                thread.recent_messages.append(Message(role="assistant", content=self._compact_history_message(final_faq)))
+                if first_user_message:
+                    thread.title = self._derive_thread_title(user_question)
+                thread.updated_at = utc_now_iso()
+                return ChatResult(thread_id=thread_id, answer=final_faq, sources=[])
             preferred_doc_ids = thread.active_doc_ids if query_analysis.context_dependent else []
             preferred_section_ids = thread.active_section_ids if query_analysis.context_dependent else []
 
-            top_docs = self.corpus.retrieve_top_docs(
-                query_vec,
-                query_analysis=query_analysis,
-                preferred_doc_ids=preferred_doc_ids,
-            )
-            top_sections = self.corpus.retrieve_top_sections(
-                query_vec,
-                query_analysis,
-                top_docs,
-                preferred_section_ids=preferred_section_ids,
-            )
-            top_docs = self._merge_retrieved_documents(top_docs, top_sections)
+            answer_text = ""
+            is_answerable = False
 
-            sources = [
-                SourceReference(
-                    document_title=self.documents[section.doc_id].title,
-                    section_title=section.title,
-                    source_path=section.source_path,
-                    score=score,
-                    section_order_index=section.order_index,
-                )
-                for section, score in top_sections
-            ]
+            # Compound question detection — if the user asked two distinct
+            # questions in one message, retrieve separately for each and answer
+            # them together.  Skip when the question is a simple follow-up or
+            # a direct aggregate query (those are handled by the FAQ path).
+            sub_questions = self._split_compound_question(user_question)
+            is_compound = len(sub_questions) > 1 and not query_analysis.context_dependent
 
-            is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
-            if is_answerable:
-                prompt_payload = self._build_answer_context(
+            if is_compound:
+                answer_text, sources = self._answer_compound_question(
                     thread=thread,
-                    query_analysis=query_analysis,
-                    top_docs=top_docs,
-                    top_sections=top_sections,
+                    user_question=user_question,
+                    sub_questions=sub_questions,
+                    active_document_titles=active_document_titles,
+                    preferred_doc_ids=preferred_doc_ids,
+                    preferred_section_ids=preferred_section_ids,
                 )
-
-                masked_answer = self._llm_text_with_debug_log(
-                    purpose="chat_answer",
-                    system_prompt=self.redactor.mask_text(self._system_prompt()),
-                    user_prompt=self.redactor.mask_text(prompt_payload),
-                    max_output_tokens=self.config.chat_max_output_tokens,
-                )
-                answer_text = self._normalize_answer_markdown(self.redactor.unmask_text(masked_answer))
+                top_docs = []
+                top_sections = []
+                is_answerable = True
+                prompt_payload = ""
             else:
-                answer_text = self._build_unanswerable_response(query_analysis, top_docs)
+                top_docs = self.corpus.retrieve_top_docs(
+                    query_vec,
+                    query_analysis=query_analysis,
+                    preferred_doc_ids=preferred_doc_ids,
+                )
+                top_sections = self.corpus.retrieve_top_sections(
+                    query_vec,
+                    query_analysis,
+                    top_docs,
+                    preferred_section_ids=preferred_section_ids,
+                )
+                top_docs = self._merge_retrieved_documents(top_docs, top_sections)
+
+                sources = [
+                    SourceReference(
+                        document_title=self.documents[section.doc_id].title,
+                        section_title=section.title,
+                        source_path=section.source_path,
+                        score=score,
+                        section_order_index=section.order_index,
+                    )
+                    for section, score in top_sections
+                ]
+
+                is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
+                if is_answerable:
+                    prompt_payload = self._build_answer_context(
+                        thread=thread,
+                        query_analysis=query_analysis,
+                        top_docs=top_docs,
+                        top_sections=top_sections,
+                    )
+                    masked_answer = self._llm_text_with_debug_log(
+                        purpose="chat_answer",
+                        system_prompt=self.redactor.mask_text(self._system_prompt()),
+                        user_prompt=self.redactor.mask_text(prompt_payload),
+                        max_output_tokens=self.config.chat_max_output_tokens,
+                    )
+                    answer_text = self._normalize_answer_markdown(self.redactor.unmask_text(masked_answer))
+                    if not self._check_answer_grounding(answer_text, prompt_payload):
+                        answer_text += (
+                            "\n\n_Note: some details in this answer could not be fully verified "
+                            "against the retrieved evidence. Please cross-check with the source document._"
+                        )
+                else:
+                    # Pattern pre-filter missed this (e.g. "looks nice.. thanks").
+                    # Ask the LLM to classify intent before showing a retrieval
+                    # failure — cheap single call, avoids confusing non-policy
+                    # messages with "I couldn't find a clear statement".
+                    llm_intent = self._llm_classify_intent(user_question)
+                    if llm_intent != "policy":
+                        answer_text = self._conversational_reply(llm_intent, user_question)
+                    else:
+                        answer_text = self._build_unanswerable_response(query_analysis, top_docs)
 
             final_answer = self._sanitize_answer_for_user(answer_text.strip())
             self._write_retrieval_log(
@@ -246,10 +312,247 @@ class PolicyGPTBot:
 
         raise ValueError(f"Unsupported AI provider: {self.config.ai_provider}")
 
+    def _conversational_reply(self, intent: str, user_message: str = "") -> str:
+        """Return a natural LLM-generated reply for non-policy conversational messages.
+
+        Falls back to a canned reply if the LLM call fails so the user always
+        gets a response.
+        """
+        system_prompt = (
+            "You are a warm, friendly policy assistant for an insurance company's agency sales team. "
+            "The user has sent you a social or conversational message — not a policy question. "
+            "Respond naturally and briefly (1-2 sentences max) as a helpful colleague would. "
+            "Be warm, human, and in context with what the user said. "
+            "Do not lecture them about what you can do unless they specifically asked. "
+            "If they seem to be wrapping up, wish them well. "
+            "If they expressed an emotion or made a social gesture, acknowledge it naturally. "
+            "If the message is unclear or gibberish, respond with light humour and let them know you're ready to help."
+        )
+        try:
+            reply = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_message.strip() or intent,
+                max_output_tokens=80,
+            ).strip()
+            if reply:
+                return reply
+        except Exception:
+            pass
+
+        # Canned fallback in case the LLM call fails
+        _fallback: dict[str, str] = {
+            "greeting": "Hello! Ready to help with any contest or policy questions.",
+            "farewell": "Goodbye! Come back anytime.",
+            "thanks": "You're welcome!",
+            "identity": (
+                "I'm a policy assistant for the agency sales team — ask me about contests, "
+                "rewards, eligibility, thresholds, timelines, and more."
+            ),
+        }
+        return _fallback.get(intent, "Happy to help — just ask!")
+
+    def _llm_classify_intent(self, text: str) -> str:
+        """Use a cheap LLM call to classify intent when the pattern pre-filter misses.
+
+        Returns one of: "policy" | "greeting" | "farewell" | "thanks" |
+        "identity" | "chitchat".
+
+        Defaults to "policy" on any failure so real questions are never
+        suppressed by a classification error.
+        """
+        system_prompt = (
+            "You are an intent classifier for a policy Q&A assistant used by insurance sales agents. "
+            "Classify the user message into exactly one of these categories:\n"
+            "  policy    — a genuine question about contest rules, rewards, eligibility, "
+            "thresholds, timelines, locations, roles, or any other policy topic\n"
+            "  greeting  — hello, hi, good morning, good evening, etc.\n"
+            "  farewell  — bye, goodbye, see you, take care, etc.\n"
+            "  thanks    — thank you, thanks, great, nice, looks good, cheers, etc.\n"
+            "  identity  — who are you, what can you do, what is this bot, etc.\n"
+            "  chitchat  — any other off-topic or social message that is not a policy question\n\n"
+            "Reply with ONLY the single category word. No punctuation, no explanation."
+        )
+        user_prompt = f"Message: {text.strip()}"
+        try:
+            raw = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=10,
+            )
+            category = raw.strip().lower().split()[0] if raw.strip() else "policy"
+            valid = {"policy", "greeting", "farewell", "thanks", "identity", "chitchat"}
+            return category if category in valid else "policy"
+        except Exception:
+            return "policy"
+
+    def _check_answer_grounding(self, answer: str, evidence_context: str) -> bool:
+        """Return True if the answer appears grounded in the evidence.
+
+        Makes a single cheap LLM call asking the model to verify that every
+        factual claim in the answer is supported by the provided evidence.
+        Returns True (grounded) on any failure so the guard never suppresses
+        a valid answer due to an LLM error.
+        """
+        if not self.config.grounding_guard_enabled:
+            return True
+        if not answer.strip() or not evidence_context.strip():
+            return True
+        system_prompt = (
+            "You are a factual grounding checker. "
+            "Given an answer and the evidence it was derived from, decide whether "
+            "every specific factual claim in the answer (numbers, names, dates, "
+            "thresholds, eligibility rules) is directly supported by the evidence. "
+            "Reply with exactly one word: GROUNDED or UNGROUNDED."
+        )
+        user_prompt = (
+            f"Evidence:\n{evidence_context[:3000]}\n\n"
+            f"Answer:\n{answer[:1500]}\n\n"
+            "Is every factual claim in the answer supported by the evidence above?"
+        )
+        try:
+            raw = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=self.config.grounding_guard_max_output_tokens,
+            )
+            return "ungrounded" not in raw.strip().lower()
+        except Exception:
+            return True
+
+    # Patterns that signal the user asked two or more distinct questions.
+    _COMPOUND_SPLITTERS = re.compile(
+        r"\band\s+(what|who|when|where|how|which|is|are|can|does|do|will)\b"
+        r"|\balso\s+(what|who|when|where|how|which|is|are|can|does|do|will)\b"
+        r"|\?[^?]+\?",  # two or more question marks
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _split_compound_question(cls, text: str) -> list[str]:
+        """Return sub-questions if *text* contains a compound question, else [text].
+
+        Splits on "... and what/who/how/..." or on multiple "?" marks. Returns
+        the original question unchanged when no compound pattern is detected or
+        when the question is too short to split meaningfully.
+        """
+        text = text.strip()
+        # Two or more explicit question marks → split there.
+        parts_by_qmark = [p.strip() for p in text.split("?") if p.strip()]
+        if len(parts_by_qmark) >= 2:
+            return [p + "?" for p in parts_by_qmark]
+
+        # Detect "and what/who/how/..." mid-sentence connector.
+        match = cls._COMPOUND_SPLITTERS.search(text)
+        if match:
+            split_pos = match.start()
+            first = text[:split_pos].strip().rstrip(",;")
+            second = text[split_pos:].strip().lstrip("and ").lstrip("also ").strip()
+            if first and second and len(first) >= 12 and len(second) >= 12:
+                return [first + "?", second + "?"]
+
+        return [text]
+
+    def _answer_compound_question(
+        self,
+        thread,
+        user_question: str,
+        sub_questions: list[str],
+        active_document_titles: list[str],
+        preferred_doc_ids: list[str],
+        preferred_section_ids: list[str],
+    ) -> tuple[str, list[SourceReference]]:
+        """Retrieve evidence for each sub-question separately and answer together.
+
+        Returns (combined_answer_text, merged_sources).
+        """
+        sub_contexts: list[str] = []
+        all_sources: list[SourceReference] = []
+        seen_section_ids: set[str] = set()
+
+        for sub_q in sub_questions:
+            sub_analysis = self.query_analyzer.analyze(
+                user_question=sub_q,
+                active_document_titles=active_document_titles,
+                candidate_documents=list(self.documents.values()),
+                entity_lookup=self.corpus.entity_lookup,
+            )
+            sub_vec = self._embed_one(sub_q)
+            sub_docs = self.corpus.retrieve_top_docs(
+                sub_vec,
+                query_analysis=sub_analysis,
+                preferred_doc_ids=preferred_doc_ids,
+            )
+            sub_sections = self.corpus.retrieve_top_sections(
+                sub_vec,
+                sub_analysis,
+                sub_docs,
+                preferred_section_ids=preferred_section_ids,
+            )
+            for section, score in sub_sections:
+                if section.section_id in seen_section_ids:
+                    continue
+                seen_section_ids.add(section.section_id)
+                all_sources.append(SourceReference(
+                    document_title=self.documents[section.doc_id].title,
+                    section_title=section.title,
+                    source_path=section.source_path,
+                    score=score,
+                    section_order_index=section.order_index,
+                ))
+            sub_context = self._build_answer_context(
+                thread=thread,
+                query_analysis=sub_analysis,
+                top_docs=sub_docs,
+                top_sections=sub_sections,
+            )
+            sub_contexts.append(f"Sub-question: {sub_q}\n{sub_context}")
+
+        combined_payload = (
+            f"The user asked a compound question with {len(sub_questions)} parts. "
+            "Answer each part in sequence, clearly labelled.\n\n"
+            + "\n\n---\n\n".join(sub_contexts)
+        )
+        masked = self._llm_text_with_debug_log(
+            purpose="chat_answer",
+            system_prompt=self.redactor.mask_text(self._system_prompt()),
+            user_prompt=self.redactor.mask_text(combined_payload),
+            max_output_tokens=self.config.chat_max_output_tokens,
+        )
+        answer = self._normalize_answer_markdown(self.redactor.unmask_text(masked))
+        return answer, all_sources
+
+    def _load_supplementary_facts(self) -> str:
+        """Load supplementary facts from file if configured and present.
+
+        Content is injected verbatim into every LLM prompt as background
+        context.  It is never returned to the user as a source or citation.
+        Returns empty string when the file is absent or unreadable.
+        """
+        facts_path = (self.config.supplementary_facts_file or "").strip()
+        if not facts_path:
+            return ""
+        path = Path(facts_path)
+        if not path.is_file():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def reload_supplementary_facts(self) -> None:
+        """Re-read the supplementary facts file without restarting the bot.
+
+        Call this if the file is updated while the bot is running.
+        """
+        self._supplementary_facts = self._load_supplementary_facts()
+
     def _system_prompt(self) -> str:
+        domain = self.config.domain_context
         if self._uses_open_weight_prompt_profile():
             return (
-                "You are a conversational enterprise document assistant.\n"
+                f"Domain: {domain}\n"
+                "You are a conversational assistant helping users in this domain "
+                "find answers from their contest policy documents.\n"
                 "Rules:\n"
                 "1. Answer only from the provided document evidence.\n"
                 "2. If the answer is not clearly present, say that it is not clearly stated in the provided documents.\n"
@@ -266,7 +569,7 @@ class PolicyGPTBot:
                 "13. Ignore retrieved text that is about a different policy or a different topic than the user's question, even if it appears semantically similar.\n"
                 "14. If the evidence does not explicitly support the asked point, say it is not clearly stated instead of inferring.\n"
                 "15. Rewrite policy language into plain, user-friendly business English. Do not paste long policy wording back to the user.\n"
-                "16. For list, eligibility, process, approval, and comparison questions, prefer short bullets with bold labels instead of long paragraphs.\n"
+                "16. For list, eligibility, process, approval, and comparison questions, prefer short bullets with bold labels instead of long paragraphs. When the user explicitly asks for a table or tabular format, output a proper HTML table using <table><thead><tr><th>...</th></tr></thead><tbody><tr><td>...</td></tr></tbody></table> — never use Markdown pipe syntax for tables as it does not render correctly.\n"
                 "17. Avoid horizontal rules, deep heading hierarchies, raw policy numbering, and document-style formatting.\n"
                 "18. Do not add a separate source/citation section in the answer body. References are added separately.\n"
                 "19. Treat the question analysis as a retrieval aid, but only state things that are clearly supported by the evidence snippets.\n"
@@ -275,10 +578,12 @@ class PolicyGPTBot:
                 "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format.\n"
                 "23. If recent chat suggests one document but the current retrieved evidence explicitly defines the asked term in another document, follow the current evidence and briefly note the difference if needed.\n"
                 "24. Treat raw policy evidence blocks as the source of truth. Use summaries only for orientation. If a raw evidence block and a summary differ, trust the raw evidence.\n"
-                "25. Never show internal IDs or evidence labels in the final answer body. Sources are shown separately."
+                "25. Never show internal IDs or evidence labels in the final answer body. Sources are shown separately.\n"
+                "26. Never use the pipe character | anywhere in the response — not in tables, not as a text separator, not in any context. Use HTML tables for tabular data and commas or bullets for inline lists."
             )
         return (
-            "You are an enterprise document assistant.\n"
+            f"Domain: {domain}\n"
+            "You are a document assistant helping users in this domain find answers from their policy documents.\n"
             "Answer only from the provided evidence; if unclear, say it is not clearly stated.\n"
             "Use recent chat only for referential follow-ups.\n"
             "Prefer raw evidence blocks over summaries; summaries are orientation only.\n"
@@ -288,7 +593,8 @@ class PolicyGPTBot:
             "Reply in concise Markdown. Lead with the answer. Use short bullets for list, eligibility, process, approval, comparison, and timeline questions.\n"
             "Use plain English. Avoid long quotes and repetition.\n"
             "No Evidence:, Source:, or Reference: lines in the answer body.\n"
-            "Never show internal IDs or evidence labels. Sources are shown separately."
+            "Never show internal IDs or evidence labels. Sources are shown separately.\n"
+            "Never use the pipe character | anywhere — not in tables, not as a separator. Use HTML tables for tabular data."
         )
 
     def _uses_open_weight_prompt_profile(self) -> bool:
@@ -297,12 +603,47 @@ class PolicyGPTBot:
             return False
         return config.ai_provider == "bedrock" and config.bedrock_gpt_model_size in {"20b", "120b"}
 
+    # Keywords that signal the user wants output as a table.
+    _TABLE_REQUEST_PHRASES: tuple[str, ...] = (
+        "in table",
+        "in a table",
+        "as a table",
+        "show table",
+        "show in table",
+        "show me table",
+        "show me in table",
+        "display table",
+        "display as table",
+        "tabular",
+        "table format",
+        "in tabular",
+    )
+
+    @staticmethod
+    def _user_wants_table(query_analysis: QueryAnalysis) -> bool:
+        normalized = query_analysis.normalized_question
+        return any(phrase in normalized for phrase in PolicyGPTBot._TABLE_REQUEST_PHRASES)
+
     def _answer_format_guidance(self, query_analysis: QueryAnalysis) -> str:
         detail_suffix = (
             " Expand slightly with supporting details because the user explicitly asked for more detail."
             if query_analysis.detail_requested
             else " Keep it tight and focused."
         )
+
+        if self._user_wants_table(query_analysis):
+            return (
+                "The user explicitly asked for a table. "
+                "Respond using a proper HTML table — not Markdown pipe syntax. "
+                "Structure: <table><thead><tr><th>Col</th>...</tr></thead><tbody><tr><td>val</td>...</tr></tbody></table>. "
+                "Choose column headers that match the data (e.g. Name, Eligibility, Reward, Threshold, Amount). "
+                "Keep each cell concise — one line of text per cell, no bullet lists or newlines inside cells. "
+                "If the data has multiple logical groups, output one <table> per group with a short <b>heading</b> above it. "
+                "Do not mix Markdown pipe rows with HTML tables. "
+                "Do not add any extra Markdown decoration around the table."
+                + detail_suffix
+            )
+
         if "comparison" in query_analysis.intents:
             return (
                 "Start with the direct difference, then use short bullets for each item being compared. "
@@ -473,12 +814,78 @@ class PolicyGPTBot:
         return f"{clean_answer}\n\n{reference_line}"
 
     @staticmethod
+    def _is_table_separator_row(line: str) -> bool:
+        """Return True if the line is a markdown table separator (e.g. | --- | :--- |)."""
+        stripped = line.strip()
+        return (
+            "|" in stripped
+            and "-" in stripped
+            and bool(re.match(r"^[\|\-\:\s]+$", stripped))
+        )
+
+    @staticmethod
+    def _parse_table_row(line: str) -> list[str]:
+        """Split a markdown table row into cell strings."""
+        stripped = line.strip().strip("|")
+        return [cell.strip() for cell in stripped.split("|")]
+
+    @staticmethod
+    def _markdown_table_to_html(lines: list[str]) -> str:
+        """Convert a list of markdown table lines into a compact HTML table string."""
+        if len(lines) < 2:
+            return "\n".join(lines)
+        headers = PolicyGPTBot._parse_table_row(lines[0])
+        # lines[1] is the separator row — skip it
+        data_rows = [
+            PolicyGPTBot._parse_table_row(row)
+            for row in lines[2:]
+            if "|" in row
+        ]
+        parts: list[str] = ["<table><thead><tr>"]
+        parts += [f"<th>{h}</th>" for h in headers if h]
+        parts += ["</tr></thead><tbody>"]
+        for row in data_rows:
+            parts.append("<tr>")
+            parts += [f"<td>{cell}</td>" for cell in row if cell or len(row) > 1]
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+        return "".join(parts)
+
+    @staticmethod
     def _normalize_answer_markdown(answer: str) -> str:
+        # ── pass 1: convert any markdown pipe-tables to HTML ──────────────────
+        raw_lines = answer.splitlines()
+        converted: list[str] = []
+        i = 0
+        while i < len(raw_lines):
+            line = raw_lines[i]
+            # A markdown table starts with a pipe row whose *next* line is a
+            # separator row (| --- | --- |).
+            if (
+                "|" in line
+                and i + 1 < len(raw_lines)
+                and PolicyGPTBot._is_table_separator_row(raw_lines[i + 1])
+            ):
+                table_block: list[str] = [line]
+                j = i + 1
+                while j < len(raw_lines) and "|" in raw_lines[j]:
+                    table_block.append(raw_lines[j])
+                    j += 1
+                converted.append(PolicyGPTBot._markdown_table_to_html(table_block))
+                i = j
+                continue
+            converted.append(line)
+            i += 1
+
+        # ── pass 2: clean up non-table lines ──────────────────────────────────
         cleaned_lines: list[str] = []
-        for raw_line in answer.splitlines():
+        for raw_line in converted:
             stripped = raw_line.strip()
+
+            # Drop standalone horizontal rules (---, ***, ___).
             if re.fullmatch(r"[-*_]{3,}", stripped):
                 continue
+
             if stripped.lower().startswith("source:") or stripped.lower().startswith("_source:"):
                 continue
 
@@ -491,6 +898,15 @@ class PolicyGPTBot:
 
         cleaned = "\n".join(cleaned_lines)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+        # ── pass 3: strip any remaining stray pipe characters ─────────────────
+        # Replace " | " style inline separators with " / " so they read
+        # naturally.  Pipes inside HTML tag content are extremely unlikely but
+        # we guard against matching inside angle-bracket spans.
+        cleaned = re.sub(r"(?<![<\w])\s*\|\s*(?![>\w/])", " / ", cleaned)
+        # Catch any residual lone pipes (e.g. at line start/end).
+        cleaned = re.sub(r"\|", "", cleaned)
+
         return cleaned.strip()
 
     @staticmethod
@@ -507,16 +923,6 @@ class PolicyGPTBot:
         if limit:
             return self._truncate_context_text(compact, limit)
         return compact
-
-    @staticmethod
-    def _sanitize_answer_for_user(answer: str) -> str:
-        cleaned = re.sub(r"\*?\((?:D\d+(?::S\d+)?)\)\*?", "", (answer or "").strip())
-        cleaned = re.sub(r"(?m)^\s*\[(?:D\d+(?::S\d+)?)\]\s*", "", cleaned)
-        cleaned = re.sub(r"(?m)^(\s*[-*]\s*)?\*{0,2}(?:D\d+(?::S\d+)?)\*{0,2}\s*(?:-|:|—)\s*", r"\1", cleaned)
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned.strip()
 
     @staticmethod
     def _sanitize_answer_for_user(answer: str) -> str:
@@ -590,7 +996,7 @@ class PolicyGPTBot:
             return True
 
         normalized_question = query_analysis.normalized_question.casefold()
-        relative_date_markers = (
+        date_sensitive_markers = (
             "today",
             "current",
             "currently",
@@ -598,14 +1004,35 @@ class PolicyGPTBot:
             "as of",
             "right now",
             "at present",
+            "still open",
+            "still active",
+            "still running",
+            "open for",
+            "open now",
+            "enrollment",
+            "enroll",
+            "login window",
+            "registration",
+            "last date",
+            "deadline",
+            "expired",
+            "ended",
+            "closed",
         )
-        return any(marker in normalized_question for marker in relative_date_markers)
+        return any(marker in normalized_question for marker in date_sensitive_markers)
 
     @staticmethod
     def _current_date_prompt_line() -> str:
+        today = datetime.now().astimezone().date().isoformat()
         return (
-            f"Current date: {datetime.now().astimezone().date().isoformat()}\n"
-            "Interpret relative dates such as today, current, and now against this date."
+            f"Current date: {today}\n"
+            "Interpret relative dates such as today, current, and now against this date.\n"
+            "If the evidence mentions a specific date range (e.g. contest window, login window, "
+            "enrollment period) and today's date falls AFTER the end of that range, explicitly "
+            "note in your answer that the window has already passed. "
+            "If the date range has not yet started, note that it has not begun. "
+            "If today falls within the range, note that it is currently active. "
+            "Do this only when the evidence clearly states the dates — do not infer dates."
         )
 
     @staticmethod
@@ -639,10 +1066,6 @@ class PolicyGPTBot:
             "higher of",
             "qualification rule",
             "allocation",
-            "eligibility",
-            "audience",
-            "persistency",
-            "tax",
             "net off all applicable taxes",
         )
 
@@ -705,9 +1128,13 @@ class PolicyGPTBot:
 
         for section, score in ranked_sections:
             signal = self._aggregate_section_signal(section)
-            if signal <= 0:
+            # Only hard-drop strongly negative sections once we already have
+            # enough coverage; never drop the first representative per doc.
+            if signal <= -4 and section.doc_id in seen_doc_ids:
                 continue
-            if section.doc_id in seen_doc_ids and signal < 6:
+            # Allow a second section from the same doc if its signal is at
+            # least mildly positive (was 6, now 2 to include eligibility etc.)
+            if section.doc_id in seen_doc_ids and signal < 2:
                 continue
             selected.append((section, score))
             seen_section_ids.add(section.section_id)
@@ -718,7 +1145,8 @@ class PolicyGPTBot:
                 break
             if section.section_id in seen_section_ids:
                 continue
-            if self._aggregate_section_signal(section) < 4:
+            # Lowered from 4 to 1 so boundary sections aren't silently dropped
+            if self._aggregate_section_signal(section) < 1:
                 continue
             selected.append((section, score))
             seen_section_ids.add(section.section_id)
@@ -787,10 +1215,26 @@ class PolicyGPTBot:
             parts.append(f"Conversation summary: {thread.conversation_summary}")
         if query_analysis.context_dependent and thread.current_topic:
             parts.append(f"Current topic: {thread.current_topic}")
-        if query_analysis.context_dependent and thread.active_doc_ids:
-            active_titles = [self.documents[doc_id].title for doc_id in thread.active_doc_ids if doc_id in self.documents]
+
+        # Always inject the titles of documents referenced in the last answer so
+        # follow-up questions resolve correctly even before a conversation summary
+        # exists (first few turns where summarize_after_turns hasn't fired yet).
+        if query_analysis.context_dependent:
+            active_titles: list[str] = [
+                self.documents[doc_id].title
+                for doc_id in thread.active_doc_ids
+                if doc_id in self.documents
+            ]
+            # Fall back to last-answer sources when active_doc_ids is empty
+            if not active_titles and thread.last_answer_sources:
+                seen: set[str] = set()
+                for src in thread.last_answer_sources:
+                    if src.document_title not in seen:
+                        seen.add(src.document_title)
+                        active_titles.append(src.document_title)
             if active_titles:
                 parts.append(f"Current documents: {', '.join(active_titles)}")
+
         if query_analysis.topic_hints:
             parts.append(f"Inferred policy topics: {', '.join(query_analysis.topic_hints)}")
         if query_analysis.intents:
@@ -868,56 +1312,76 @@ class PolicyGPTBot:
             if len(doc_context_lines) > 1:
                 doc_context_parts.append("\n".join(doc_context_lines))
 
-        prompt_sections = self._sections_for_answer_context(query_analysis, top_sections, top_docs)
+        # For aggregate queries (list all X, show all Y) use each document's
+        # pre-generated FAQ as evidence instead of sections.  FAQs are already
+        # high-level Q&A distillations — they give complete cross-document
+        # coverage for listing questions.  Sections are better for detail queries.
+        is_aggregate = "aggregate" in query_analysis.intents
         section_context_parts = []
-        seen_evidence: set[str] = set()
-        section_alias_counts: dict[str, int] = {}
-        for section, _ in prompt_sections:
-            doc_alias = doc_aliases.get(section.doc_id, "D?")
-            section_alias_counts[section.doc_id] = section_alias_counts.get(section.doc_id, 0) + 1
-            section_alias = f"S{section_alias_counts[section.doc_id]}"
-            evidence_tag = f"{doc_alias}:{section_alias}"
-            if minimal_context:
-                raw_evidence_blocks = self.corpus.extract_evidence_snippets(section, query_analysis, limit=1)
-            else:
-                raw_evidence_blocks = self.corpus.extract_answer_evidence_blocks(section, query_analysis)
 
-            # Fix #9: deduplicate evidence blocks across sections so the
-            # LLM doesn't see the same raw text twice (common when two
-            # sections from the same document are retrieved).
-            unique_blocks: list[str] = []
-            for block in raw_evidence_blocks:
-                block_key = re.sub(r"\s+", " ", block).strip().casefold()
-                if block_key not in seen_evidence:
-                    seen_evidence.add(block_key)
-                    unique_blocks.append(block)
+        if is_aggregate:
+            for document, _ in top_docs[: self._document_context_limit(query_analysis)]:
+                doc_alias = doc_aliases.get(document.doc_id, "D?")
+                faq_text = (document.faq or "").strip()
+                if not faq_text:
+                    # Fall back to document summary when no FAQ is available.
+                    faq_text = self._truncate_context_text(
+                        self.redactor.unmask_text(document.summary),
+                        self.config.answer_context_doc_summary_char_limit,
+                    )
+                else:
+                    faq_text = self.redactor.unmask_text(faq_text)
+                section_context_parts.append(f"[{doc_alias} FAQ]\n{faq_text}")
+        else:
+            prompt_sections = self._sections_for_answer_context(query_analysis, top_sections, top_docs)
+            seen_evidence: set[str] = set()
+            section_alias_counts: dict[str, int] = {}
+            for section, _ in prompt_sections:
+                doc_alias = doc_aliases.get(section.doc_id, "D?")
+                section_alias_counts[section.doc_id] = section_alias_counts.get(section.doc_id, 0) + 1
+                section_alias = f"S{section_alias_counts[section.doc_id]}"
+                evidence_tag = f"{doc_alias}:{section_alias}"
+                if minimal_context:
+                    raw_evidence_blocks = self.corpus.extract_evidence_snippets(section, query_analysis, limit=1)
+                else:
+                    raw_evidence_blocks = self.corpus.extract_answer_evidence_blocks(section, query_analysis)
 
-            raw_evidence_text = (
-                "\n\n".join(
-                    f"{evidence_tag}.E{index}\n{block}"
-                    for index, block in enumerate(unique_blocks, start=1)
+                # Deduplicate evidence blocks across sections so the LLM doesn't
+                # see the same raw text twice (common when two sections from the
+                # same document are retrieved).
+                unique_blocks: list[str] = []
+                for block in raw_evidence_blocks:
+                    block_key = re.sub(r"\s+", " ", block).strip().casefold()
+                    if block_key not in seen_evidence:
+                        seen_evidence.add(block_key)
+                        unique_blocks.append(block)
+
+                raw_evidence_text = (
+                    "\n\n".join(
+                        f"{evidence_tag}.E{index}\n{block}"
+                        for index, block in enumerate(unique_blocks, start=1)
+                    )
+                    or f"{evidence_tag}.E1\n(no focused raw evidence extracted)"
                 )
-                or f"{evidence_tag}.E1\n(no focused raw evidence extracted)"
-            )
-            section_orientation = self._truncate_context_text(
-                self.redactor.unmask_text(section.summary),
-                self.config.answer_context_doc_summary_char_limit,
-            )
-            section_context_lines = [
-                f"[{evidence_tag} {section.title}]",
-            ]
-            if not minimal_context and self.config.include_section_metadata_in_answers:
-                section_context_lines.append(
-                    f"Section type: {section.section_type or 'general'} | Tags: {', '.join(section.metadata_tags) or 'none'}"
+                section_orientation = self._truncate_context_text(
+                    self.redactor.unmask_text(section.summary),
+                    self.config.answer_context_doc_summary_char_limit,
                 )
-            if (
-                not minimal_context
-                and not query_analysis.exact_match_expected
-                and self.config.include_section_orientation_in_answers
-            ):
-                section_context_lines.append(f"Summary:\n{section_orientation or '(empty)'}")
-            section_context_lines.append(f"Evidence:\n{raw_evidence_text}")
-            section_context_parts.append("\n".join(section_context_lines))
+                section_context_lines = [
+                    f"[{evidence_tag} {section.title}]",
+                ]
+                if not minimal_context and self.config.include_section_metadata_in_answers:
+                    section_context_lines.append(
+                        f"Section type: {section.section_type or 'general'} | Tags: {', '.join(section.metadata_tags) or 'none'}"
+                    )
+                if (
+                    not minimal_context
+                    and not query_analysis.exact_match_expected
+                    and self.config.include_section_orientation_in_answers
+                ):
+                    section_context_lines.append(f"Summary:\n{section_orientation or '(empty)'}")
+                section_context_lines.append(f"Evidence:\n{raw_evidence_text}")
+                section_context_parts.append("\n".join(section_context_lines))
 
         prompt_parts: list[str] = []
         if thread.conversation_summary.strip():
@@ -933,6 +1397,11 @@ class PolicyGPTBot:
         prompt_parts.append(f"Evidence:\n{chr(10).join(section_context_parts)}")
         if doc_context_parts and ("document_lookup" in query_analysis.intents or self._uses_open_weight_prompt_profile()):
             prompt_parts.append(f"Doc notes:\n{chr(10).join(doc_context_parts)}")
+        if self._supplementary_facts:
+            prompt_parts.append(
+                f"Background facts (use to supplement retrieved evidence; do not cite as a source):\n"
+                f"{self._supplementary_facts}"
+            )
         prompt_parts.append("Answer only from the evidence. Prefer raw evidence over summaries. Never mention internal IDs.")
         return "\n\n".join(part for part in prompt_parts if part.strip())
 
@@ -1237,9 +1706,11 @@ class PolicyGPTBot:
         source_context = "\n".join(source_context_parts)
 
         system_prompt = (
+            f"Domain: {self.config.domain_context}\n"
             "Summarize this conversation for future retrieval and follow-up handling. "
-            "Capture the specific document names, section titles, current topic, "
-            "key answered points, and unresolved questions. "
+            "Capture: specific contest/document names, section titles, current topic, "
+            "roles and eligibility discussed, rewards or thresholds mentioned, "
+            "key answered points, and any unresolved questions. "
             "Be concise and factual."
         )
         user_prompt = f"{recent_chat}\n\n{source_context}" if source_context else recent_chat

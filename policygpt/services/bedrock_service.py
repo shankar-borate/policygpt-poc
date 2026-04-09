@@ -82,6 +82,7 @@ class BedrockService:
                 {"role": "user", "content": user_prompt},
             ],
             "max_completion_tokens": max_output_tokens,
+            "temperature": 0.2,
             "stream": False,
         }
         response = self._run_with_retries(

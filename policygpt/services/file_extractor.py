@@ -235,10 +235,35 @@ class FileExtractor:
     def _extract_html_semantic_units(self, soup: BeautifulSoup) -> list[tuple[str, str]]:
         units: list[tuple[str, str]] = []
         seen_texts: set[str] = set()
+        # Track table nodes we have already emitted so their child td/th/tr
+        # elements are not emitted again as separate units.
+        emitted_table_ids: set[int] = set()
 
         for node in (soup.body or soup).find_all(list(self.HTML_SEMANTIC_TAGS)):
             if self._is_html_noise_node(node) or self._has_html_noise_ancestor(node):
                 continue
+
+            node_name = node.name.lower()
+
+            # Emit <table> as a single atomic unit — keeps reward-slab tables
+            # intact instead of fragmenting them across multiple section chunks.
+            if node_name == "table":
+                table_text = self._table_to_plain_text(node)
+                if not table_text:
+                    continue
+                normalized = self._normalize_html_text(table_text)
+                if normalized not in seen_texts:
+                    seen_texts.add(normalized)
+                    emitted_table_ids.add(id(node))
+                    units.append(("table", table_text))
+                continue
+
+            # Skip cells/rows that belong to a table we already emitted.
+            if node_name in {"tr", "td", "th"}:
+                ancestor_table = node.find_parent("table")
+                if ancestor_table is not None and id(ancestor_table) in emitted_table_ids:
+                    continue
+
             text = self.clean_whitespace(node.get_text(" ", strip=True))
             if not text:
                 continue
@@ -246,9 +271,27 @@ class FileExtractor:
             if normalized in seen_texts:
                 continue
             seen_texts.add(normalized)
-            units.append((node.name.lower(), text))
+            units.append((node_name, text))
 
         return units
+
+    @staticmethod
+    def _table_to_plain_text(table_node) -> str:
+        """Convert an HTML table to a compact, readable plain-text representation.
+
+        Each row is rendered as a tab-separated line so the text stays coherent
+        for both embedding and BM25 without losing column relationships.
+        """
+        rows: list[str] = []
+        for tr in table_node.find_all("tr"):
+            cells = [
+                re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip()
+                for cell in tr.find_all(["th", "td"])
+            ]
+            row_text = " | ".join(c for c in cells if c)
+            if row_text:
+                rows.append(row_text)
+        return "\n".join(rows)
 
     def _extract_html_block_units(self, soup: BeautifulSoup) -> list[tuple[str, str]]:
         units: list[tuple[str, str]] = []
@@ -421,6 +464,11 @@ class FileExtractor:
             if tag.startswith("h"):
                 flush()
                 current_title = text[:200]
+            elif tag == "table":
+                # Emit accumulated prose first, then the table as its own
+                # atomic section so it is never split mid-row.
+                flush()
+                sections.append((current_title, self.clean_whitespace(text)))
             else:
                 current_parts.append(text)
 

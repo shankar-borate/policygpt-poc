@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from policygpt.models import DocumentRecord
 from policygpt.services.taxonomy import (
@@ -13,6 +16,137 @@ from policygpt.services.taxonomy import (
     tokenize_text,
     unique_preserving_order,
 )
+
+
+# ---------------------------------------------------------------------------
+# Conversational intent — messages that should never touch the RAG pipeline
+# ---------------------------------------------------------------------------
+
+_GREETINGS: frozenset[str] = frozenset({
+    "hi", "hello", "hey", "hiya", "howdy", "sup", "yo",
+    "good morning", "good afternoon", "good evening", "good night",
+    "gm", "gn", "morning", "afternoon", "evening",
+    "greetings", "namaste", "salut",
+})
+
+_FAREWELLS: frozenset[str] = frozenset({
+    "bye", "goodbye", "good bye", "see you", "see ya", "cya",
+    "later", "take care", "ttyl", "talk later", "catch you later",
+    "have a good day", "have a nice day", "have a great day",
+    "signing off", "log off", "done for today", "done for now",
+})
+
+_THANKS: frozenset[str] = frozenset({
+    "thanks", "thank you", "thank u", "thx", "ty", "cheers",
+    "appreciate it", "appreciated", "many thanks", "much appreciated",
+    "great", "perfect", "awesome", "excellent", "brilliant", "wonderful",
+    "that helps", "that helped", "got it", "understood", "noted",
+})
+
+_IDENTITY: frozenset[str] = frozenset({
+    "who are you", "what are you", "what can you do", "what do you do",
+    "how do you work", "how does this work", "help", "help me",
+    "what is this", "what is policygpt", "about you", "introduce yourself",
+})
+
+_CHITCHAT: frozenset[str] = frozenset({
+    "how are you", "how r u", "how are u", "how's it going",
+    "what's up", "whats up", "what's new", "hows it going",
+    "ok", "okay", "k", "cool", "nice", "alright", "sure",
+    "lol", "haha", "hehe",
+})
+
+
+def normalize_numeric_expressions(text: str) -> str:
+    """Normalise Indian-style numeric shorthand so BM25/embedding matches document figures.
+
+    Examples:
+      "3 lakh"  → "300000"
+      "₹3L"     → "300000"
+      "25 lac"  → "2500000"   (note: lac = lakh = 1e5)
+      "1 crore" → "10000000"
+      "3,49,000"→ "349000"   (Indian comma grouping → plain integer)
+      "₹3.5L"   → "350000"
+    """
+    # Strip currency symbols so patterns are simpler
+    t = re.sub(r"[₹$€£]", "", text)
+
+    # Indian comma grouping: 3,49,000 → 349000
+    def _remove_indian_commas(m: re.Match) -> str:
+        return m.group(0).replace(",", "")
+
+    t = re.sub(r"\b\d{1,2}(?:,\d{2})+(?:,\d{3})?\b", _remove_indian_commas, t)
+    t = re.sub(r"\b\d{1,3}(?:,\d{3})+\b", _remove_indian_commas, t)
+
+    # X crore → integer
+    def _crore(m: re.Match) -> str:
+        try:
+            return str(int(float(m.group(1)) * 10_000_000))
+        except ValueError:
+            return m.group(0)
+
+    t = re.sub(r"(\d+(?:\.\d+)?)\s*(?:cr(?:ore)?s?)\b", _crore, t, flags=re.IGNORECASE)
+
+    # X lakh / lac / L (capital) → integer
+    def _lakh(m: re.Match) -> str:
+        try:
+            return str(int(float(m.group(1)) * 100_000))
+        except ValueError:
+            return m.group(0)
+
+    t = re.sub(r"(\d+(?:\.\d+)?)\s*(?:lakh|lakhs|lac|lacs)\b", _lakh, t, flags=re.IGNORECASE)
+    t = re.sub(r"(\d+(?:\.\d+)?)L\b", _lakh, t)  # e.g. 3L, 3.5L (capital-L suffix only)
+
+    # X thousand → integer
+    def _thousand(m: re.Match) -> str:
+        try:
+            return str(int(float(m.group(1)) * 1_000))
+        except ValueError:
+            return m.group(0)
+
+    t = re.sub(r"(\d+(?:\.\d+)?)\s*(?:thousand|k)\b", _thousand, t, flags=re.IGNORECASE)
+
+    return t
+
+
+def detect_conversational_intent(text: str) -> str | None:
+    """Return the conversational intent type or None if it is a policy question.
+
+    Checks are ordered: exact full-message match first, then substring match
+    for longer phrased messages that still start with a greeting/farewell.
+    Returns one of: 'greeting' | 'farewell' | 'thanks' | 'identity' | 'chitchat'
+    """
+    normalized = normalize_text(text).strip()
+    if not normalized:
+        return "greeting"
+
+    # Exact match against known phrases
+    if normalized in _GREETINGS:
+        return "greeting"
+    if normalized in _FAREWELLS:
+        return "farewell"
+    if normalized in _THANKS:
+        return "thanks"
+    if normalized in _IDENTITY:
+        return "identity"
+    if normalized in _CHITCHAT:
+        return "chitchat"
+
+    # Prefix match — e.g. "good morning everyone", "thanks a lot", "hi there"
+    for phrase in _GREETINGS:
+        if normalized.startswith(phrase) and len(normalized) <= len(phrase) + 12:
+            return "greeting"
+    for phrase in _FAREWELLS:
+        if normalized.startswith(phrase) and len(normalized) <= len(phrase) + 12:
+            return "farewell"
+    for phrase in _THANKS:
+        if normalized.startswith(phrase) and len(normalized) <= len(phrase) + 12:
+            return "thanks"
+    for phrase in _IDENTITY:
+        if phrase in normalized:
+            return "identity"
+
+    return None
 
 
 DETAIL_PHRASES: tuple[str, ...] = (
@@ -158,16 +292,32 @@ class QueryAnalysis:
 
 
 class QueryAnalyzer:
+    def __init__(self) -> None:
+        # Cache keyed on (normalized question, sorted active doc titles) so
+        # repeated identical questions within a session skip re-analysis.
+        self._analysis_cache: dict[tuple[str, tuple[str, ...]], QueryAnalysis] = {}
+
     def analyze(
         self,
         user_question: str,
         active_document_titles: list[str] | None = None,
         candidate_documents: list[DocumentRecord] | None = None,
+        entity_lookup: dict | None = None,
     ) -> QueryAnalysis:
-        normalized_question = normalize_text(user_question)
-        focus_terms = self._select_focus_terms(user_question)
+        cache_key = (
+            user_question.strip().casefold(),
+            tuple(sorted(active_document_titles or [])),
+        )
+        if cache_key in self._analysis_cache:
+            return self._analysis_cache[cache_key]
+
+        # Normalise numeric shorthand (3L, ₹3 lakh, 3,49,000) before any
+        # tokenisation so BM25 / entity expansion match document figures.
+        numerically_normalized = normalize_numeric_expressions(user_question)
+        normalized_question = normalize_text(numerically_normalized)
+        focus_terms = self._select_focus_terms(numerically_normalized)
         corpus_topics, corpus_expanded_terms, supporting_titles = self._infer_corpus_topics(
-            user_question=user_question,
+            user_question=numerically_normalized,
             normalized_question=normalized_question,
             focus_terms=focus_terms,
             candidate_documents=candidate_documents or [],
@@ -216,6 +366,32 @@ class QueryAnalyzer:
             focus_terms=focus_terms,
             multi_doc_expected=multi_doc_expected,
         )
+        # Entity-based query expansion — match any user term against the corpus
+        # entity lookup and inject the entity's synonyms + context keywords.
+        entity_expansions: list[str] = []
+        if entity_lookup:
+            all_query_terms = unique_preserving_order(
+                tokenize_text(user_question) + focus_terms
+            )
+            matched_entity_names: set[str] = set()
+            for term in all_query_terms:
+                term_lower = term.lower().strip()
+                entity = entity_lookup.get(term_lower)
+                if entity is None:
+                    continue
+                entity_key = entity.name.lower()
+                if entity_key in matched_entity_names:
+                    continue
+                matched_entity_names.add(entity_key)
+                entity_expansions.extend(entity.synonyms)
+                # Inject context keywords (content words from the context sentence)
+                context_tokens = [
+                    t for t in tokenize_text(entity.context)
+                    if len(t) >= 4 and t not in STOPWORDS
+                ]
+                entity_expansions.extend(context_tokens[:6])
+            expanded_terms.extend(entity_expansions)
+
         canonical_lines = [f"User question: {user_question.strip()}"]
         if topic_hints:
             canonical_lines.append(f"Inferred policy topics: {', '.join(topic_hints)}")
@@ -229,10 +405,12 @@ class QueryAnalyzer:
             canonical_lines.append("Conversation context: active follow-up")
         if supporting_titles:
             canonical_lines.append(f"Likely matching documents: {', '.join(supporting_titles)}")
+        if entity_expansions:
+            canonical_lines.append(f"Matched entity context: {', '.join(unique_preserving_order(entity_expansions)[:16])}")
         if expanded_terms:
             canonical_lines.append(f"Expanded search terms: {', '.join(unique_preserving_order(expanded_terms)[:24])}")
 
-        return QueryAnalysis(
+        result = QueryAnalysis(
             original_question=user_question,
             normalized_question=normalized_question,
             canonical_question="\n".join(canonical_lines),
@@ -246,6 +424,8 @@ class QueryAnalyzer:
             expanded_terms=unique_preserving_order(expanded_terms),
             expected_section_types=unique_preserving_order(expected_section_types),
         )
+        self._analysis_cache[cache_key] = result
+        return result
 
     def _infer_corpus_topics(
         self,

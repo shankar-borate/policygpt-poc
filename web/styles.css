@@ -482,6 +482,35 @@ button {
     background: transparent;
 }
 
+.message-body table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 14px;
+    font-size: 0.93rem;
+}
+
+.message-body table th,
+.message-body table td {
+    padding: 8px 12px;
+    text-align: left;
+    border: 1px solid #e2e8f0;
+}
+
+.message-body table thead th {
+    background: #f8fafc;
+    font-weight: 600;
+    color: #374151;
+    border-bottom: 2px solid #d1d5db;
+}
+
+.message-body table tbody tr:nth-child(even) {
+    background: #fafafa;
+}
+
+.message-body table tbody tr:hover {
+    background: #f1f5f9;
+}
+
 .typing-indicator {
     display: inline-flex;
     align-items: center;

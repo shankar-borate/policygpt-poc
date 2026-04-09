@@ -69,38 +69,38 @@ ACCURACY_PROFILE_PRESETS: dict[str, dict[str, int]] = {
        "vhigh": {
         "top_docs": 3,
         "top_sections_per_doc": 5,
-        "max_sections_to_llm": 8,
-        "rerank_section_candidates": 12,
-        "exact_top_docs": 3,
-        "exact_top_sections_per_doc": 4,
-        "exact_max_sections_to_llm": 6,
-        "exact_rerank_section_candidates": 10,
+        "max_sections_to_llm": 15,
+        "rerank_section_candidates": 15,
+        "exact_top_docs": 6,
+        "exact_top_sections_per_doc": 5,
+        "exact_max_sections_to_llm": 15,
+        "exact_rerank_section_candidates": 15,
         "broad_top_docs": 6,
         "broad_top_sections_per_doc": 6,
         "broad_max_sections_to_llm": 8,
         "broad_rerank_section_candidates": 24,
-        "max_evidence_snippets_per_section": 3,
+        "max_evidence_snippets_per_section": 5,
         "evidence_snippet_char_limit": 320,
         "embedding_raw_excerpt_chars": 600,
-        "answer_context_doc_summary_char_limit": 260,
+        "answer_context_doc_summary_char_limit": 1000,
         "evidence_chunk_char_limit": 900,
-        "evidence_neighboring_units": 1,
-        "small_section_full_text_chars": 1500,
-        "exact_answer_evidence_char_limit": 1600,
-        "broad_answer_evidence_char_limit": 1200,
-        "answer_evidence_block_limit_exact": 2,
-        "answer_evidence_block_limit_broad": 2,
-        "max_recent_messages": 6,
-        "doc_summary_input_token_budget": 6000,
-        "doc_summary_combine_token_budget": 4500,
-        "section_summary_input_token_budget": 2500,
-        "min_recursive_summary_token_budget": 250,
-        "doc_summary_max_output_tokens": 400,
-        "doc_summary_max_output_tokens_cap": 800,
-        "doc_summary_chunk_max_output_tokens": 220,
-        "section_summary_max_output_tokens": 220,
-        "chat_max_output_tokens": 900,
-        "conversation_summary_max_output_tokens": 250,
+        "evidence_neighboring_units": 5,
+        "small_section_full_text_chars": 2500,
+        "exact_answer_evidence_char_limit": 2600,
+        "broad_answer_evidence_char_limit": 2200,
+        "answer_evidence_block_limit_exact": 5,
+        "answer_evidence_block_limit_broad": 5,
+        "max_recent_messages": 10,
+        "doc_summary_input_token_budget": 8000,
+        "doc_summary_combine_token_budget": 6500,
+        "section_summary_input_token_budget": 5500,
+        "min_recursive_summary_token_budget": 550,
+        "doc_summary_max_output_tokens": 2400,
+        "doc_summary_max_output_tokens_cap": 3600,
+        "doc_summary_chunk_max_output_tokens": 3660,
+        "section_summary_max_output_tokens": 6660,
+        "chat_max_output_tokens": 3600,
+        "conversation_summary_max_output_tokens": 3750,
     },
     "high": {
         "top_docs": 3,
@@ -131,12 +131,12 @@ ACCURACY_PROFILE_PRESETS: dict[str, dict[str, int]] = {
         "doc_summary_combine_token_budget": 4500,
         "section_summary_input_token_budget": 2500,
         "min_recursive_summary_token_budget": 250,
-        "doc_summary_max_output_tokens": 400,
-        "doc_summary_max_output_tokens_cap": 800,
-        "doc_summary_chunk_max_output_tokens": 220,
-        "section_summary_max_output_tokens": 220,
-        "chat_max_output_tokens": 900,
-        "conversation_summary_max_output_tokens": 250,
+        "doc_summary_max_output_tokens": 1200,
+        "doc_summary_max_output_tokens_cap": 2400,
+        "doc_summary_chunk_max_output_tokens": 660,
+        "section_summary_max_output_tokens": 660,
+        "chat_max_output_tokens": 2700,
+        "conversation_summary_max_output_tokens": 750,
     },
     "medium": {
         "top_docs": 2,
@@ -167,12 +167,12 @@ ACCURACY_PROFILE_PRESETS: dict[str, dict[str, int]] = {
         "doc_summary_combine_token_budget": 3000,
         "section_summary_input_token_budget": 1800,
         "min_recursive_summary_token_budget": 250,
-        "doc_summary_max_output_tokens": 280,
-        "doc_summary_max_output_tokens_cap": 500,
-        "doc_summary_chunk_max_output_tokens": 160,
-        "section_summary_max_output_tokens": 160,
-        "chat_max_output_tokens": 650,
-        "conversation_summary_max_output_tokens": 160,
+        "doc_summary_max_output_tokens": 840,
+        "doc_summary_max_output_tokens_cap": 1500,
+        "doc_summary_chunk_max_output_tokens": 480,
+        "section_summary_max_output_tokens": 480,
+        "chat_max_output_tokens": 1950,
+        "conversation_summary_max_output_tokens": 480,
     },
     "low": {
         "top_docs": 2,
@@ -203,12 +203,12 @@ ACCURACY_PROFILE_PRESETS: dict[str, dict[str, int]] = {
         "doc_summary_combine_token_budget": 1800,
         "section_summary_input_token_budget": 1200,
         "min_recursive_summary_token_budget": 250,
-        "doc_summary_max_output_tokens": 180,
-        "doc_summary_max_output_tokens_cap": 320,
-        "doc_summary_chunk_max_output_tokens": 120,
-        "section_summary_max_output_tokens": 120,
-        "chat_max_output_tokens": 400,
-        "conversation_summary_max_output_tokens": 100,
+        "doc_summary_max_output_tokens": 540,
+        "doc_summary_max_output_tokens_cap": 960,
+        "doc_summary_chunk_max_output_tokens": 360,
+        "section_summary_max_output_tokens": 360,
+        "chat_max_output_tokens": 1200,
+        "conversation_summary_max_output_tokens": 300,
     },
 }
 
@@ -235,8 +235,8 @@ RUNTIME_COST_PROFILE_PRESETS: dict[str, dict[str, int | bool]] = {
         "answer_evidence_block_limit_broad": 2,
         "max_recent_messages": 6,
         "summarize_after_turns": 8,
-        "chat_max_output_tokens": 900,
-        "conversation_summary_max_output_tokens": 250,
+        "chat_max_output_tokens": 2700,
+        "conversation_summary_max_output_tokens": 750,
         "include_document_metadata_in_answers": True,
         "include_section_metadata_in_answers": True,
         "include_document_orientation_in_answers": True,
@@ -264,8 +264,8 @@ RUNTIME_COST_PROFILE_PRESETS: dict[str, dict[str, int | bool]] = {
         "answer_evidence_block_limit_broad": 1,
         "max_recent_messages": 2,
         "summarize_after_turns": 12,
-        "chat_max_output_tokens": 220,
-        "conversation_summary_max_output_tokens": 80,
+        "chat_max_output_tokens": 660,
+        "conversation_summary_max_output_tokens": 240,
         "include_document_metadata_in_answers": False,
         "include_section_metadata_in_answers": False,
         "include_document_orientation_in_answers": False,
@@ -297,6 +297,42 @@ class Config:
     bedrock_gpt_model_size: str = ""
     usd_to_inr_exchange_rate: float = 93.0
     debug_log_dir: str = r"D:\policy-mgmt\data\durandhar_html\metadata"
+    # Path to a plain-text file containing supplementary facts (e.g. reward
+    # tables, business rules) that are not fully captured in indexed documents.
+    # Its content is injected into every LLM prompt as background context but
+    # is never surfaced to the user as a source or citation.
+    supplementary_facts_file: str = r"D:\policy-mgmt\data\durandhar_html\metadata\supplementary_facts.txt"
+
+    # Domain context — injected into every LLM system prompt so the model
+    # understands the business domain, document type, and target user role
+    # across ALL operations: summarisation, entity extraction, FAQ generation,
+    # query understanding, and answer generation.
+    domain_context: str = (
+        "Documents are reward-and-recognition contest policies for an insurance "
+        "company's agency sales channel. Users are sales agents (FCs, EIMs, ACHs, "
+        "and other channel roles) asking about contest eligibility, qualification "
+        "criteria, reward details, payout timelines, locations, role definitions, "
+        "product thresholds (FYFP, persistency, etc.), and contest rules."
+    )
+
+    # FAQ generation — generate Q&A pairs per document during ingestion so the
+    # document embedding captures natural-language questions users would ask,
+    # dramatically improving semantic retrieval accuracy.
+    generate_faq: bool = True
+    faq_max_questions: int = 30
+    faq_max_output_tokens: int = 2700
+
+    # Contextual entity extraction — extract all named entities (roles,
+    # locations, rewards, thresholds, abbreviations, etc.) with their meaning
+    # in context. Enriches embeddings and enables query-time entity expansion.
+    generate_entity_map: bool = True
+    entity_map_max_output_tokens: int = 3600
+
+    # FAQ fast-path: if the user question matches a stored FAQ question with
+    # cosine similarity ≥ this threshold, return the FAQ answer directly without
+    # running the full RAG pipeline.  Only active when generate_faq=True.
+    faq_fastpath_enabled: bool = True
+    faq_fastpath_min_score: float = 0.92
 
     top_docs: int = 3
     top_sections_per_doc: int = 3
@@ -335,7 +371,7 @@ class Config:
     doc_summary_combine_token_budget: int = 4500
     section_summary_input_token_budget: int = 2500
     min_recursive_summary_token_budget: int = 250
-    skip_section_summary: bool = True
+    skip_section_summary: bool = False
 
     redaction_rules: dict[str, str] = field(
         default_factory=lambda: {
@@ -345,12 +381,12 @@ class Config:
         }
     )
 
-    doc_summary_max_output_tokens: int = 400
-    doc_summary_max_output_tokens_cap: int = 800
-    doc_summary_chunk_max_output_tokens: int = 220
-    section_summary_max_output_tokens: int = 220
-    chat_max_output_tokens: int = 900
-    conversation_summary_max_output_tokens: int = 250
+    doc_summary_max_output_tokens: int = 1200
+    doc_summary_max_output_tokens_cap: int = 2400
+    doc_summary_chunk_max_output_tokens: int = 660
+    section_summary_max_output_tokens: int = 660
+    chat_max_output_tokens: int = 2700
+    conversation_summary_max_output_tokens: int = 750
     include_document_metadata_in_answers: bool | None = None
     include_section_metadata_in_answers: bool | None = None
     include_document_orientation_in_answers: bool | None = None
@@ -372,6 +408,12 @@ class Config:
     answerability_min_support_matches_multi_doc: int = 2
     answerability_min_exact_evidence_matches: int = 1
     exact_query_section_parent_weight_scale: float = 0.75
+
+    # Grounding guard: after the LLM produces an answer, a cheap second call
+    # checks whether every factual claim is supported by the evidence. If the
+    # check fails, the answer is flagged with a disclaimer.
+    grounding_guard_enabled: bool = True
+    grounding_guard_max_output_tokens: int = 20
 
     debug: bool = True
 
@@ -424,18 +466,37 @@ class Config:
                 current_value = getattr(self, field_name)
                 if field_name in explicit_runtime_bool_fields and current_value is None:
                     object.__setattr__(self, field_name, preset_value)
-            return
+        else:
+            for field_name, preset_value in runtime_cost_preset.items():
+                current_value = getattr(self, field_name)
+                if field_name in explicit_runtime_bool_fields:
+                    if current_value is None:
+                        object.__setattr__(self, field_name, preset_value)
+                    continue
 
-        for field_name, preset_value in runtime_cost_preset.items():
-            current_value = getattr(self, field_name)
-            if field_name in explicit_runtime_bool_fields:
-                if current_value is None:
+                baseline_value = accuracy_preset.get(field_name, standard_runtime_cost_preset[field_name])
+                if current_value == baseline_value:
                     object.__setattr__(self, field_name, preset_value)
-                continue
 
-            baseline_value = accuracy_preset.get(field_name, standard_runtime_cost_preset[field_name])
-            if current_value == baseline_value:
-                object.__setattr__(self, field_name, preset_value)
+        # Scale up token/context limits for the 120B model which has a much
+        # larger context window than smaller variants.  These are floor values;
+        # if a field was already tuned higher, leave it untouched.
+        if self.bedrock_gpt_model_size == "120b":
+            _120b_floors: dict[str, int] = {
+                "chat_max_output_tokens": 6000,
+                "exact_answer_evidence_char_limit": 3000,
+                "broad_answer_evidence_char_limit": 2500,
+                "evidence_chunk_char_limit": 2000,
+                "answer_evidence_block_limit_exact": 4,
+                "answer_evidence_block_limit_broad": 4,
+                "doc_summary_input_token_budget": 12000,
+                "doc_summary_combine_token_budget": 9000,
+                "answer_context_doc_summary_char_limit": 500,
+                "small_section_full_text_chars": 3000,
+            }
+            for field_name, floor_value in _120b_floors.items():
+                if getattr(self, field_name) < floor_value:
+                    object.__setattr__(self, field_name, floor_value)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -443,7 +504,8 @@ class Config:
         debug_log_dir_env = os.getenv("POLICY_GPT_DEBUG_LOG_DIR")
         debug_env = os.getenv("POLICY_GPT_DEBUG")
         return cls(
-            ai_profile=base_config.ai_profile,
+            ai_profile=os.getenv("POLICY_GPT_AI_PROFILE", base_config.ai_profile).strip()
+            or base_config.ai_profile,
             accuracy_profile=os.getenv("POLICY_GPT_ACCURACY_PROFILE", base_config.accuracy_profile).strip()
             or base_config.accuracy_profile,
             runtime_cost_profile=os.getenv("POLICY_GPT_RUNTIME_COST_PROFILE", base_config.runtime_cost_profile).strip()

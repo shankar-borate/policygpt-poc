@@ -1,3 +1,4 @@
+import json
 import re
 import traceback
 import uuid
@@ -12,6 +13,7 @@ from policygpt.config import Config
 from policygpt.models import DocumentRecord, SectionRecord, utc_now_iso
 from policygpt.services.base import AIRequestTooLargeError, AIService
 from policygpt.services.debug_logging import write_llm_debug_log_pair
+from policygpt.services.entity_extractor import DocumentEntityMap, EntityExtractor, ExtractedEntity
 from policygpt.services.file_extractor import FileExtractor
 from policygpt.services.metadata_extractor import MetadataExtractor
 from policygpt.services.query_analyzer import QueryAnalysis
@@ -46,6 +48,7 @@ class DocumentCorpus:
         self.ai = ai
         self.redactor = redactor
         self.metadata_extractor = MetadataExtractor()
+        self.entity_extractor = EntityExtractor(ai, domain_context=config.domain_context)
 
         self.documents: dict[str, DocumentRecord] = {}
         self.sections: dict[str, SectionRecord] = {}
@@ -58,6 +61,10 @@ class DocumentCorpus:
         self.avg_doc_token_length = 0.0
         self.avg_section_token_length = 0.0
         self._active_ingestion_run_id: str | None = None
+        # Flat lookup built from all document entity maps during rebuild_indexes.
+        # Maps lowercased entity name / synonym → ExtractedEntity.
+        # Used at query time to expand user terms with contextual meaning.
+        self.entity_lookup: dict[str, ExtractedEntity] = {}
 
     TOPIC_ALIGNMENT_IGNORED_TOKENS: set[str] = {
         "policy",
@@ -215,7 +222,53 @@ class DocumentCorpus:
             total_files=total_files,
             file_name=file_name,
         )
-        document_embedding = self._build_enriched_embedding(title, document_summary, full_text)
+
+        document_faq = ""
+        faq_qa_pairs: list[tuple[str, str]] = []
+        faq_q_embeddings: list[np.ndarray] = []
+        if self.config.generate_faq:
+            self._emit_progress(
+                progress_callback,
+                processed_files,
+                total_files,
+                f"{file_name} - generating FAQ",
+            )
+            document_faq = self._generate_document_faq(
+                masked_title=masked_title,
+                masked_text=masked_full_text,
+            )
+            if document_faq and self.config.faq_fastpath_enabled:
+                faq_qa_pairs = self._parse_faq_qa_pairs(document_faq)
+                if faq_qa_pairs:
+                    questions = [q for q, _ in faq_qa_pairs]
+                    try:
+                        raw_embeddings = self.ai.embed_texts(questions)
+                        faq_q_embeddings = [l2_normalize(e) for e in raw_embeddings]
+                    except Exception:
+                        faq_q_embeddings = []
+
+        document_entity_map = DocumentEntityMap()
+        if self.config.generate_entity_map:
+            self._emit_progress(
+                progress_callback,
+                processed_files,
+                total_files,
+                f"{file_name} - extracting entities",
+            )
+            document_entity_map = self.entity_extractor.extract(
+                title=masked_title,
+                masked_text=masked_full_text,
+                max_output_tokens=self.config.entity_map_max_output_tokens,
+                char_budget=max(4000, self.config.doc_summary_input_token_budget * 2),
+            )
+
+        document_embedding = self._build_enriched_embedding(
+            title,
+            document_summary,
+            full_text,
+            faq=document_faq,
+            entity_enrichment=document_entity_map.to_enrichment_text(),
+        )
 
         document_id = str(uuid.uuid4())
         document = DocumentRecord(
@@ -238,7 +291,15 @@ class DocumentCorpus:
             title_terms=document_metadata.title_terms,
             token_counts=document_metadata.token_counts,
             token_length=document_metadata.token_length,
+            faq=document_faq,
+            faq_qa_pairs=faq_qa_pairs,
+            faq_q_embeddings=faq_q_embeddings,
+            entity_map=document_entity_map,
         )
+        if document_faq:
+            self._write_faq_file(path, file_name, document_faq)
+        if document_entity_map.entities:
+            self._write_entity_file(path, file_name, document_entity_map)
 
         valid_sections = [(section_title, section_text) for section_title, section_text in sections if section_text.strip()]
         total_sections = len(valid_sections)
@@ -289,6 +350,13 @@ class DocumentCorpus:
                 )
                 continue
 
+            # Enrich section metadata tags with entity tags that are relevant
+            # to this specific section's text (global categories always included).
+            entity_tags = document_entity_map.tags_relevant_to(
+                section_title + " " + section_text
+            )
+            merged_tags = list(dict.fromkeys(section_metadata.tags + entity_tags))
+
             section_id = str(uuid.uuid4())
             section = SectionRecord(
                 section_id=section_id,
@@ -302,7 +370,7 @@ class DocumentCorpus:
                 order_index=index - 1,
                 normalized_title=section_metadata.normalized_title,
                 section_type=section_metadata.section_type,
-                metadata_tags=section_metadata.tags,
+                metadata_tags=merged_tags,
                 keywords=section_metadata.keywords,
                 title_terms=section_metadata.title_terms,
                 token_counts=section_metadata.token_counts,
@@ -313,6 +381,7 @@ class DocumentCorpus:
 
         self.documents[document_id] = document
         self._write_ingestion_log(document)
+        self._write_section_files(path, file_name, document.sections)
         self._emit_progress(
             progress_callback,
             processed_files,
@@ -325,6 +394,48 @@ class DocumentCorpus:
             print(f"  Title: {title}")
             print(f"  Sections: {len(document.sections)}")
         return ("ingested", f"ingested with {len(document.sections)} sections")
+
+    def _write_section_files(
+        self,
+        source_path: str,
+        file_name: str,
+        sections: list,
+    ) -> None:
+        """Write each section's raw text to its own file under metadata/sections/.
+
+        Files are named  <source_stem>_section1.txt, <source_stem>_section2.txt …
+        so they are easy to inspect alongside the source document.
+        """
+        debug_log_dir = (self.config.debug_log_dir or "").strip()
+        if not debug_log_dir:
+            return
+
+        sections_dir = Path(debug_log_dir) / "sections"
+        try:
+            sections_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+
+        stem = Path(file_name).stem
+        for index, section in enumerate(sections, start=1):
+            safe_stem = re.sub(r"[^\w\-]", "_", stem)
+            out_path = sections_dir / f"{safe_stem}_section{index}.txt"
+            lines: list[str] = [
+                f"Source: {source_path}",
+                f"Section {index}: {section.title}",
+                f"Type: {section.section_type or 'general'}",
+                f"Tags: {', '.join(section.metadata_tags) or 'none'}",
+                "",
+                "=== Raw Text ===",
+                section.raw_text.strip(),
+                "",
+                "=== Summary ===",
+                (self.redactor.unmask_text(section.summary) if section.summary else "(none)").strip(),
+            ]
+            try:
+                out_path.write_text("\n".join(lines), encoding="utf-8")
+            except OSError:
+                pass
 
     def rebuild_indexes(self) -> None:
         self.doc_ids = []
@@ -351,6 +462,14 @@ class DocumentCorpus:
 
         self.doc_embedding_matrix = np.vstack(doc_vectors) if doc_vectors else None
         self.section_embedding_matrix = np.vstack(section_vectors) if section_vectors else None
+
+        # Rebuild the flat entity lookup from all document entity maps.
+        self.entity_lookup = {}
+        for document in self.documents.values():
+            if document.entity_map and document.entity_map.entities:
+                for key, entity in document.entity_map.to_lookup().items():
+                    if key not in self.entity_lookup:
+                        self.entity_lookup[key] = entity
         self.avg_doc_token_length = float(sum(doc_token_lengths) / len(doc_token_lengths)) if doc_token_lengths else 0.0
         self.avg_section_token_length = (
             float(sum(section_token_lengths) / len(section_token_lengths))
@@ -821,7 +940,8 @@ class DocumentCorpus:
         query_analysis: QueryAnalysis,
         candidate_sections: list[tuple[SectionRecord, float]],
     ) -> list[tuple[SectionRecord, float]]:
-        reranked: list[tuple[SectionRecord, float]] = []
+        # Step 1: heuristic re-score (fast, zero cost)
+        heuristic: list[tuple[SectionRecord, float]] = []
         for section, base_score in candidate_sections:
             document = self.documents[section.doc_id]
             snippets = self.extract_evidence_snippets(section, query_analysis, limit=2)
@@ -844,7 +964,7 @@ class DocumentCorpus:
                 query_terms=query_analysis.focus_terms + query_analysis.topic_hints,
                 candidate_terms=section.title_terms + document.title_terms,
             )
-            reranked_score = (
+            h_score = (
                 (0.72 * base_score)
                 + (0.14 * snippet_overlap)
                 + (0.08 * section_type_boost)
@@ -853,8 +973,83 @@ class DocumentCorpus:
                 + (0.06 * focus_match_score)
                 + (0.08 * precise_match_score)
             )
-            reranked.append((section, reranked_score))
+            heuristic.append((section, h_score))
+
+        # Step 2: LLM relevance scoring — one call for all candidates
+        llm_scores = self._llm_rerank_sections(query_analysis, heuristic)
+
+        # Step 3: blend (70% heuristic, 30% LLM) so a bad LLM response cannot
+        # completely override strong heuristic signals.
+        reranked: list[tuple[SectionRecord, float]] = []
+        for section, h_score in heuristic:
+            llm_score = llm_scores.get(section.section_id, h_score)
+            blended = 0.70 * h_score + 0.30 * llm_score
+            reranked.append((section, blended))
         return reranked
+
+    # Maximum candidates to pass to LLM re-ranker in one call.
+    _LLM_RERANK_CANDIDATE_LIMIT: int = 12
+
+    def _llm_rerank_sections(
+        self,
+        query_analysis: QueryAnalysis,
+        heuristic_sections: list[tuple[SectionRecord, float]],
+    ) -> dict[str, float]:
+        """Score section relevance with one LLM call; return section_id → 0-1 score.
+
+        Falls back to an empty dict (caller uses heuristic score only) on any
+        error or if the feature is implicitly disabled (fewer than 2 candidates).
+        """
+        candidates = heuristic_sections[: self._LLM_RERANK_CANDIDATE_LIMIT]
+        if len(candidates) < 2:
+            return {}
+
+        # Build a compact snippet list numbered 1..N
+        items: list[str] = []
+        id_index: list[str] = []
+        for idx, (section, _) in enumerate(candidates, start=1):
+            excerpt = (section.raw_text or section.summary or "")[:400].strip()
+            doc_title = self.documents[section.doc_id].title if section.doc_id in self.documents else ""
+            items.append(
+                f"{idx}. [{doc_title}] {section.title}\n{excerpt}"
+            )
+            id_index.append(section.section_id)
+
+        system_prompt = (
+            f"Domain: {self.config.domain_context}\n"
+            "You are a relevance judge. For each numbered section excerpt below, "
+            "rate how relevant it is to answering the user's question. "
+            "Reply with ONLY a JSON object mapping the number (as a string) to a "
+            "relevance score between 0.0 (irrelevant) and 1.0 (highly relevant). "
+            'Example: {"1": 0.9, "2": 0.3, "3": 0.7}'
+        )
+        user_prompt = (
+            f"Question: {query_analysis.original_question}\n\n"
+            "Section excerpts:\n"
+            + "\n\n".join(items)
+        )
+        try:
+            raw = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=len(candidates) * 12 + 20,
+            )
+            # Extract JSON object from response
+            match = re.search(r"\{[^}]+\}", raw)
+            if not match:
+                return {}
+            scores_raw: dict = json.loads(match.group())
+            result: dict[str, float] = {}
+            for key, value in scores_raw.items():
+                try:
+                    idx = int(key) - 1
+                    if 0 <= idx < len(id_index):
+                        result[id_index[idx]] = max(0.0, min(1.0, float(value)))
+                except (ValueError, TypeError):
+                    continue
+            return result
+        except Exception:
+            return {}
 
     def _document_metadata_score(self, query_analysis: QueryAnalysis, document: DocumentRecord) -> float:
         score = 0.0
@@ -1124,9 +1319,11 @@ class DocumentCorpus:
 
     def _summarize_document_text(self, masked_title: str, masked_text: str, max_output_tokens: int | None = None) -> str:
         system_prompt = (
-            "You summarize enterprise documents for retrieval. "
+            f"Context: {self.config.domain_context}\n"
+            "You summarize documents from this domain for retrieval. "
             "Return a compact retrieval-oriented summary. "
-            "Focus on purpose, scope, major topics, rules/processes, exceptions, and key entities. "
+            "Focus on: purpose, scope, eligible roles, contest/reward structure, "
+            "key thresholds and amounts, timelines, locations, exceptions, and definitions. "
             "Do not add facts."
         )
         user_prompt = (
@@ -1194,10 +1391,11 @@ class DocumentCorpus:
         chunk_label: str,
     ) -> str:
         system_prompt = (
-            "You summarize one chunk of a longer enterprise document for retrieval. "
+            f"Context: {self.config.domain_context}\n"
+            "You summarize one chunk of a longer document from this domain for retrieval. "
             "Use only the provided chunk. "
-            "Capture the chunk's main topics, rules, process steps, eligibility, approvals, exceptions, "
-            "thresholds, dates, and named entities when present. "
+            "Capture: contest/reward names, eligible roles, qualification thresholds, "
+            "FYFP amounts, reward values, locations, timelines, exceptions, and definitions. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1215,9 +1413,11 @@ class DocumentCorpus:
 
     def _combine_document_summaries(self, masked_title: str, summary_batch: str) -> str:
         system_prompt = (
-            "You are combining multiple partial summaries of the same enterprise document for retrieval. "
-            "Merge overlap, preserve concrete policy details, and keep the result compact. "
-            "Retain the important rules, approvals, thresholds, dates, exceptions, and actors when present. "
+            f"Context: {self.config.domain_context}\n"
+            "You are combining partial summaries of the same document from this domain for retrieval. "
+            "Merge overlap, preserve concrete details, and keep the result compact. "
+            "Retain: contest names, eligible roles, reward amounts, locations, thresholds, "
+            "timelines, exceptions, and key definitions. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1234,9 +1434,11 @@ class DocumentCorpus:
 
     def _finalize_document_summary(self, masked_title: str, summary_input: str) -> str:
         system_prompt = (
-            "You summarize enterprise documents for retrieval. "
+            f"Context: {self.config.domain_context}\n"
+            "You summarize documents from this domain for retrieval. "
             "Return a compact retrieval-oriented summary. "
-            "Focus on purpose, scope, major topics, rules/processes, exceptions, and key entities. "
+            "Focus on: eligible roles, contest/reward structure, thresholds, "
+            "locations, timelines, exceptions, and definitions. "
             "Do not add facts."
         )
         user_prompt = (
@@ -1307,9 +1509,11 @@ class DocumentCorpus:
 
     def _summarize_section_text(self, doc_title: str, section_title: str, section_text: str) -> str:
         system_prompt = (
-            "You summarize a section for retrieval. "
-            "Return a concise summary that helps answer questions later. "
-            "Capture the key topic, rules, eligibility, process, exceptions, or details present. "
+            f"Context: {self.config.domain_context}\n"
+            "You summarize a section from a document in this domain for retrieval. "
+            "Return a concise summary that helps a sales agent find answers later. "
+            "Capture: eligible roles, qualification thresholds, reward details, "
+            "locations, timelines, exceptions, definitions, and any rules specific to this section. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1327,9 +1531,11 @@ class DocumentCorpus:
 
     def _combine_section_summaries(self, doc_title: str, section_title: str, summary_batch: str) -> str:
         system_prompt = (
-            "You are combining multiple partial summaries of the same document section for retrieval. "
-            "Merge overlap, keep policy details precise, and preserve approvals, eligibility, process steps, "
-            "exceptions, thresholds, and dates when present. "
+            f"Context: {self.config.domain_context}\n"
+            "You are combining partial summaries of the same section from a document in this domain. "
+            "Merge overlap, keep details precise, and preserve: "
+            "eligible roles, reward amounts, qualification thresholds, locations, "
+            "timelines, exceptions, and definitions. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1347,9 +1553,11 @@ class DocumentCorpus:
 
     def _finalize_section_summary(self, doc_title: str, section_title: str, summary_input: str) -> str:
         system_prompt = (
-            "You summarize a section for retrieval. "
-            "Return a concise summary that helps answer questions later. "
-            "Capture the key topic, rules, eligibility, process, exceptions, or details present. "
+            f"Context: {self.config.domain_context}\n"
+            "You summarize a section from a document in this domain for retrieval. "
+            "Return a concise summary that helps a sales agent find answers later. "
+            "Capture: eligible roles, qualification thresholds, reward details, "
+            "locations, timelines, exceptions, definitions, and any rules specific to this section. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1371,13 +1579,188 @@ class DocumentCorpus:
     def embed_text(self, text: str) -> np.ndarray:
         return self._embed_one(text)
 
-    def _build_enriched_embedding(self, title: str, summary: str, raw_text: str) -> np.ndarray:
-        """Embed title + unmasked summary + raw text excerpt so the vector
-        captures original terminology users will search with, instead of
-        redacted placeholders or LLM-rephrased terms."""
+    @staticmethod
+    def _parse_faq_qa_pairs(faq_text: str) -> list[tuple[str, str]]:
+        """Parse Q/A pairs from FAQ text generated by _generate_document_faq.
+
+        Expected format (one pair per two lines):
+            Q: <question>
+            A: <answer>
+        Returns a list of (question, answer) tuples.
+        """
+        pairs: list[tuple[str, str]] = []
+        lines = [line.strip() for line in faq_text.splitlines() if line.strip()]
+        i = 0
+        while i < len(lines):
+            if lines[i].startswith("Q:"):
+                q = lines[i][2:].strip()
+                a = ""
+                if i + 1 < len(lines) and lines[i + 1].startswith("A:"):
+                    a = lines[i + 1][2:].strip()
+                    i += 2
+                else:
+                    i += 1
+                if q and a:
+                    pairs.append((q, a))
+            else:
+                i += 1
+        return pairs
+
+    def faq_fastpath_lookup(
+        self,
+        query_vec: np.ndarray,
+        min_score: float = 0.92,
+    ) -> str | None:
+        """Return a FAQ answer if the query vector closely matches a stored FAQ question.
+
+        Checks all documents' FAQ question embeddings and returns the answer for
+        the best match above *min_score*.  Returns None when no match is found or
+        when the fast-path is disabled.
+        """
+        if not self.config.faq_fastpath_enabled:
+            return None
+        best_score = min_score
+        best_answer: str | None = None
+        for document in self.documents.values():
+            if not document.faq_q_embeddings or not document.faq_qa_pairs:
+                continue
+            matrix = np.vstack(document.faq_q_embeddings)
+            scores = cosine_similarity(query_vec, matrix)
+            top_idx = int(np.argmax(scores))
+            top_score = float(scores[top_idx])
+            if top_score >= best_score:
+                best_score = top_score
+                _, answer = document.faq_qa_pairs[top_idx]
+                best_answer = self.redactor.unmask_text(answer)
+        return best_answer
+
+    def _generate_document_faq(self, masked_title: str, masked_text: str) -> str:
+        """Generate Q&A pairs that users would naturally ask about this document.
+
+        The FAQ text is embedded alongside the document summary so the document
+        vector sits close to real user queries in embedding space, improving
+        semantic retrieval significantly compared to embedding raw policy prose.
+        """
+        n = max(1, self.config.faq_max_questions)
+        # Feed as much document text as fits within half the doc-summary budget
+        # so we don't crowd out other ingestion calls.
+        char_budget = max(1200, self.config.doc_summary_input_token_budget * 2)
+        text_excerpt = masked_text[:char_budget].strip()
+
+        system_prompt = (
+            f"Context: {self.config.domain_context}\n"
+            "You are a document analyst. Your task is to generate the most useful FAQ "
+            "for a chatbot that answers questions from users in this domain about this document."
+        )
+        user_prompt = (
+            f"Document: {masked_title}\n\n"
+            f"{text_excerpt}\n\n"
+            f"Generate up to {n} question-and-answer pairs that a user in this domain would realistically ask.\n"
+            "Only include questions that are clearly and directly answerable from the document above — "
+            "do not pad with vague or repetitive questions just to reach the limit.\n"
+            "Cover where present: eligibility criteria, reward amounts, key thresholds, timelines, locations, "
+            "exceptions, role definitions, qualification rules, and contest structure.\n"
+            "Use natural conversational English for questions (the way someone would type in a chat).\n"
+            "Keep answers concise (1–3 sentences) and grounded strictly in the document above.\n"
+            "Format each pair exactly as:\n"
+            "Q: <question>\n"
+            "A: <answer>\n\n"
+            "Output only the Q&A pairs — no intro, no numbering, no commentary."
+        )
+        try:
+            return self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=self.config.faq_max_output_tokens,
+            ).strip()
+        except Exception as exc:
+            if self.config.debug:
+                print(f"  FAQ generation failed: {type(exc).__name__}: {exc}")
+            return ""
+
+    def _write_entity_file(
+        self, source_path: str, file_name: str, entity_map: DocumentEntityMap
+    ) -> None:
+        """Write extracted entities to metadata/entities/<stem>_entities.txt."""
+        debug_log_dir = (self.config.debug_log_dir or "").strip()
+        if not debug_log_dir or not entity_map.entities:
+            return
+        entities_dir = Path(debug_log_dir) / "entities"
+        try:
+            entities_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        stem = re.sub(r"[^\w\-]", "_", Path(file_name).stem)
+        out_path = entities_dir / f"{stem}_entities.txt"
+
+        by_category: dict[str, list[ExtractedEntity]] = {}
+        for entity in entity_map.entities:
+            by_category.setdefault(entity.category, []).append(entity)
+
+        lines = [f"Source: {source_path}", ""]
+        for category, items in sorted(by_category.items()):
+            lines.append(f"=== {category.replace('_', ' ').title()} ===")
+            for e in items:
+                lines.append(f"  {e.name}")
+                lines.append(f"    Context : {e.context}")
+                if e.synonyms:
+                    lines.append(f"    Synonyms: {', '.join(e.synonyms)}")
+            lines.append("")
+
+        try:
+            out_path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _write_faq_file(self, source_path: str, file_name: str, faq_text: str) -> None:
+        """Write the generated FAQ to metadata/faq/<stem>_faq.txt for inspection."""
+        debug_log_dir = (self.config.debug_log_dir or "").strip()
+        if not debug_log_dir or not faq_text:
+            return
+        faq_dir = Path(debug_log_dir) / "faq"
+        try:
+            faq_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        stem = re.sub(r"[^\w\-]", "_", Path(file_name).stem)
+        out_path = faq_dir / f"{stem}_faq.txt"
+        lines = [
+            f"Source: {source_path}",
+            "",
+            faq_text,
+        ]
+        try:
+            out_path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _build_enriched_embedding(
+        self,
+        title: str,
+        summary: str,
+        raw_text: str,
+        faq: str = "",
+        entity_enrichment: str = "",
+    ) -> np.ndarray:
+        """Embed title + summary + entity enrichment + FAQ + raw text excerpt.
+
+        Layer order (most to least semantically dense):
+        1. Title — high signal, always short
+        2. Summary — structured overview
+        3. Entity enrichment — "Role: FC (Financial Consultant; also: agent)"
+           closes the gap between policy jargon and natural-language queries
+        4. FAQ — natural-language Q&A pairs the user would actually type
+        5. Raw text excerpt — preserves verbatim terminology for lexical overlap
+        """
         unmasked_summary = self.redactor.unmask_text(summary)
         raw_excerpt = raw_text[:self.config.embedding_raw_excerpt_chars].strip() if raw_text else ""
-        combined = f"{title}\n{unmasked_summary}\n{raw_excerpt}".strip()
+        parts = [title, unmasked_summary]
+        if entity_enrichment:
+            parts.append(entity_enrichment)
+        if faq:
+            parts.append(faq)
+        parts.append(raw_excerpt)
+        combined = "\n".join(p for p in parts if p).strip()
         return self._embed_one(combined)
 
     def _build_fallback_section_summary(self, section_title: str, section_text: str) -> str:
