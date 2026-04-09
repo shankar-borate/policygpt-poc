@@ -1,6 +1,7 @@
 import re
 import traceback
 import uuid
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -200,6 +201,7 @@ class PolicyGPTBot:
                         query_analysis=query_analysis,
                         top_docs=top_docs,
                         top_sections=top_sections,
+                        query_vec=query_vec,
                     )
                     masked_answer = self._llm_text_with_debug_log(
                         purpose="chat_answer",
@@ -1267,6 +1269,7 @@ class PolicyGPTBot:
         query_analysis: QueryAnalysis,
         top_docs,
         top_sections,
+        query_vec: np.ndarray | None = None,
     ) -> str:
         minimal_context = self._use_minimal_answer_context(query_analysis)
         doc_aliases = self._build_document_aliases(top_docs, top_sections)
@@ -1320,18 +1323,33 @@ class PolicyGPTBot:
         section_context_parts = []
 
         if is_aggregate:
-            for document, _ in top_docs[: self._document_context_limit(query_analysis)]:
-                doc_alias = doc_aliases.get(document.doc_id, "D?")
-                faq_text = (document.faq or "").strip()
-                if not faq_text:
-                    # Fall back to document summary when no FAQ is available.
-                    faq_text = self._truncate_context_text(
-                        self.redactor.unmask_text(document.summary),
-                        self.config.answer_context_doc_summary_char_limit,
-                    )
-                else:
-                    faq_text = self.redactor.unmask_text(faq_text)
-                section_context_parts.append(f"[{doc_alias} FAQ]\n{faq_text}")
+            # Search FAQ questions across ALL documents independently of which
+            # docs were retrieved — this gives cross-corpus coverage without
+            # being limited by doc-level retrieval scoring.
+            faq_hits = self.corpus.search_faq_questions(
+                query_vec=query_vec if query_vec is not None else self._embed_one(query_analysis.original_question),
+                top_k=self.config.aggregate_faq_top_k,
+            )
+            if faq_hits:
+                # Group Q&A pairs by document title for a clean prompt layout.
+                by_doc: dict[str, list[tuple[str, str]]] = defaultdict(list)
+                for _, q, a, doc_title in faq_hits:
+                    by_doc[doc_title].append((q, a))
+                for doc_title, pairs in by_doc.items():
+                    qa_lines = "\n".join(f"Q: {q}\nA: {a}" for q, a in pairs)
+                    section_context_parts.append(f"[{doc_title}]\n{qa_lines}")
+            else:
+                # Fallback: no FAQ embeddings available — use full FAQ text or summary
+                for document, _ in top_docs:
+                    faq_text = (document.faq or "").strip()
+                    if not faq_text:
+                        faq_text = self._truncate_context_text(
+                            self.redactor.unmask_text(document.summary),
+                            self.config.answer_context_doc_summary_char_limit,
+                        )
+                    else:
+                        faq_text = self.redactor.unmask_text(faq_text)
+                    section_context_parts.append(f"[{document.title} FAQ]\n{faq_text}")
         else:
             prompt_sections = self._sections_for_answer_context(query_analysis, top_sections, top_docs)
             seen_evidence: set[str] = set()

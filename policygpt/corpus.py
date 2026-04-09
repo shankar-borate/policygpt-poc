@@ -1634,6 +1634,33 @@ class DocumentCorpus:
                 best_answer = self.redactor.unmask_text(answer)
         return best_answer
 
+    def search_faq_questions(
+        self,
+        query_vec: np.ndarray,
+        top_k: int = 30,
+    ) -> list[tuple[float, str, str, str]]:
+        """Search FAQ questions across ALL documents and return top-k matches.
+
+        Returns list of (score, question, answer, doc_title) sorted by score
+        descending. Unlike faq_fastpath_lookup this returns many results and
+        is used to build aggregate query evidence.
+        """
+        all_hits: list[tuple[float, str, str, str]] = []
+        for document in self.documents.values():
+            if not document.faq_q_embeddings or not document.faq_qa_pairs:
+                continue
+            matrix = np.vstack(document.faq_q_embeddings)
+            scores = cosine_similarity(query_vec, matrix)
+            doc_title = document.title
+            for idx, score in enumerate(scores):
+                if idx >= len(document.faq_qa_pairs):
+                    continue
+                q, a = document.faq_qa_pairs[idx]
+                all_hits.append((float(score), q, self.redactor.unmask_text(a), doc_title))
+
+        all_hits.sort(key=lambda x: x[0], reverse=True)
+        return all_hits[:top_k]
+
     def _generate_document_faq(self, masked_title: str, masked_text: str) -> str:
         """Generate Q&A pairs that users would naturally ask about this document.
 

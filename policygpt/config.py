@@ -333,6 +333,8 @@ class Config:
     # running the full RAG pipeline.  Only active when generate_faq=True.
     faq_fastpath_enabled: bool = True
     faq_fastpath_min_score: float = 0.92
+    # Number of FAQ Q&A pairs to pass as context for aggregate queries.
+    aggregate_faq_top_k: int = 30
 
     top_docs: int = 3
     top_sections_per_doc: int = 3
