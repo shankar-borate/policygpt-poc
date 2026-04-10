@@ -362,7 +362,7 @@ class PolicyGPTBot:
         gets a response.
         """
         system_prompt = (
-            "You are a warm, friendly policy assistant for an insurance company's agency sales team. "
+            f"You are a warm, friendly policy assistant for {self.config.domain_profile.persona_description}. "
             "The user has sent you a social or conversational message — not a policy question. "
             "Respond naturally and briefly (1-2 sentences max) as a helpful colleague would. "
             "Be warm, human, and in context with what the user said. "
@@ -384,13 +384,10 @@ class PolicyGPTBot:
 
         # Canned fallback in case the LLM call fails
         _fallback: dict[str, str] = {
-            "greeting": "Hello! Ready to help with any contest or policy questions.",
+            "greeting": self.config.domain_profile.greeting_reply,
             "farewell": "Goodbye! Come back anytime.",
             "thanks": "You're welcome!",
-            "identity": (
-                "I'm a policy assistant for the agency sales team — ask me about contests, "
-                "rewards, eligibility, thresholds, timelines, and more."
-            ),
+            "identity": self.config.domain_profile.identity_reply,
         }
         return _fallback.get(intent, "Happy to help — just ask!")
 
@@ -404,10 +401,9 @@ class PolicyGPTBot:
         suppressed by a classification error.
         """
         system_prompt = (
-            "You are an intent classifier for a policy Q&A assistant used by insurance sales agents. "
+            f"You are an intent classifier for a policy Q&A assistant used by {self.config.domain_profile.intent_user_description}. "
             "Classify the user message into exactly one of these categories:\n"
-            "  policy    — a genuine question about contest rules, rewards, eligibility, "
-            "thresholds, timelines, locations, roles, or any other policy topic\n"
+            f"  policy    — a genuine question about {self.config.domain_profile.intent_policy_description}\n"
             "  greeting  — hello, hi, good morning, good evening, etc.\n"
             "  farewell  — bye, goodbye, see you, take care, etc.\n"
             "  thanks    — thank you, thanks, great, nice, looks good, cheers, etc.\n"
@@ -677,7 +673,7 @@ class PolicyGPTBot:
             return (
                 f"Domain: {domain}\n"
                 "You are a conversational assistant helping users in this domain "
-                "find answers from their contest policy documents.\n"
+                f"find answers from their {self.config.domain_profile.doc_type_label}.\n"
                 "Rules:\n"
                 "1. Answer only from the provided document evidence.\n"
                 "2. If the answer is not clearly present, say that it is not clearly stated in the provided documents.\n"
@@ -797,9 +793,7 @@ class PolicyGPTBot:
             return (
                 "Start with the direct answer, then list each relevant item in short bullets. "
                 "For every bullet, use 'Name - short description' and keep the description to one concise phrase based on the evidence. "
-                "Prefer standalone contest names from document titles or sections that explicitly name the contest. "
-                "Do not treat comparison-only mentions, incomplete-sentence mentions, or verification notes as main contest items. "
-                "Do not output bare names without context."
+                + self.config.domain_profile.aggregate_response_hint
                 + detail_suffix
             )
         if query_analysis.multi_doc_expected:
@@ -1171,8 +1165,7 @@ class PolicyGPTBot:
             "Do this only when the evidence clearly states the dates — do not infer dates."
         )
 
-    @staticmethod
-    def _aggregate_section_signal(section) -> int:
+    def _aggregate_section_signal(self, section) -> int:
         text = " ".join(
             part for part in (
                 section.title or "",
@@ -1182,18 +1175,7 @@ class PolicyGPTBot:
             if part
         ).casefold()
 
-        positive_markers = (
-            "contest name",
-            "name and purpose",
-            "contest identity",
-            "contest overview",
-            "contest structure",
-            "structure summary",
-            "contest is named",
-            "contest is titled",
-            "the contest is named",
-            "the contest is titled",
-        )
+        positive_markers = self.config.domain_profile.aggregate_positive_markers
         negative_markers = (
             "incomplete sentence",
             "requiring verification",

@@ -48,7 +48,7 @@ class DocumentCorpus:
         self.ai = ai
         self.redactor = redactor
         self.metadata_extractor = MetadataExtractor()
-        self.entity_extractor = EntityExtractor(ai, domain_context=config.domain_context)
+        self.entity_extractor = EntityExtractor(ai, domain_profile=config.domain_profile)
 
         self.documents: dict[str, DocumentRecord] = {}
         self.sections: dict[str, SectionRecord] = {}
@@ -357,7 +357,8 @@ class DocumentCorpus:
             # Enrich section metadata tags with entity tags that are relevant
             # to this specific section's text (global categories always included).
             entity_tags = document_entity_map.tags_relevant_to(
-                section_title + " " + section_text
+                section_title + " " + section_text,
+                self.config.domain_profile.entity_global_categories,
             )
             merged_tags = list(dict.fromkeys(section_metadata.tags + entity_tags))
 
@@ -1328,12 +1329,12 @@ class DocumentCorpus:
             return reduced_summary_input
 
     def _summarize_document_text(self, masked_title: str, masked_text: str, max_output_tokens: int | None = None) -> str:
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You summarize documents from this domain for retrieval. "
             "Return a compact retrieval-oriented summary. "
-            "Focus on: purpose, scope, eligible roles, contest/reward structure, "
-            "key thresholds and amounts, timelines, locations, exceptions, and definitions. "
+            f"Focus on: {dp.doc_summary_focus}. "
             "Do not add facts."
         )
         user_prompt = (
@@ -1400,12 +1401,12 @@ class DocumentCorpus:
         chunk_text: str,
         chunk_label: str,
     ) -> str:
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You summarize one chunk of a longer document from this domain for retrieval. "
             "Use only the provided chunk. "
-            "Capture: contest/reward names, eligible roles, qualification thresholds, "
-            "FYFP amounts, reward values, locations, timelines, exceptions, and definitions. "
+            f"Capture: {dp.chunk_summary_capture}. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1422,12 +1423,12 @@ class DocumentCorpus:
         )
 
     def _combine_document_summaries(self, masked_title: str, summary_batch: str) -> str:
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You are combining partial summaries of the same document from this domain for retrieval. "
             "Merge overlap, preserve concrete details, and keep the result compact. "
-            "Retain: contest names, eligible roles, reward amounts, locations, thresholds, "
-            "timelines, exceptions, and key definitions. "
+            f"Retain: {dp.combine_summary_retain}. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1443,12 +1444,12 @@ class DocumentCorpus:
         )
 
     def _finalize_document_summary(self, masked_title: str, summary_input: str) -> str:
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You summarize documents from this domain for retrieval. "
             "Return a compact retrieval-oriented summary. "
-            "Focus on: eligible roles, contest/reward structure, thresholds, "
-            "locations, timelines, exceptions, and definitions. "
+            f"Focus on: {dp.finalize_summary_focus}. "
             "Do not add facts."
         )
         user_prompt = (
@@ -1527,13 +1528,12 @@ class DocumentCorpus:
             "data exactly as they appear — so a user querying those values can find this section."
             if is_table_section else ""
         )
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You summarize a section from a document in this domain for retrieval. "
-            "Return a concise summary that helps a sales agent find answers later. "
-            "Capture: eligible roles, qualification thresholds with EXACT amounts, reward details "
-            "with EXACT values, locations, timelines with EXACT dates or periods, exceptions, "
-            "definitions, and rules specific to this section. "
+            f"Return a concise summary that helps a {dp.user_label} find answers later. "
+            f"Capture: {dp.section_summary_capture}. "
             "Always state specific numbers, percentages, and currency amounts verbatim — "
             "do not round or paraphrase them."
             + table_note
@@ -1553,12 +1553,12 @@ class DocumentCorpus:
         )
 
     def _combine_section_summaries(self, doc_title: str, section_title: str, summary_batch: str) -> str:
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You are combining partial summaries of the same section from a document in this domain. "
             "Merge overlap, keep details precise, and preserve: "
-            "eligible roles, reward amounts, qualification thresholds, locations, "
-            "timelines, exceptions, and definitions. "
+            f"{dp.section_combine_preserve}. "
             "Do not invent facts."
         )
         user_prompt = (
@@ -1575,13 +1575,12 @@ class DocumentCorpus:
         )
 
     def _finalize_section_summary(self, doc_title: str, section_title: str, summary_input: str) -> str:
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You summarize a section from a document in this domain for retrieval. "
-            "Return a concise summary that helps a sales agent find answers later. "
-            "Capture: eligible roles, qualification thresholds with EXACT amounts, reward details "
-            "with EXACT values, locations, timelines with EXACT dates or periods, exceptions, "
-            "definitions, and rules specific to this section. "
+            f"Return a concise summary that helps a {dp.user_label} find answers later. "
+            f"Capture: {dp.section_summary_capture}. "
             "Always state specific numbers, percentages, and currency amounts verbatim. "
             "Do not invent facts."
         )
@@ -1699,8 +1698,9 @@ class DocumentCorpus:
         char_budget = max(1200, self.config.doc_summary_input_token_budget * 2)
         text_excerpt = masked_text[:char_budget].strip()
 
+        dp = self.config.domain_profile
         system_prompt = (
-            f"Context: {self.config.domain_context}\n"
+            f"Context: {dp.domain_context}\n"
             "You are a document analyst. Your task is to generate the most useful FAQ "
             "for a chatbot that answers questions from users in this domain about this document."
         )
@@ -1710,8 +1710,7 @@ class DocumentCorpus:
             f"Generate up to {n} question-and-answer pairs that a user in this domain would realistically ask.\n"
             "Only include questions that are clearly and directly answerable from the document above — "
             "do not pad with vague or repetitive questions just to reach the limit.\n"
-            "Cover where present: eligibility criteria, reward amounts, key thresholds, timelines, locations, "
-            "exceptions, role definitions, qualification rules, and contest structure.\n"
+            f"Cover where present: {dp.faq_cover}.\n"
             "Use natural conversational English for questions (the way someone would type in a chat).\n"
             "Answer quality rules:\n"
             "- Always include specific numbers, amounts, percentages, and dates verbatim — never paraphrase them.\n"

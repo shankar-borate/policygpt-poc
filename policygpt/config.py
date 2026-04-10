@@ -276,7 +276,7 @@ RUNTIME_COST_PROFILE_PRESETS: dict[str, dict[str, int | bool]] = {
 
 @dataclass(frozen=True)
 class Config:
-    document_folder: str = r"D:\policy-mgmt\data\durandhar_html"
+    document_folder: str = r"D:\policy-mgmt\data\vcx_policies"
     supported_file_patterns: tuple[str, ...] = ("*.html", "*.htm", "*.txt", "*.pdf")
     excluded_file_name_parts: tuple[str, ...] = ("_summary",)
 
@@ -296,24 +296,27 @@ class Config:
     bedrock_region: str = "ap-south-1"
     bedrock_gpt_model_size: str = ""
     usd_to_inr_exchange_rate: float = 93.0
-    debug_log_dir: str = r"D:\policy-mgmt\data\durandhar_html\metadata"
+    debug_log_dir: str = r"D:\policy-mgmt\data\vcx_policies\metadata"
     # Path to a plain-text file containing supplementary facts (e.g. reward
     # tables, business rules) that are not fully captured in indexed documents.
     # Its content is injected into every LLM prompt as background context but
     # is never surfaced to the user as a source or citation.
-    supplementary_facts_file: str = r"D:\policy-mgmt\data\durandhar_html\metadata\supplementary_facts.txt"
+    supplementary_facts_file: str = r"D:\policy-mgmt\data\vcx_policies\metadata\supplementary_facts.txt"
 
-    # Domain context — injected into every LLM system prompt so the model
-    # understands the business domain, document type, and target user role
-    # across ALL operations: summarisation, entity extraction, FAQ generation,
-    # query understanding, and answer generation.
-    domain_context: str = (
-        "Documents are reward-and-recognition contest policies for an insurance "
-        "company's agency sales channel. Users are sales agents (FCs, EIMs, ACHs, "
-        "and other channel roles) asking about contest eligibility, qualification "
-        "criteria, reward details, payout timelines, locations, role definitions, "
-        "product thresholds (FYFP, persistency, etc.), and contest rules."
-    )
+    # Knowledge-base domain type — selects the domain profile (prompt text,
+    # entity categories, etc.) from policygpt/domain/.
+    # Built-in values: "contest" (insurance contest policies) | "policy" (HR/IT/finance policies)
+    # Add a new file under policygpt/domain/ to register additional types.
+    domain_type: str = "policy"
+
+    @property
+    def domain_profile(self):
+        from policygpt.domain import get_domain_profile
+        return get_domain_profile(self.domain_type)
+
+    @property
+    def domain_context(self) -> str:
+        return self.domain_profile.domain_context
 
     # FAQ generation — generate Q&A pairs per document during ingestion so the
     # document embedding captures natural-language questions users would ask,
@@ -581,4 +584,5 @@ class Config:
             ),
             debug_log_dir=base_config.debug_log_dir if debug_log_dir_env is None else debug_log_dir_env.strip(),
             debug=base_config.debug if debug_env is None else debug_env.strip().lower() in {"1", "true", "yes", "on"},
+            domain_type=os.getenv("POLICY_GPT_DOMAIN_TYPE", base_config.domain_type).strip() or base_config.domain_type,
         )
