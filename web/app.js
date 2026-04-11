@@ -1,5 +1,6 @@
 const state = {
     health: null,
+    domain: null,
     threads: [],
     activeThread: null,
     pendingPrompt: "",
@@ -12,6 +13,10 @@ const state = {
 const elements = {
     threadList: document.getElementById("thread-list"),
     chatTitle: document.getElementById("chat-title"),
+    assistantLabel: document.getElementById("assistant-label"),
+    heroEyebrow: document.getElementById("hero-eyebrow"),
+    heroDescription: document.getElementById("hero-description"),
+    promptRow: document.getElementById("prompt-row"),
     messages: document.getElementById("messages"),
     hero: document.getElementById("hero"),
     corpusSummary: document.getElementById("corpus-summary"),
@@ -338,6 +343,31 @@ function renderHeader() {
     elements.sendButton.textContent = state.loading ? "Working..." : "Send";
 }
 
+function renderDomainUI() {
+    const domain = state.domain;
+    if (!domain) {
+        return;
+    }
+
+    elements.assistantLabel.textContent = domain.assistant_label;
+    elements.heroEyebrow.textContent = domain.eyebrow;
+    elements.heroDescription.textContent = domain.description;
+
+    elements.promptRow.innerHTML = domain.prompt_chips
+        .map((chip) =>
+            `<button class="prompt-chip" type="button" data-prompt="${escapeHtml(chip.prompt)}">${escapeHtml(chip.label)}</button>`
+        )
+        .join("");
+
+    elements.promptRow.querySelectorAll("[data-prompt]").forEach((button) => {
+        button.addEventListener("click", () => {
+            elements.composerInput.value = button.getAttribute("data-prompt") || "";
+            autosizeComposer();
+            elements.composerInput.focus();
+        });
+    });
+}
+
 function render() {
     setStatus(state.health);
     renderThreadList();
@@ -505,8 +535,18 @@ async function pollHealth() {
     }
 }
 
+async function fetchDomain() {
+    try {
+        state.domain = await fetchJson("/api/domain", { method: "GET" });
+        renderDomainUI();
+    } catch {
+        // Domain UI is non-critical — leave containers empty if it fails.
+    }
+}
+
 async function bootstrap() {
     render();
+    await fetchDomain();
     await pollHealth();
 }
 
@@ -526,13 +566,6 @@ elements.composerForm.addEventListener("submit", (event) => {
 elements.newChatButton.addEventListener("click", createThread);
 elements.resetChatButton.addEventListener("click", resetActiveThread);
 
-document.querySelectorAll("[data-prompt]").forEach((button) => {
-    button.addEventListener("click", () => {
-        elements.composerInput.value = button.getAttribute("data-prompt") || "";
-        autosizeComposer();
-        elements.composerInput.focus();
-    });
-});
 
 window.addEventListener("beforeunload", () => {
     window.clearTimeout(state.pollHandle);

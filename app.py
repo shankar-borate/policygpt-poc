@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from policygpt.config import Config
-from policygpt.server.api import PolicyApiServer
+from policygpt.api.routes.chat import PolicyApiServer
 
 
 BASE_DIR = Path(__file__).resolve().parent

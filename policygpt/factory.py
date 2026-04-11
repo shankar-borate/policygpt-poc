@@ -1,9 +1,9 @@
 import os
 
-from policygpt.bot import PolicyGPTBot
+from policygpt.core.bot import PolicyGPTBot
 from policygpt.config import Config
-from policygpt.corpus import ProgressCallback
-from policygpt.services.usage_metrics import LLMUsageTracker
+from policygpt.core.corpus import ProgressCallback
+from policygpt.observability.usage_metrics import LLMUsageTracker
 
 
 def create_ready_bot(

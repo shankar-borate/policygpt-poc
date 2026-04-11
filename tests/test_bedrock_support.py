@@ -2,8 +2,8 @@ import json
 import unittest
 
 from policygpt.config import Config
-from policygpt.services.bedrock_service import BedrockService
-from policygpt.services.usage_metrics import LLMUsageTracker
+from policygpt.core.ai.providers.bedrock_provider import BedrockService
+from policygpt.observability.usage_metrics import LLMUsageTracker
 
 
 class _FakeStreamingBody:

@@ -4,8 +4,8 @@ from pathlib import Path
 
 from policygpt.config import Config
 from policygpt.models import SourceReference
-from policygpt.server.api import PolicyApiServer
-from policygpt.server.ui import WebUIRenderer
+from policygpt.api.routes.chat import PolicyApiServer
+from policygpt.api.renderers.ui import WebUIRenderer
 
 
 class ReferenceViewerTests(unittest.TestCase):

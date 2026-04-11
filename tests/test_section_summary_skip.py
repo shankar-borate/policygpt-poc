@@ -3,8 +3,8 @@ import unittest
 import numpy as np
 
 from policygpt.config import Config
-from policygpt.corpus import DocumentCorpus
-from policygpt.services.redaction import Redactor
+from policygpt.core.corpus import DocumentCorpus
+from policygpt.extraction.redaction import Redactor
 
 
 class _StubExtractor:

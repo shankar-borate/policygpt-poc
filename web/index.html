@@ -108,7 +108,7 @@
         <main class="chat-shell">
             <header class="chat-header">
                 <div>
-                    <p class="eyebrow">Enterprise assistant</p>
+                    <p class="eyebrow" id="assistant-label"></p>
                     <h2 id="chat-title">New chat</h2>
                 </div>
                 <button id="reset-chat-btn" class="ghost-button" type="button">Reset thread</button>
@@ -116,14 +116,9 @@
 
             <section id="hero" class="hero">
                 <div class="hero-card">
-                    <p class="eyebrow">Ask policy questions</p> 
-                    <p class="muted">The answer stays concise, focused, and grounded in the indexed policy content.</p>
-                    <div class="prompt-row">
-                        <button class="prompt-chip" type="button" data-prompt="List all active contests and who is eligible for each.">List all contests</button>
-                        <button class="prompt-chip" type="button" data-prompt="What is the FYFP threshold for FC to qualify for Bali Bliss?">Bali Bliss threshold</button>
-                        <button class="prompt-chip" type="button" data-prompt="Show me all rewards and their eligibility criteria in a table.">Rewards table</button>
-                        <button class="prompt-chip" type="button" data-prompt="What are the enrollment and contest timelines for all current contests?">Contest timelines</button>
-                    </div>
+                    <p class="eyebrow" id="hero-eyebrow"></p>
+                    <p class="muted" id="hero-description"></p>
+                    <div class="prompt-row" id="prompt-row"></div>
                 </div>
             </section>
 
@@ -136,7 +131,7 @@
                         id="composer-input"
                         class="composer-input"
                         rows="1"
-                        placeholder="Ask about any policy in D:\policy-mgmt\policies..."
+                        placeholder="Ask about leave, travel, expenses, IT rules, approvals..."
                     ></textarea>
                     <button id="send-btn" class="primary-button send-button" type="submit">Send</button>
                 </div>

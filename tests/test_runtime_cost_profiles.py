@@ -3,11 +3,11 @@ from unittest.mock import patch
 
 import numpy as np
 
-from policygpt.bot import PolicyGPTBot
+from policygpt.core.bot import PolicyGPTBot
 from policygpt.config import RUNTIME_COST_PROFILE_PRESETS, Config
 from policygpt.models import DocumentRecord, Message, SectionRecord, ThreadState
-from policygpt.services.query_analyzer import QueryAnalysis
-from policygpt.services.usage_metrics import estimate_text_tokens
+from policygpt.core.retrieval.query_analyzer import QueryAnalysis
+from policygpt.observability.usage_metrics import estimate_text_tokens
 
 
 class _IdentityRedactor:

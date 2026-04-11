@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import patch
 
-from policygpt.services.openai_service import OpenAIService
-from policygpt.services.pricing_loader import ModelPricingLoader
-from policygpt.services.usage_metrics import LLMUsageTracker, ModelPricingSnapshot
+from policygpt.core.ai.providers.openai_provider import OpenAIService
+from policygpt.observability.pricing.pricing_loader import ModelPricingLoader
+from policygpt.observability.usage_metrics import LLMUsageTracker, ModelPricingSnapshot
 
 
 class _FakeOpenAIUsage:
