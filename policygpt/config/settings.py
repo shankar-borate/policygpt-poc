@@ -82,6 +82,14 @@ class Config:
         }
     )
 
+    # ── OCR ───────────────────────────────────────────────────────────────────
+    # When enabled, images inside HTML files are passed through AWS Textract
+    # and the extracted text is indexed alongside the surrounding content.
+    # Configured per-domain in config/domain_defaults.py.
+    ocr_enabled: bool = False
+    ocr_provider: str = "textract"   # only "textract" supported today
+    ocr_min_confidence: float = 80.0  # Textract LINE block confidence threshold (0–100)
+
     # ── Ingestion: FAQ generation ─────────────────────────────────────────────
     generate_faq: bool = True
     faq_max_questions: int = 30
@@ -282,15 +290,23 @@ class Config:
 
         # Apply domain-specific Config overrides (config/domain_defaults.py).
         # Runs last so values compound on top of model-floor adjustments above.
-        # chat_max_output_tokens is treated as a floor: whichever is larger
-        # (model floor or domain setting) wins.
         domain_overrides = DOMAIN_CONFIG_OVERRIDES.get(self.domain_type, {})
+
+        # chat_max_output_tokens — treated as a floor (higher of model or domain wins).
         if "chat_max_output_tokens" in domain_overrides:
             object.__setattr__(
                 self,
                 "chat_max_output_tokens",
                 max(self.chat_max_output_tokens, int(domain_overrides["chat_max_output_tokens"])),
             )
+
+        # Boolean / scalar domain overrides — only apply when the field is
+        # still at its dataclass default (respects explicit constructor args).
+        for field_name in ("ocr_enabled", "ocr_min_confidence"):
+            if field_name in domain_overrides:
+                default_value = Config.__dataclass_fields__[field_name].default
+                if getattr(self, field_name) == default_value:
+                    object.__setattr__(self, field_name, domain_overrides[field_name])
 
     @classmethod
     def from_env(cls) -> "Config":

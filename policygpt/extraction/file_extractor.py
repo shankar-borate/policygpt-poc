@@ -5,6 +5,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from policygpt.config import Config
+from policygpt.extraction.ocr import TextractOCR
 
 
 class FileExtractor:
@@ -37,6 +38,14 @@ class FileExtractor:
 
     def __init__(self, config: Config):
         self.config = config
+        self._ocr: TextractOCR | None = (
+            TextractOCR(
+                region=config.bedrock_region,
+                min_confidence=config.ocr_min_confidence,
+            )
+            if config.ocr_enabled
+            else None
+        )
 
     @staticmethod
     def read_text_file(path: str) -> str:
@@ -78,6 +87,21 @@ class FileExtractor:
             )
             return title, self._group_units_into_sections(self._build_html_text_fallback_units(raw_text))
 
+        # OCR pass — collect text from all <img> tags before they are removed.
+        # Each image becomes a "p" unit appended after the normal content units
+        # so it is indexed and searchable.  The full OCR text is stored in the
+        # section so the entire block is shown when a match is retrieved.
+        ocr_units: list[tuple[str, str]] = []
+        if self._ocr is not None:
+            html_dir = Path(path).resolve().parent
+            for img_tag in soup.find_all("img"):
+                src = img_tag.get("src") or img_tag.get("data-src") or ""
+                ocr_text = self._ocr.extract_from_src(src, html_dir)
+                if ocr_text:
+                    alt = self.clean_whitespace(img_tag.get("alt") or "")
+                    label = f"[Image{': ' + alt if alt else ''}]"
+                    ocr_units.append(("p", f"{label}\n{ocr_text}"))
+
         for tag in soup(["script", "style", "noscript", "svg", "img", "meta", "link"]):
             tag.decompose()
 
@@ -97,6 +121,10 @@ class FileExtractor:
 
         if not self._has_substantive_body_units(units) and fallback_text:
             units = self._build_html_text_fallback_units(fallback_text)
+
+        # Append OCR units after the main content so they form their own
+        # section(s) and are fully shown when their text matches a query.
+        units = units + ocr_units
 
         title = self._select_document_title(path=path, html_title=html_title, units=units)
         return title, self._group_units_into_sections(units)

@@ -21,10 +21,20 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         # tables, multi-step approval chains.  Set a high minimum so the model
         # has room to give complete, well-structured answers.
         "chat_max_output_tokens": 5400,
+
+        # Policy HTML documents frequently contain scanned images, org charts,
+        # and approval matrices — OCR these so their text is searchable.
+        "ocr_enabled": True,
+        "ocr_min_confidence": 80.0,
     },
     "contest": {
         # Contest answers are focused and concise — thresholds, reward amounts,
         # timelines.  A moderate budget is sufficient.
         "chat_max_output_tokens": 2700,
+
+        # Contest documents also embed reward tables and eligibility charts
+        # as images — OCR them for complete coverage.
+        "ocr_enabled": True,
+        "ocr_min_confidence": 80.0,
     },
 }

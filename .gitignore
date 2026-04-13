@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Env / secrets
+.env
+.env.*
+*.env
+
+# Eval testset — may contain extracted secrets from policy documents
+tests/eval_testset.json
+tests/results/
+
+# Artifacts / generated data
+artifacts/
+metadata/
+
+# IDE
+.vscode/
+.idea/
