@@ -211,6 +211,19 @@ class DocumentCorpus:
         if extension not in {".html", ".htm", ".txt", ".pdf"}:
             return ("skipped", f"unsupported file extension: {extension or 'none'}")
 
+        # Skip expensive LLM processing when the document is already indexed in
+        # the external vector store.  This prevents re-running summarisation,
+        # FAQ generation, and entity extraction on every server restart.
+        if self._vector_store is not None and self._vector_store.document_indexed_for_path(path):
+            self._emit_progress(
+                progress_callback,
+                processed_files,
+                total_files,
+                f"{file_name} - already indexed, skipping",
+            )
+            logger.info("Skipping already-indexed document: %s", file_name)
+            return ("skipped", "already indexed in OpenSearch")
+
         title, sections = self.extractor.extract(path)
         full_text = "\n\n".join(text for _, text in sections).strip()
         if not full_text:

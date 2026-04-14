@@ -239,6 +239,57 @@ function renderThreadList() {
     });
 }
 
+const RELATED_MARKER = "**You might also ask:**";
+
+function splitRelatedQuestions(text) {
+    const markerIdx = text.indexOf(RELATED_MARKER);
+    if (markerIdx === -1) return { mainText: text, questions: [] };
+
+    const mainText = text.slice(0, markerIdx).trimEnd();
+    const rest = text.slice(markerIdx + RELATED_MARKER.length);
+    const questions = rest
+        .split(/\r?\n/)
+        .map((line) => line.trim().match(/^[-*]\s+(.+)/))
+        .filter(Boolean)
+        .map((m) => m[1].trim());
+
+    return { mainText, questions };
+}
+
+function renderRelatedQuestions(questions) {
+    if (!questions || questions.length === 0) return "";
+    const chips = questions.map(
+        (q) => `<button class="related-chip" type="button" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button>`
+    );
+    return `<div class="related-refs"><span class="source-refs-label">You might also ask</span><div class="related-chips">${chips.join("")}</div></div>`;
+}
+
+function renderSources(sources) {
+    if (!sources || sources.length === 0) return "";
+
+    const seen = new Set();
+    const unique = sources.filter((s) => {
+        if (seen.has(s.document_url)) return false;
+        seen.add(s.document_url);
+        return true;
+    });
+
+    const chips = unique.map((src) => {
+        const sectionWords = (src.section_title || "").trim().split(/\s+/).filter(Boolean);
+        const isGeneric = sectionWords.length === 0 || src.section_title.toLowerCase() === "introduction";
+        const shortLabel = isGeneric
+            ? src.file_name.replace(/\.[^/.]+$/, "")
+            : sectionWords.slice(0, 4).join(" ") + (sectionWords.length > 4 ? "\u2026" : "");
+        const tooltip = src.section_title && !isGeneric
+            ? `${src.document_title} \u203a ${src.section_title}`
+            : src.document_title;
+
+        return `<a class="source-chip" href="${escapeHtml(src.document_url)}" target="_blank" rel="noreferrer noopener" data-tooltip="${escapeHtml(tooltip)}">${escapeHtml(shortLabel)}</a>`;
+    });
+
+    return `<div class="source-refs"><span class="source-refs-label">Sources</span><div class="source-chips">${chips.join("")}</div></div>`;
+}
+
 function renderMessages() {
     const savedMessages = state.activeThread?.messages || [];
     const hasPending = Boolean(state.pendingPrompt);
@@ -251,17 +302,32 @@ function renderMessages() {
         return;
     }
 
-    const parts = savedMessages.map((message) => {
+    const lastAssistantIdx = savedMessages.reduce((last, msg, idx) =>
+        msg.role === "assistant" ? idx : last, -1);
+
+    const parts = savedMessages.map((message, idx) => {
         const label = message.role === "user" ? "You" : "Policy GPT";
-        const body = message.role === "assistant"
-            ? renderMarkdown(message.content)
-            : `<p>${escapeHtml(message.content)}</p>`;
+        let body, relatedHtml = "";
+
+        if (message.role === "assistant") {
+            const { mainText, questions } = splitRelatedQuestions(message.content);
+            body = renderMarkdown(mainText);
+            relatedHtml = renderRelatedQuestions(questions);
+        } else {
+            body = `<p>${escapeHtml(message.content)}</p>`;
+        }
+
+        const sourcesHtml = (message.role === "assistant" && idx === lastAssistantIdx)
+            ? renderSources(state.activeThread?.sources || [])
+            : "";
 
         return `
             <article class="message ${message.role}">
                 <div class="message-meta">${label}</div>
                 <div class="message-card">
                     <div class="message-body">${body}</div>
+                    ${relatedHtml}
+                    ${sourcesHtml}
                 </div>
             </article>
         `;
@@ -289,6 +355,17 @@ function renderMessages() {
     }
 
     elements.messages.innerHTML = parts.join("");
+
+    elements.messages.querySelectorAll(".related-chip").forEach((btn) => {
+        btn.addEventListener("click", () => {
+            const question = btn.getAttribute("data-question");
+            if (!question) return;
+            elements.composerInput.value = question;
+            autosizeComposer();
+            sendMessage();
+        });
+    });
+
     elements.messages.scrollTop = elements.messages.scrollHeight;
 }
 

@@ -34,6 +34,7 @@ class PolicyGPTBot:
         extractor: FileExtractor | None = None,
         corpus: DocumentCorpus | None = None,
         conversations: ConversationManager | None = None,
+        thread_repo=None,
     ) -> None:
         self.config = config
         self.usage_tracker = usage_tracker
@@ -47,7 +48,7 @@ class PolicyGPTBot:
             ai=self.ai,
             redactor=self.redactor,
         )
-        self.conversations = conversations or ConversationManager()
+        self.conversations = conversations or ConversationManager(repo=thread_repo)
         self._supplementary_facts: str = self._load_supplementary_facts()
         # In-memory answer cache: (normalized_question, frozenset(active_doc_ids)) → (answer, sources).
         # Only caches non-context-dependent queries. Cleared on process restart.
@@ -79,8 +80,8 @@ class PolicyGPTBot:
             domain=domain,
         )
 
-    def new_thread(self) -> str:
-        return self.conversations.new_thread()
+    def new_thread(self, user_id: str = "") -> str:
+        return self.conversations.new_thread(user_id=user_id)
 
     def reset_thread(self, thread_id: str) -> None:
         self.conversations.reset_thread(thread_id)
@@ -88,8 +89,8 @@ class PolicyGPTBot:
     def get_thread(self, thread_id: str):
         return self.conversations.get_thread(thread_id)
 
-    def list_threads(self):
-        return self.conversations.list_threads()
+    def list_threads(self, user_id: str = ""):
+        return self.conversations.list_threads(user_id=user_id)
 
     def chat(self, thread_id: str, user_question: str, user_id: str | int | None = None) -> ChatResult:
         thread = None

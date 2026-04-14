@@ -82,34 +82,44 @@ class PolicyApiServer:
         with self.runtime.lock:
             return self.runtime.usage_payload()
 
-    def list_threads(self) -> dict:
+    def list_threads(self, http_request: Request) -> dict:
+        user_id = http_request.cookies.get("user_id", "")
         with self.runtime.lock:
             bot = self.runtime.require_bot()
             return {
-                "items": [self.serialize_thread_summary(thread) for thread in bot.list_threads()],
+                "items": [
+                    self.serialize_thread_summary(t)
+                    for t in bot.list_threads(user_id=user_id)
+                ],
             }
 
-    def create_thread(self) -> dict:
+    def create_thread(self, http_request: Request) -> dict:
+        user_id = http_request.cookies.get("user_id", "")
         with self.runtime.lock:
             bot = self.runtime.require_bot()
-            thread_id = bot.new_thread()
-            return self.serialize_thread_detail(bot.get_thread(thread_id))
+            thread_id = bot.new_thread(user_id=user_id)
+            thread = bot.conversations.get_thread_for_display(thread_id)
+            return self.serialize_thread_detail(thread)
 
-    def get_thread(self, thread_id: str) -> dict:
+    def get_thread(self, thread_id: str, http_request: Request) -> dict:
         with self.runtime.lock:
             bot = self.runtime.require_bot()
-            thread = bot.threads.get(thread_id)
-            if thread is None:
+            thread = bot.conversations.get_thread_for_display(thread_id)
+            if not thread.display_messages and thread_id not in bot.threads:
                 raise HTTPException(status_code=404, detail="Thread not found.")
             return self.serialize_thread_detail(thread)
 
-    def reset_thread(self, thread_id: str) -> dict:
+    def reset_thread(self, thread_id: str, http_request: Request) -> dict:
+        user_id = http_request.cookies.get("user_id", "")
         with self.runtime.lock:
             bot = self.runtime.require_bot()
-            if thread_id not in bot.threads:
+            # Verify thread exists (in memory or OS).
+            existing = bot.conversations.get_thread_for_display(thread_id)
+            if not existing.display_messages and thread_id not in bot.threads:
                 raise HTTPException(status_code=404, detail="Thread not found.")
             bot.reset_thread(thread_id)
-            return self.serialize_thread_detail(bot.get_thread(thread_id))
+            thread = bot.conversations.get_thread_for_display(thread_id)
+            return self.serialize_thread_detail(thread)
 
     def chat(self, request: ChatRequest, http_request: Request) -> dict:
         message = request.message.strip()
@@ -123,11 +133,15 @@ class PolicyApiServer:
 
         with self.runtime.lock:
             bot = self.runtime.require_bot()
-            thread_id = request.thread_id or bot.new_thread()
+            thread_id = request.thread_id or bot.new_thread(user_id=user_id or "")
             result = bot.chat(thread_id=thread_id, user_question=message, user_id=user_id)
-            thread = bot.get_thread(result.thread_id)
+            # Persist to OS (if configured) and clear display_messages from memory.
+            in_memory_thread = bot.get_thread(result.thread_id)
+            bot.conversations.save_thread(in_memory_thread)
+            # Load the display thread — from OS when persisted, from memory otherwise.
+            display_thread = bot.conversations.get_thread_for_display(result.thread_id)
             return {
-                "thread": self.serialize_thread_detail(thread),
+                "thread": self.serialize_thread_detail(display_thread),
                 "answer": result.answer,
             }
 

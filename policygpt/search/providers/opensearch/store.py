@@ -152,6 +152,20 @@ class OpenSearchVectorStore(VectorStore):
             body=body,
         )
 
+    def document_indexed_for_path(self, source_path: str) -> bool:
+        """Return True if a document with this source_path exists in the documents index."""
+        try:
+            body = {
+                "query": {"term": {"source_path": source_path}},
+                "size": 1,
+                "_source": False,
+            }
+            resp = self.client.search(index=self._documents_index, body=body)
+            return resp.get("hits", {}).get("total", {}).get("value", 0) > 0
+        except Exception as exc:
+            logger.warning("document_indexed_for_path check failed for '%s': %s", source_path, exc)
+            return False
+
     def delete_document(self, doc_id: str) -> None:
         try:
             self.client.delete(index=self._documents_index, id=doc_id, ignore=[404])

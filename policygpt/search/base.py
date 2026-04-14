@@ -57,6 +57,14 @@ class VectorStore(ABC):
         """
 
     @abstractmethod
+    def document_indexed_for_path(self, source_path: str) -> bool:
+        """Return True if a document with this source_path is already indexed.
+
+        Used by the ingestion pipeline to skip expensive LLM processing for
+        documents that have not changed since the last run.
+        """
+
+    @abstractmethod
     def delete_document(self, doc_id: str) -> None:
         """Remove a document, all its sections, and all its FAQ pairs."""
 

@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-from policygpt.models.utils import utc_now_iso
+from policygpt.common.models.utils import utc_now_iso
 
 
 @dataclass
