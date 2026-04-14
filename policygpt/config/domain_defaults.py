@@ -26,6 +26,13 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         # and approval matrices — OCR these so their text is searchable.
         "ocr_enabled": True,
         "ocr_min_confidence": 80.0,
+
+        # Hybrid search weights for policy domain.
+        # Policy queries tend to use exact defined terms (clause numbers, names)
+        # so keyword search gets a stronger share than the default.
+        "hybrid_keyword_weight": 0.35,
+        "hybrid_similarity_weight": 0.15,
+        "hybrid_vector_weight": 0.50,
     },
     "contest": {
         # Contest answers are focused and concise — thresholds, reward amounts,
@@ -36,5 +43,11 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         # as images — OCR them for complete coverage.
         "ocr_enabled": True,
         "ocr_min_confidence": 80.0,
+
+        # Contest queries are often vague ("what do I win") so semantic vector
+        # search should dominate.
+        "hybrid_keyword_weight": 0.20,
+        "hybrid_similarity_weight": 0.15,
+        "hybrid_vector_weight": 0.65,
     },
 }

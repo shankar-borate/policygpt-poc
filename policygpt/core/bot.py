@@ -69,8 +69,15 @@ class PolicyGPTBot:
         self,
         folder_path: str,
         progress_callback: ProgressCallback | None = None,
+        user_ids: list[str | int] | None = None,
+        domain: str = "",
     ) -> None:
-        self.corpus.ingest_folder(folder_path, progress_callback=progress_callback)
+        self.corpus.ingest_folder(
+            folder_path,
+            progress_callback=progress_callback,
+            user_ids=user_ids,
+            domain=domain,
+        )
 
     def new_thread(self) -> str:
         return self.conversations.new_thread()
@@ -84,7 +91,7 @@ class PolicyGPTBot:
     def list_threads(self):
         return self.conversations.list_threads()
 
-    def chat(self, thread_id: str, user_question: str) -> ChatResult:
+    def chat(self, thread_id: str, user_question: str, user_id: str | int | None = None) -> ChatResult:
         thread = None
         query_analysis = None
         retrieval_query = ""
@@ -135,6 +142,7 @@ class PolicyGPTBot:
             faq_hit = self.corpus.faq_fastpath_lookup(
                 query_vec,
                 min_score=self.config.faq_fastpath_min_score,
+                user_id=user_id,
             )
             if faq_hit:
                 final_faq = self._normalize_answer_markdown(faq_hit)
@@ -185,6 +193,7 @@ class PolicyGPTBot:
                     active_document_titles=active_document_titles,
                     preferred_doc_ids=preferred_doc_ids,
                     preferred_section_ids=preferred_section_ids,
+                    user_id=user_id,
                 )
                 top_docs = []
                 top_sections = []
@@ -201,6 +210,7 @@ class PolicyGPTBot:
                     query_analysis,
                     top_docs,
                     preferred_section_ids=preferred_section_ids,
+                    user_id=user_id,
                 )
                 top_docs = self._merge_retrieved_documents(top_docs, top_sections)
 
@@ -229,6 +239,7 @@ class PolicyGPTBot:
                         top_docs=top_docs,
                         top_sections=top_sections,
                         query_vec=query_vec,
+                        user_id=user_id,
                     )
                     masked_answer = self._llm_text_with_debug_log(
                         purpose="chat_answer",
@@ -247,7 +258,7 @@ class PolicyGPTBot:
                     if confidence != "High":
                         answer_text += f"\n\n_Confidence: {confidence}_"
                     # Suggest related questions from the FAQ corpus
-                    related = self._find_related_questions(query_vec, user_question)
+                    related = self._find_related_questions(query_vec, user_question, user_id=user_id)
                     if related:
                         answer_text += "\n\n**You might also ask:**\n" + "\n".join(f"- {q}" for q in related)
                 else:
@@ -504,6 +515,7 @@ class PolicyGPTBot:
         active_document_titles: list[str],
         preferred_doc_ids: list[str],
         preferred_section_ids: list[str],
+        user_id: str | int | None = None,
     ) -> tuple[str, list[SourceReference]]:
         """Retrieve evidence for each sub-question separately and answer together.
 
@@ -531,6 +543,7 @@ class PolicyGPTBot:
                 sub_analysis,
                 sub_docs,
                 preferred_section_ids=preferred_section_ids,
+                user_id=user_id,
             )
             for section, score in sub_sections:
                 if section.section_id in seen_section_ids:
@@ -548,6 +561,7 @@ class PolicyGPTBot:
                 query_analysis=sub_analysis,
                 top_docs=sub_docs,
                 top_sections=sub_sections,
+                user_id=user_id,
             )
             sub_contexts.append(f"Sub-question: {sub_q}\n{sub_context}")
 
@@ -577,14 +591,20 @@ class PolicyGPTBot:
             return "Medium"
         return "Low"
 
-    def _find_related_questions(self, query_vec, asked_question: str, top_k: int = 3) -> list[str]:
+    def _find_related_questions(
+        self,
+        query_vec,
+        asked_question: str,
+        top_k: int = 3,
+        user_id: str | int | None = None,
+    ) -> list[str]:
         """Return up to top_k FAQ questions related to the current query.
 
         Filters out the question that was just asked so suggestions are
         genuinely new.  Returns an empty list when FAQ embeddings are absent
         or when no related questions score above a basic threshold.
         """
-        candidates = self.corpus.search_faq_questions(query_vec, top_k=top_k + 5)
+        candidates = self.corpus.search_faq_questions(query_vec, top_k=top_k + 5, user_id=user_id)
         asked_lower = asked_question.strip().casefold()
         seen: set[str] = set()
         related: list[str] = []
@@ -1386,6 +1406,7 @@ class PolicyGPTBot:
         top_docs,
         top_sections,
         query_vec: np.ndarray | None = None,
+        user_id: str | int | None = None,
     ) -> str:
         minimal_context = self._use_minimal_answer_context(query_analysis)
         doc_aliases = self._build_document_aliases(top_docs, top_sections)
@@ -1445,6 +1466,7 @@ class PolicyGPTBot:
             faq_hits = self.corpus.search_faq_questions(
                 query_vec=query_vec if query_vec is not None else self._embed_one(query_analysis.original_question),
                 top_k=self.config.aggregate_faq_top_k,
+                user_id=user_id,
             )
             if faq_hits:
                 # Group Q&A pairs by document title for a clean prompt layout.

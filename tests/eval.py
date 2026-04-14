@@ -158,6 +158,7 @@ def run_eval_api(
     generate_answers: bool = True,
     filter_category: str = "",
     filter_difficulty: str = "",
+    user_id: str = "",
 ) -> list[EvalResult]:
     import requests
 
@@ -169,6 +170,9 @@ def run_eval_api(
     print(f"Server ready. Running {len(test_cases)} test cases...\n")
 
     session = requests.Session()
+    # Set user_id cookie so permission filtering works the same as in production
+    if user_id:
+        session.cookies.set("user_id", user_id)
     results: list[EvalResult] = []
 
     for i, tc in enumerate(test_cases, start=1):
@@ -467,6 +471,7 @@ def main() -> None:
     parser.add_argument("--all", dest="all_cases", action="store_true", help="Include unverified cases")
     parser.add_argument("--category", default="", help="Filter by category")
     parser.add_argument("--difficulty", default="", help="Filter by difficulty")
+    parser.add_argument("--user-id", default="", help="user_id to send as cookie (required when hybrid search is enabled)")
     args = parser.parse_args()
 
     if args.compare:
@@ -493,7 +498,7 @@ def main() -> None:
     )
 
     if args.url:
-        run_eval_api(base_url=args.url.rstrip("/"), **kwargs)
+        run_eval_api(base_url=args.url.rstrip("/"), user_id=args.user_id, **kwargs)
     else:
         run_eval_local(**kwargs)
 

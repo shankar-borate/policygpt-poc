@@ -1,0 +1,12 @@
+# Files excluded from Claude Code context.
+# Claude will not read or reference these files.
+
+# Credentials — must never be sent as context
+policygpt/config/opensearch.env
+.env
+.env.*
+
+# Large generated artifacts — not useful as context
+tests/eval_testset.json
+tests/results/
+artifacts/

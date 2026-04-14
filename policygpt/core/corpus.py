@@ -1,11 +1,12 @@
 import json
+import logging
 import re
 import traceback
 import uuid
 from collections import Counter
 from math import log
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -19,7 +20,10 @@ from policygpt.extraction.metadata_extractor import MetadataExtractor
 from policygpt.core.retrieval.query_analyzer import QueryAnalysis
 from policygpt.extraction.redaction import Redactor
 from policygpt.extraction.taxonomy import keywordize_text, normalize_text, tokenize_text, unique_preserving_order
+from policygpt.search import VectorStore, OpenSearchRetriever, create_vector_store
 
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int, str | None, int, int], None]
 
@@ -66,6 +70,15 @@ class DocumentCorpus:
         # Used at query time to expand user terms with contextual meaning.
         self.entity_lookup: dict[str, ExtractedEntity] = {}
 
+        # ── Hybrid search (optional external vector store) ────────────────
+        # None  → use existing in-memory retrieval (hybrid_search_enabled=False)
+        # set   → delegate retrieve_top_sections() to OpenSearchRetriever
+        self._vector_store: Optional[VectorStore] = create_vector_store(config)
+        self._os_retriever: Optional[OpenSearchRetriever] = (
+            OpenSearchRetriever(self._vector_store, config)
+            if self._vector_store is not None else None
+        )
+
     TOPIC_ALIGNMENT_IGNORED_TOKENS: set[str] = {
         "policy",
         "policies",
@@ -89,6 +102,8 @@ class DocumentCorpus:
         self,
         folder_path: str,
         progress_callback: ProgressCallback | None = None,
+        user_ids: list[str | int] | None = None,
+        domain: str = "",
     ) -> None:
         file_paths = self.list_supported_policy_files(folder_path)
         if not file_paths:
@@ -119,6 +134,8 @@ class DocumentCorpus:
                         progress_callback=progress_callback,
                         processed_files=processed_files - 1,
                         total_files=total_files,
+                        user_ids=user_ids,
+                        domain=domain,
                     )
                     if status == "ingested":
                         self._emit_progress(
@@ -177,6 +194,8 @@ class DocumentCorpus:
         progress_callback: ProgressCallback | None = None,
         processed_files: int = 0,
         total_files: int = 0,
+        user_ids: list[str | int] | None = None,
+        domain: str = "",
     ) -> tuple[str, str]:
         path_obj = Path(path)
         file_name = path_obj.name
@@ -387,6 +406,33 @@ class DocumentCorpus:
         self.documents[document_id] = document
         self._write_ingestion_log(document)
         self._write_section_files(path, file_name, document.sections)
+
+        # Index into external vector store when enabled
+        if self._vector_store is not None:
+            _effective_domain = domain or self.config.domain_type
+            _effective_user_ids = user_ids or []
+            try:
+                self._vector_store.index_document(
+                    document,
+                    user_ids=_effective_user_ids,
+                    domain=_effective_domain,
+                )
+            except Exception as exc:
+                # Log but never fail ingestion due to search indexing errors
+                print(f"  WARNING: vector store indexing failed for '{file_name}': {exc}")
+            if faq_qa_pairs and faq_q_embeddings:
+                try:
+                    self._vector_store.index_faq_pairs(
+                        doc_id=document.doc_id,
+                        document_title=document.title,
+                        source_path=path,
+                        qa_pairs=faq_qa_pairs,
+                        q_embeddings=faq_q_embeddings,
+                        user_ids=[str(uid) for uid in _effective_user_ids],
+                        domain=_effective_domain,
+                    )
+                except Exception as exc:
+                    print(f"  WARNING: FAQ indexing failed for '{file_name}': {exc}")
         self._emit_progress(
             progress_callback,
             processed_files,
@@ -558,7 +604,49 @@ class DocumentCorpus:
         query_analysis: QueryAnalysis,
         top_docs: list[tuple[DocumentRecord, float]],
         preferred_section_ids: list[str] | None = None,
+        user_id: str | int | None = None,
     ) -> list[tuple[SectionRecord, float]]:
+        # ── External vector store path ─────────────────────────────────────
+        if self._os_retriever is not None:
+            if user_id is None:
+                raise ValueError(
+                    "user_id is required when hybrid search is enabled. "
+                    "Pass the user_id from the request cookie."
+                )
+            rerank_limit = self._rerank_limit_for_query(query_analysis)
+            result_limit = self._section_result_limit_for_query(query_analysis)
+            # Over-fetch so the reranker has enough candidates, then apply the
+            # same heuristic+LLM reranker and diversity selection as the
+            # in-memory path.  Without this the OS path returns raw blended
+            # scores which are significantly worse than reranked results.
+            candidates = self._os_retriever.retrieve(
+                query_text=query_analysis.original_question,
+                query_embedding=query_vec,
+                top_k=rerank_limit,
+                query_analysis=query_analysis,
+                section_lookup=self.sections,
+                user_id=user_id,
+            )
+            # Apply the same preferred_section_ids bonus as the in-memory path so
+            # thread context (sections from prior turns) is boosted before reranking.
+            preferred_set = set(preferred_section_ids or [])
+            if preferred_set:
+                candidates = [
+                    (sec, score + 0.08 if sec.section_id in preferred_set else score)
+                    for sec, score in candidates
+                ]
+            reranked = self._rerank_sections(
+                query_analysis=query_analysis,
+                candidate_sections=candidates,
+            )
+            reranked.sort(key=lambda item: item[1], reverse=True)
+            return self._select_diverse_sections(
+                query_analysis=query_analysis,
+                scored_sections=reranked,
+                limit=result_limit,
+            )
+
+        # ── In-memory path (unchanged) ─────────────────────────────────────
         if self.section_embedding_matrix is None or not self.section_ids:
             return []
 
@@ -948,7 +1036,7 @@ class DocumentCorpus:
         # Step 1: heuristic re-score (fast, zero cost)
         heuristic: list[tuple[SectionRecord, float]] = []
         for section, base_score in candidate_sections:
-            document = self.documents[section.doc_id]
+            document = self.documents.get(section.doc_id)
             snippets = self.extract_evidence_snippets(section, query_analysis, limit=2)
             snippet_terms = keywordize_text(" ".join(snippets))
             snippet_overlap = self._term_overlap_score(
@@ -965,9 +1053,10 @@ class DocumentCorpus:
             )
             section_type_boost = 1.0 if section.section_type in query_analysis.expected_section_types else 0.0
             tag_boost = self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
+            doc_title_terms = document.title_terms if document is not None else []
             title_alignment = self._term_overlap_score(
                 query_terms=query_analysis.focus_terms + query_analysis.topic_hints,
-                candidate_terms=section.title_terms + document.title_terms,
+                candidate_terms=section.title_terms + doc_title_terms,
             )
             h_score = (
                 (0.72 * base_score)
@@ -1634,15 +1723,35 @@ class DocumentCorpus:
         self,
         query_vec: np.ndarray,
         min_score: float = 0.92,
+        user_id: str | int | None = None,
     ) -> str | None:
         """Return a FAQ answer if the query vector closely matches a stored FAQ question.
 
-        Checks all documents' FAQ question embeddings and returns the answer for
-        the best match above *min_score*.  Returns None when no match is found or
-        when the fast-path is disabled.
+        When hybrid search is enabled, delegates to the vector store's faq_search()
+        so permission filtering (user_id) is applied at the database level.
+        Falls back to in-memory scan when the vector store is unavailable or
+        returns no result.
         """
         if not self.config.faq_fastpath_enabled:
             return None
+
+        # Delegate to OpenSearch (or other vector store) when available —
+        # this applies user_id permission filtering at the DB level.
+        if self._vector_store is not None and user_id is not None:
+            try:
+                faq_result = self._vector_store.faq_search(
+                    query_embedding=query_vec,
+                    user_id=str(user_id),
+                    min_score=min_score,
+                )
+                if faq_result is not None:
+                    return self.redactor.unmask_text(faq_result.answer)
+                return None
+            except Exception as exc:
+                # Fall through to in-memory scan on transient errors
+                logger.warning("faq_search via vector store failed, falling back to in-memory: %s", exc)
+
+        # In-memory fallback (used when hybrid search is disabled or user_id is None)
         best_score = min_score
         best_answer: str | None = None
         for document in self.documents.values():
@@ -1662,13 +1771,35 @@ class DocumentCorpus:
         self,
         query_vec: np.ndarray,
         top_k: int = 30,
+        user_id: str | int | None = None,
     ) -> list[tuple[float, str, str, str]]:
         """Search FAQ questions across ALL documents and return top-k matches.
 
         Returns list of (score, question, answer, doc_title) sorted by score
         descending. Unlike faq_fastpath_lookup this returns many results and
         is used to build aggregate query evidence.
+
+        When hybrid search is enabled, delegates to the vector store so
+        user_id permission filtering is applied at the database level.
+        Falls back to in-memory scan (no permission filtering) when the
+        vector store is unavailable or user_id is not provided.
         """
+        # Delegate to OpenSearch when available — enforces user_id permission filter
+        if self._vector_store is not None and user_id is not None:
+            try:
+                faq_results = self._vector_store.search_faq_questions(
+                    query_embedding=query_vec,
+                    user_id=str(user_id),
+                    top_k=top_k,
+                )
+                return [
+                    (r.score, r.question, self.redactor.unmask_text(r.answer), r.document_title)
+                    for r in faq_results
+                ]
+            except Exception as exc:
+                logger.warning("search_faq_questions via vector store failed, falling back to in-memory: %s", exc)
+
+        # In-memory fallback
         all_hits: list[tuple[float, str, str, str]] = []
         for document in self.documents.values():
             if not document.faq_q_embeddings or not document.faq_qa_pairs:

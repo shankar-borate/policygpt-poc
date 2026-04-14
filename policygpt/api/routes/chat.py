@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -111,15 +111,20 @@ class PolicyApiServer:
             bot.reset_thread(thread_id)
             return self.serialize_thread_detail(bot.get_thread(thread_id))
 
-    def chat(self, request: ChatRequest) -> dict:
+    def chat(self, request: ChatRequest, http_request: Request) -> dict:
         message = request.message.strip()
         if not message:
             raise HTTPException(status_code=422, detail="Message cannot be empty.")
 
+        # Extract user_id from cookie — mandatory when hybrid search is enabled.
+        user_id = http_request.cookies.get("user_id")
+        if user_id is None and self.config.hybrid_search_enabled:
+            raise HTTPException(status_code=401, detail="user_id cookie is required.")
+
         with self.runtime.lock:
             bot = self.runtime.require_bot()
             thread_id = request.thread_id or bot.new_thread()
-            result = bot.chat(thread_id=thread_id, user_question=message)
+            result = bot.chat(thread_id=thread_id, user_question=message, user_id=user_id)
             thread = bot.get_thread(result.thread_id)
             return {
                 "thread": self.serialize_thread_detail(thread),

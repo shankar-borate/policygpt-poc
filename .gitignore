@@ -10,6 +10,7 @@ venv/
 .env
 .env.*
 *.env
+policygpt/config/opensearch.env
 
 # Eval testset — may contain extracted secrets from policy documents
 tests/eval_testset.json

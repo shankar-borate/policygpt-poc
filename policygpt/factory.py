@@ -17,5 +17,6 @@ def create_ready_bot(
         raise EnvironmentError("OPENAI_API_KEY is not set in environment variables.")
     resolved_folder = folder or resolved_config.document_folder
     bot = PolicyGPTBot(config=resolved_config, usage_tracker=usage_tracker)
-    bot.ingest_folder(resolved_folder, progress_callback=progress_callback)
+    user_ids = list(resolved_config.ingestion_user_ids) or None
+    bot.ingest_folder(resolved_folder, progress_callback=progress_callback, user_ids=user_ids)
     return bot

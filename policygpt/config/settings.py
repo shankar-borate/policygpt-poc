@@ -26,7 +26,7 @@ from policygpt.config.presets import (
 @dataclass(frozen=True)
 class Config:
     # ── Storage ───────────────────────────────────────────────────────────────
-    document_folder: str = r"D:\policy-mgmt\data\vcx_policies"
+    document_folder: str = r"D:\policy-mgmt\data\test"
     supported_file_patterns: tuple[str, ...] = ("*.html", "*.htm", "*.txt", "*.pdf")
     excluded_file_name_parts: tuple[str, ...] = ("_summary",)
 
@@ -59,19 +59,27 @@ class Config:
     usd_to_inr_exchange_rate: float = 93.0
 
     # ── Debug / observability ─────────────────────────────────────────────────
-    debug_log_dir: str = r"D:\policy-mgmt\data\vcx_policies\metadata"
+    debug_log_dir: str = r"D:\policy-mgmt\data\test\metadata"
     debug: bool = True
 
     # ── Supplementary context ─────────────────────────────────────────────────
     # Path to a plain-text file with extra facts (e.g. business rules) injected
     # into every LLM prompt but never shown to the user as a source.
-    supplementary_facts_file: str = r"D:\policy-mgmt\data\vcx_policies\metadata\supplementary_facts.txt"
+    supplementary_facts_file: str = r"D:\policy-mgmt\data\test\metadata\supplementary_facts.txt"
 
     # ── Domain ────────────────────────────────────────────────────────────────
     # Selects domain profile (prompt text, entity categories, etc.) from domain/.
     # Built-in values: "contest" | "policy"
     # Add a new file under policygpt/domain/ to register additional types.
     domain_type: str = "policy"
+
+    # ── Ingestion: access control ─────────────────────────────────────────────
+    # User IDs that are granted access to every document ingested at server
+    # startup.  Set via POLICY_GPT_INGESTION_USER_IDS (comma-separated) so the
+    # documents are queryable by those users through OpenSearch.
+    # Leave empty (default) only when hybrid_search_enabled=False, because an
+    # empty list means the OpenSearch user_id filter never matches anything.
+    ingestion_user_ids: tuple[str, ...] = ()
 
     # ── Redaction ─────────────────────────────────────────────────────────────
     redaction_rules: dict[str, str] = field(
@@ -170,6 +178,44 @@ class Config:
     # ── AI rate limiting ──────────────────────────────────────────────────────
     ai_rate_limit_retries: int = 2
     ai_rate_limit_backoff_seconds: float = 8.0
+
+    # ── Hybrid search ─────────────────────────────────────────────────────────
+    # Master switch — set True to route retrieval through an external vector store.
+    # When False (default) the existing in-memory path is used unchanged.
+    hybrid_search_enabled: bool = True
+
+    # Which vector store backend to use.
+    # Must match a key in policygpt/search/factory.py registry.
+    # Swap to "pinecone" / "weaviate" / "pgvector" to switch backends with
+    # zero other code changes.
+    hybrid_search_provider: str = "opensearch"
+
+    # ── OpenSearch provider config ────────────────────────────────────────────
+    # Used only when hybrid_search_provider = "opensearch".
+    # Credentials must be set via environment variables (loaded from opensearch.env).
+    # See opensearch.env.example — never put real credentials in this file.
+    opensearch_host: str = ""
+    opensearch_port: int = 9200
+    opensearch_username: str = ""
+    opensearch_password: str = ""
+    opensearch_use_ssl: bool = True
+    opensearch_verify_certs: bool = False
+    opensearch_index_prefix: str = "policygpt"
+
+    # ── Hybrid search weights ─────────────────────────────────────────────────
+    # Controls the blend of the three complementary retrieval mechanisms.
+    # Values are normalised at blend time so they do not need to sum to 1.0,
+    # but it is clearest if they do.
+    # Override per domain in config/domain_defaults.py.
+    #
+    #   keyword    — BM25 exact/fuzzy term match (strong for clause numbers,
+    #                defined terms, exact policy names)
+    #   similarity — more_like_this vocabulary overlap (good for paraphrases
+    #                and synonym-rich policy language)
+    #   vector     — dense kNN semantic search (best for intent/meaning queries)
+    hybrid_keyword_weight: float = 0.30
+    hybrid_similarity_weight: float = 0.20
+    hybrid_vector_weight: float = 0.50
 
     # ── Retrieval scoring weights ─────────────────────────────────────────────
     doc_semantic_weight: float = 0.48
@@ -302,7 +348,13 @@ class Config:
 
         # Boolean / scalar domain overrides — only apply when the field is
         # still at its dataclass default (respects explicit constructor args).
-        for field_name in ("ocr_enabled", "ocr_min_confidence"):
+        for field_name in (
+            "ocr_enabled",
+            "ocr_min_confidence",
+            "hybrid_keyword_weight",
+            "hybrid_similarity_weight",
+            "hybrid_vector_weight",
+        ):
             if field_name in domain_overrides:
                 default_value = Config.__dataclass_fields__[field_name].default
                 if getattr(self, field_name) == default_value:
@@ -340,4 +392,17 @@ class Config:
             debug_log_dir=base.debug_log_dir if debug_log_dir_env is None else debug_log_dir_env.strip(),
             debug=base.debug if debug_env is None else debug_env.strip().lower() in {"1", "true", "yes", "on"},
             domain_type=os.getenv("POLICY_GPT_DOMAIN_TYPE", base.domain_type).strip() or base.domain_type,
+            # OpenSearch credentials — read from env only, never from code defaults
+            opensearch_host=os.getenv("OS_HOST", base.opensearch_host).strip(),
+            opensearch_port=_env_int("OS_PORT", base.opensearch_port),
+            opensearch_username=os.getenv("OS_USERNAME", base.opensearch_username).strip(),
+            opensearch_password=os.getenv("OS_PASSWORD", base.opensearch_password),
+            opensearch_use_ssl=bool(_env_bool("OS_USE_SSL", base.opensearch_use_ssl)),
+            opensearch_verify_certs=bool(_env_bool("OS_VERIFY_CERTS", base.opensearch_verify_certs)),
+            opensearch_index_prefix=os.getenv("OS_INDEX_PREFIX", base.opensearch_index_prefix).strip() or base.opensearch_index_prefix,
+            ingestion_user_ids=tuple(
+                uid.strip()
+                for uid in os.getenv("POLICY_GPT_INGESTION_USER_IDS", "").split(",")
+                if uid.strip()
+            ),
         )
