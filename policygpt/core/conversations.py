@@ -76,31 +76,43 @@ class ConversationManager:
         self.threads[thread_id] = thread
         return thread
 
-    def get_thread_for_display(self, thread_id: str) -> ThreadState:
+    def get_thread_for_display(self, thread_id: str) -> ThreadState | None:
         """Return thread with full display_messages for API serialization.
 
-        In-memory mode:  returns self.threads[thread_id] directly.
+        Returns None when the thread does not exist anywhere (OS or memory),
+        so callers can distinguish "found but empty" from "not found".
         OS-backed mode:  loads fresh from OS (authoritative message history).
+        In-memory mode:  returns from self.threads.
         """
         if self._repo is not None:
             loaded = self._repo.load(thread_id)
             if loaded is not None:
                 return loaded
+            # Not in OS yet — fall back to in-memory (e.g. just created,
+            # not yet persisted via save_thread).
+            return self.threads.get(thread_id)
 
-        return self.threads.get(
-            thread_id,
-            ThreadState(thread_id=thread_id),
-        )
+        return self.threads.get(thread_id)
 
     def save_thread(self, thread: ThreadState) -> None:
         """Persist to OS then clear display_messages from in-memory state.
 
         No-op when OS is not configured.
+
+        When OS-backed, loads the existing message history from OS and
+        prepends it so that display_messages accumulates across turns rather
+        than being overwritten with only the latest Q&A pair.
         """
         if self._repo is None:
             return
+        # Accumulate display_messages: prepend OS history to the new messages
+        # that chat() just appended to the (previously-cleared) in-memory list.
+        if thread.display_messages:
+            existing = self._repo.load(thread.thread_id)
+            if existing and existing.display_messages:
+                thread.display_messages = existing.display_messages + thread.display_messages
         self._repo.save(thread)
-        # Keep memory lean — messages now live in OS only.
+        # Keep memory lean — full message history now lives in OS only.
         thread.display_messages = []
 
     def list_threads(self, user_id: str = "") -> list[ThreadState]:

@@ -16,7 +16,13 @@
                 <p class="muted">Ask questions across the policy folder and get grounded answers.</p>
             </div>
 
-            <button id="new-chat-btn" class="primary-button" type="button">New chat</button>
+            <div class="sidebar-mode-row">
+                <button id="chat-mode-btn" class="mode-btn active" type="button">Chat</button>
+                <button id="search-mode-btn" class="mode-btn" type="button">Search</button>
+            </div>
+            <div class="sidebar-new-chat-row">
+                <button id="new-chat-btn" class="ghost-button full-width" type="button">+ New chat</button>
+            </div>
 
             <section class="sidebar-card">
                 <div class="status-row">
@@ -123,6 +129,24 @@
             </section>
 
             <div id="messages" class="messages"></div>
+
+            <!-- Search panel — visible when search mode is active -->
+            <section id="search-panel" class="search-panel hidden">
+                <form id="search-form" class="search-bar-form">
+                    <div class="search-bar-row">
+                        <input
+                            id="search-input"
+                            class="search-bar-input"
+                            type="search"
+                            placeholder="Search policy documents..."
+                            autocomplete="off"
+                        />
+                        <button class="primary-button" type="submit">Search</button>
+                    </div>
+                </form>
+                <div id="search-results" class="search-results"></div>
+                <div id="search-pagination" class="search-pagination hidden"></div>
+            </section>
 
             <form id="composer-form" class="composer">
                 <label class="composer-label" for="composer-input">Message</label>

@@ -57,6 +57,25 @@ class VectorStore(ABC):
         """
 
     @abstractmethod
+    def get_cached_document(self, source_path: str) -> dict | None:
+        """Return stored document + section metadata for source_path, or None.
+
+        Used by the ingestion pipeline to rebuild in-memory structures from
+        OpenSearch when a document was already indexed in a previous run —
+        avoiding expensive LLM re-processing while still populating the
+        in-memory corpus so chat and search both work correctly.
+
+        Returned dict shape:
+            {
+              doc_id, title, source_path, summary, version, effective_date,
+              document_type, metadata_tags, audiences, keywords,
+              sections: [{section_id, title, source_path, order_index,
+                          section_type, metadata_tags, keywords, summary,
+                          raw_text, masked_text}]
+            }
+        """
+        raise NotImplementedError
+
     def document_indexed_for_path(self, source_path: str) -> bool:
         """Return True if a document with this source_path is already indexed.
 
@@ -113,6 +132,26 @@ class VectorStore(ABC):
         """
 
     # ── Read (three independent search strategies) ────────────────────────────
+
+    def search_documents(
+        self,
+        query_text: str,
+        user_id: str,
+        page: int = 1,
+        size: int = 10,
+    ) -> dict:
+        """Full-text document search returning one result per document.
+
+        Groups section hits by document and returns the top-scoring section
+        as the representative snippet for each document.
+
+        Returns a dict:
+            {total, page, size, results: [{document_title, section_title,
+            snippet, source_path, section_index, score}]}
+
+        Raises NotImplementedError if the backend does not support this.
+        """
+        raise NotImplementedError("search_documents is not supported by this vector store")
 
     @abstractmethod
     def keyword_search(self, query: SearchQuery) -> list[SearchResult]:

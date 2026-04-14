@@ -211,18 +211,55 @@ class DocumentCorpus:
         if extension not in {".html", ".htm", ".txt", ".pdf"}:
             return ("skipped", f"unsupported file extension: {extension or 'none'}")
 
-        # Skip expensive LLM processing when the document is already indexed in
-        # the external vector store.  This prevents re-running summarisation,
-        # FAQ generation, and entity extraction on every server restart.
-        if self._vector_store is not None and self._vector_store.document_indexed_for_path(path):
-            self._emit_progress(
-                progress_callback,
-                processed_files,
-                total_files,
-                f"{file_name} - already indexed, skipping",
-            )
-            logger.info("Skipping already-indexed document: %s", file_name)
-            return ("skipped", "already indexed in OpenSearch")
+        # If already indexed in OpenSearch, reconstruct in-memory structures from
+        # OS data — no LLM calls needed.  Both chat (hybrid retrieval) and search
+        # query OS directly, so the in-memory record only needs to carry metadata
+        # (title, source_path, section titles) — embeddings can be empty.
+        if self._vector_store is not None:
+            cached = self._vector_store.get_cached_document(path)
+            if cached is not None:
+                self._emit_progress(
+                    progress_callback, processed_files, total_files,
+                    f"{file_name} - restoring from OpenSearch",
+                )
+                logger.info("Restoring already-indexed document from OS: %s", file_name)
+                _empty_vec = np.array([], dtype=np.float32)
+                _cached_doc = DocumentRecord(
+                    doc_id=cached["doc_id"],
+                    title=cached["title"],
+                    source_path=cached["source_path"],
+                    raw_text="",
+                    masked_text="",
+                    summary=cached["summary"],
+                    summary_embedding=_empty_vec,
+                    normalized_title=cached["title"].casefold(),
+                    canonical_title=cached["title"],
+                    document_type=cached["document_type"],
+                    version=cached["version"],
+                    effective_date=cached["effective_date"],
+                    metadata_tags=cached["metadata_tags"],
+                    audiences=cached["audiences"],
+                    keywords=cached["keywords"],
+                )
+                for sec in cached["sections"]:
+                    _sec = SectionRecord(
+                        section_id=sec["section_id"],
+                        title=sec["title"],
+                        raw_text=sec["raw_text"],
+                        masked_text=sec["masked_text"],
+                        summary=sec["summary"],
+                        summary_embedding=_empty_vec,
+                        source_path=sec["source_path"],
+                        doc_id=cached["doc_id"],
+                        order_index=sec["order_index"],
+                        section_type=sec["section_type"],
+                        metadata_tags=sec["metadata_tags"],
+                        keywords=sec["keywords"],
+                    )
+                    _cached_doc.sections.append(_sec)
+                    self.sections[sec["section_id"]] = _sec
+                self.documents[cached["doc_id"]] = _cached_doc
+                return ("ingested", f"restored from OpenSearch ({len(cached['sections'])} sections)")
 
         title, sections = self.extractor.extract(path)
         full_text = "\n\n".join(text for _, text in sections).strip()
@@ -507,22 +544,28 @@ class DocumentCorpus:
         doc_token_lengths: list[int] = []
         self.doc_term_doc_freq = {}
         for doc_id, document in self.documents.items():
-            self.doc_ids.append(doc_id)
-            doc_vectors.append(document.summary_embedding)
             doc_token_lengths.append(document.token_length)
             for term in document.token_counts:
                 self.doc_term_doc_freq[term] = self.doc_term_doc_freq.get(term, 0) + 1
+            # Only include docs with a real embedding in the kNN matrix.
+            # Cached docs (restored from OpenSearch) have an empty placeholder
+            # embedding — they use OS retrieval instead of in-memory kNN.
+            if document.summary_embedding.size > 0:
+                self.doc_ids.append(doc_id)
+                doc_vectors.append(document.summary_embedding)
 
         self.section_ids = []
         section_vectors: list[np.ndarray] = []
         section_token_lengths: list[int] = []
         self.section_term_doc_freq = {}
         for section_id, section in self.sections.items():
-            self.section_ids.append(section_id)
-            section_vectors.append(section.summary_embedding)
             section_token_lengths.append(section.token_length)
             for term in section.token_counts:
                 self.section_term_doc_freq[term] = self.section_term_doc_freq.get(term, 0) + 1
+            # Same guard for sections.
+            if section.summary_embedding.size > 0:
+                self.section_ids.append(section_id)
+                section_vectors.append(section.summary_embedding)
 
         self.doc_embedding_matrix = np.vstack(doc_vectors) if doc_vectors else None
         self.section_embedding_matrix = np.vstack(section_vectors) if section_vectors else None

@@ -4,7 +4,6 @@ from fastapi import HTTPException
 
 from policygpt.core.bot import PolicyGPTBot
 from policygpt.config import Config
-from policygpt.factory import create_ready_bot
 from policygpt.observability.pricing.pricing_loader import ModelPricingLoader
 from policygpt.observability.usage_metrics import LLMUsageTracker
 
@@ -23,11 +22,11 @@ class ServerRuntime:
         self.error: str | None = None
         self.document_folder = config.document_folder
         self.worker: Thread | None = None
+        # Ingestion progress
         self.indexing_processed_files = 0
         self.indexing_total_files = 0
         self.indexing_current_file: str | None = None
-        self.document_count = 0
-        self.section_count = 0
+        self.ingestion_running = False
 
     def start_indexing(self) -> None:
         with self.lock:
@@ -45,13 +44,12 @@ class ServerRuntime:
             self.indexing_processed_files = 0
             self.indexing_total_files = 0
             self.indexing_current_file = None
-            self.document_count = 0
-            self.section_count = 0
+            self.ingestion_running = False
             self.worker = Thread(target=self._initialize_worker, daemon=True)
             self.worker.start()
 
     def require_bot(self) -> PolicyGPTBot:
-        if self.bot is None or self.status != "ready":
+        if self.bot is None or self.status not in ("ready", "ingesting"):
             if self.status == "in_progress":
                 detail = self.progress_detail()
             else:
@@ -62,7 +60,6 @@ class ServerRuntime:
     def progress_detail(self) -> str:
         if self.indexing_total_files <= 0:
             return "Indexing is in progress."
-
         processed_files = min(self.indexing_processed_files, self.indexing_total_files)
         current_step = self.indexing_current_file or "the next indexing step"
         return f"Indexing is in progress ({processed_files}/{self.indexing_total_files}). Current step: {current_step}"
@@ -78,34 +75,101 @@ class ServerRuntime:
             "percent": percent,
         }
 
+    def get_document_count(self) -> int:
+        """Live document count — queries OpenSearch when available, else falls back to in-memory."""
+        bot = self.bot
+        if bot is not None:
+            vs = bot.corpus._vector_store
+            if vs is not None and hasattr(vs, "count_documents"):
+                return vs.count_documents()
+            return len(bot.documents)
+        return 0
+
+    def get_section_count(self) -> int:
+        """Live section count — queries OpenSearch when available, else falls back to in-memory."""
+        bot = self.bot
+        if bot is not None:
+            vs = bot.corpus._vector_store
+            if vs is not None and hasattr(vs, "count_sections"):
+                return vs.count_sections()
+            return len(bot.sections)
+        return 0
+
+    # ── Worker ────────────────────────────────────────────────────────────────
+
     def _initialize_worker(self) -> None:
+        """
+        Two-phase startup:
+          Phase 1 — Create the bot (fast).  If OpenSearch is reachable the bot
+                    is marked "ready" immediately so chat/search work at once.
+          Phase 2 — Run the ingestion pipeline in the same thread.  Any new or
+                    changed documents are indexed to OpenSearch.  The bot stays
+                    in "ready" state throughout; ingestion progress is surfaced
+                    via the /api/health endpoint.
+        """
         try:
-            print(f"[Policy GPT] Indexing started for {self.document_folder}", flush=True)
-            bot = create_ready_bot(
-                folder=self.document_folder,
-                progress_callback=self._update_progress,
+            # ── Phase 1: create the bot ───────────────────────────────────────
+            print(f"[Policy GPT] Starting up — document folder: {self.document_folder}", flush=True)
+
+            from policygpt.factory import _build_thread_repo
+            thread_repo = _build_thread_repo(self.config)
+
+            bot = PolicyGPTBot(
                 config=self.config,
                 usage_tracker=self.usage_tracker,
+                thread_repo=thread_repo,
             )
+
             with self.lock:
                 self.bot = bot
                 self.status = "ready"
                 self.error = None
-                self.indexing_processed_files = self.indexing_total_files
-                self.indexing_current_file = None
-                self.document_count = len(bot.documents)
-                self.section_count = len(bot.sections)
-            print(
-                f"[Policy GPT] Indexing complete: {len(bot.documents)} documents, {len(bot.sections)} sections.",
-                flush=True,
+
+            print("[Policy GPT] Bot ready.  Starting background ingestion …", flush=True)
+
+            # ── Phase 2: ingest (runs while status == "ready") ────────────────
+            from policygpt.ingestion import IngestionPipeline
+            from policygpt.ingestion.readers import FolderReader
+
+            user_ids = list(self.config.ingestion_user_ids)
+            domain = self.config.domain_type
+
+            with self.lock:
+                self.ingestion_running = True
+                self.status = "ingesting"
+
+            reader = FolderReader(
+                folder_path=self.document_folder,
+                user_ids=user_ids,
+                domain=domain,
             )
+            pipeline = IngestionPipeline.from_corpus(
+                corpus=bot.corpus,
+                reader=reader,
+                default_user_ids=user_ids,
+                default_domain=domain,
+            )
+            pipeline.run(progress_callback=self._update_progress)
+
+            with self.lock:
+                self.ingestion_running = False
+                self.status = "ready"
+                self.indexing_current_file = None
+
+            print("[Policy GPT] Ingestion complete.", flush=True)
+
         except Exception as exc:
             with self.lock:
-                self.bot = None
-                self.status = "error"
-                self.error = f"{type(exc).__name__}: {exc}"
-                self.indexing_current_file = None
-            print(f"[Policy GPT] Indexing failed: {type(exc).__name__}: {exc}", flush=True)
+                if self.bot is None:
+                    # Failed before bot was created — hard error
+                    self.status = "error"
+                    self.error = f"{type(exc).__name__}: {exc}"
+                else:
+                    # Bot is up but ingestion failed — stay ready, log warning
+                    self.status = "ready"
+                    self.ingestion_running = False
+                    self.indexing_current_file = None
+                    print(f"[Policy GPT] Ingestion error (bot still serving): {exc}", flush=True)
         finally:
             with self.lock:
                 self.worker = None
@@ -115,17 +179,12 @@ class ServerRuntime:
         processed_files: int,
         total_files: int,
         current_file: str | None,
-        document_count: int,
-        section_count: int,
+        *_,  # document_count / section_count — queried live from OS, not stored
     ) -> None:
         with self.lock:
-            self.status = "in_progress"
-            self.error = None
             self.indexing_processed_files = processed_files
             self.indexing_total_files = total_files
             self.indexing_current_file = current_file
-            self.document_count = document_count
-            self.section_count = section_count
 
     def usage_payload(self) -> dict:
         return self.usage_tracker.snapshot()

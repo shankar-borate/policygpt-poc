@@ -101,7 +101,7 @@ class PolicyGPTBot:
         prompt_payload = ""
         sources: list[SourceReference] = []
         try:
-            if not self.documents:
+            if not self.documents and self.corpus._os_retriever is None:
                 raise RuntimeError("No documents ingested. Call ingest_folder() first.")
 
             thread = self.get_thread(thread_id)
@@ -114,7 +114,9 @@ class PolicyGPTBot:
                 thread.updated_at = utc_now_iso()
                 return ChatResult(thread_id=thread_id, answer=reply, sources=[])
 
-            first_user_message = not any(message.role == "user" for message in thread.display_messages)
+            # Use recent_messages (always in memory) to detect first turn; display_messages
+            # may be empty after OS save even when the thread already has history.
+            first_user_message = not any(message.role == "user" for message in thread.recent_messages)
             active_document_titles = [
                 self.documents[doc_id].title
                 for doc_id in thread.active_doc_ids

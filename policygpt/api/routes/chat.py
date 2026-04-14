@@ -12,6 +12,14 @@ from policygpt.api.renderers.document_viewer import DocumentViewerRenderer
 from policygpt.api.runtime import ServerRuntime
 from policygpt.api.renderers.ui import WebUIRenderer
 from policygpt.extraction.file_extractor import FileExtractor
+from policygpt.models import ThreadState
+
+
+def _resolve_user_id(http_request: Request, query_user_id: str | None = None) -> str:
+    """Return user_id from query param first, then cookie, then empty string."""
+    if query_user_id:
+        return query_user_id
+    return http_request.cookies.get("user_id", "")
 
 
 class ChatRequest(BaseModel):
@@ -46,12 +54,16 @@ class PolicyApiServer:
         app.add_api_route("/api/threads/{thread_id}", self.get_thread, methods=["GET"])
         app.add_api_route("/api/threads/{thread_id}/reset", self.reset_thread, methods=["POST"])
         app.add_api_route("/api/chat", self.chat, methods=["POST"])
+        app.add_api_route("/api/search", self.search, methods=["GET"])
         app.add_api_route("/api/documents/open", self.open_document, methods=["GET"], response_class=FileResponse)
         app.add_api_route("/api/documents/view", self.view_document, methods=["GET"], response_class=HTMLResponse)
         return app
 
     def index(self) -> HTMLResponse:
-        return HTMLResponse(self.ui_renderer.render_index())
+        return HTMLResponse(
+            self.ui_renderer.render_index(),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     def domain_ui(self) -> dict:
         profile = self.config.domain_profile
@@ -68,22 +80,89 @@ class PolicyApiServer:
     def health(self) -> dict:
         with self.runtime.lock:
             bot = self.runtime.bot
-            return {
-                "status": self.runtime.status,
-                "error": self.runtime.error,
-                "document_folder": self.runtime.document_folder,
-                "document_count": self.runtime.document_count,
-                "section_count": self.runtime.section_count,
-                "thread_count": len(bot.threads) if bot else 0,
-                "progress": self.runtime.progress_payload(),
-            }
+            status = self.runtime.status
+            # "ingesting" is a sub-state of ready — UI treats both as operational
+            display_status = "ready" if status == "ingesting" else status
+        return {
+            "status": display_status,
+            "ingesting": status == "ingesting",
+            "error": self.runtime.error,
+            "document_folder": self.runtime.document_folder,
+            "document_count": self.runtime.get_document_count(),
+            "section_count": self.runtime.get_section_count(),
+            "thread_count": len(bot.threads) if bot else 0,
+            "progress": self.runtime.progress_payload(),
+        }
 
     def usage(self) -> dict:
         with self.runtime.lock:
             return self.runtime.usage_payload()
 
-    def list_threads(self, http_request: Request) -> dict:
-        user_id = http_request.cookies.get("user_id", "")
+    def search(
+        self,
+        q: str,
+        http_request: Request,
+        page: int = 1,
+        size: int = 10,
+        user_id: str | None = None,
+    ) -> dict:
+        q = q.strip()
+        if not q:
+            raise HTTPException(status_code=422, detail="Query cannot be empty.")
+
+        user_id = _resolve_user_id(http_request, user_id)
+        if not user_id and self.config.hybrid_search_enabled:
+            raise HTTPException(status_code=401, detail="user_id cookie or query param is required.")
+
+        page = max(1, page)
+        size = min(max(1, size), 50)
+
+        with self.runtime.lock:
+            bot = self.runtime.require_bot()
+            vector_store = bot.corpus._vector_store
+            if vector_store is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Search requires OpenSearch to be configured (hybrid_search_enabled=True).",
+                )
+            try:
+                raw = vector_store.search_documents(
+                    query_text=q,
+                    user_id=user_id,
+                    page=page,
+                    size=size,
+                )
+            except NotImplementedError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Search is not supported by the current vector store backend.",
+                )
+
+        results = [
+            {
+                "document_title": r["document_title"],
+                "section_title":  r["section_title"],
+                "snippet":        r["snippet"],
+                "score":          r["score"],
+                "document_url": build_document_view_url(
+                    self.config.public_base_url,
+                    source_path=r["source_path"],
+                    section_index=r["section_index"],
+                    section_title=r["section_title"],
+                ),
+            }
+            for r in raw["results"]
+        ]
+        return {
+            "query":   q,
+            "total":   raw["total"],
+            "page":    raw["page"],
+            "size":    raw["size"],
+            "results": results,
+        }
+
+    def list_threads(self, http_request: Request, user_id: str | None = None) -> dict:
+        user_id = _resolve_user_id(http_request, user_id)
         with self.runtime.lock:
             bot = self.runtime.require_bot()
             return {
@@ -93,43 +172,40 @@ class PolicyApiServer:
                 ],
             }
 
-    def create_thread(self, http_request: Request) -> dict:
-        user_id = http_request.cookies.get("user_id", "")
+    def create_thread(self, http_request: Request, user_id: str | None = None) -> dict:
+        user_id = _resolve_user_id(http_request, user_id)
         with self.runtime.lock:
             bot = self.runtime.require_bot()
             thread_id = bot.new_thread(user_id=user_id)
             thread = bot.conversations.get_thread_for_display(thread_id)
-            return self.serialize_thread_detail(thread)
+            return self.serialize_thread_detail(thread or ThreadState(thread_id=thread_id))
 
     def get_thread(self, thread_id: str, http_request: Request) -> dict:
         with self.runtime.lock:
             bot = self.runtime.require_bot()
             thread = bot.conversations.get_thread_for_display(thread_id)
-            if not thread.display_messages and thread_id not in bot.threads:
+            if thread is None:
                 raise HTTPException(status_code=404, detail="Thread not found.")
             return self.serialize_thread_detail(thread)
 
-    def reset_thread(self, thread_id: str, http_request: Request) -> dict:
-        user_id = http_request.cookies.get("user_id", "")
+    def reset_thread(self, thread_id: str, http_request: Request, user_id: str | None = None) -> dict:
+        user_id = _resolve_user_id(http_request, user_id)
         with self.runtime.lock:
             bot = self.runtime.require_bot()
-            # Verify thread exists (in memory or OS).
-            existing = bot.conversations.get_thread_for_display(thread_id)
-            if not existing.display_messages and thread_id not in bot.threads:
+            if bot.conversations.get_thread_for_display(thread_id) is None:
                 raise HTTPException(status_code=404, detail="Thread not found.")
             bot.reset_thread(thread_id)
             thread = bot.conversations.get_thread_for_display(thread_id)
-            return self.serialize_thread_detail(thread)
+            return self.serialize_thread_detail(thread or ThreadState(thread_id=thread_id))
 
-    def chat(self, request: ChatRequest, http_request: Request) -> dict:
+    def chat(self, request: ChatRequest, http_request: Request, user_id: str | None = None) -> dict:
         message = request.message.strip()
         if not message:
             raise HTTPException(status_code=422, detail="Message cannot be empty.")
 
-        # Extract user_id from cookie — mandatory when hybrid search is enabled.
-        user_id = http_request.cookies.get("user_id")
+        user_id = _resolve_user_id(http_request, user_id) or None
         if user_id is None and self.config.hybrid_search_enabled:
-            raise HTTPException(status_code=401, detail="user_id cookie is required.")
+            raise HTTPException(status_code=401, detail="user_id cookie or query param is required.")
 
         with self.runtime.lock:
             bot = self.runtime.require_bot()
@@ -139,7 +215,10 @@ class PolicyApiServer:
             in_memory_thread = bot.get_thread(result.thread_id)
             bot.conversations.save_thread(in_memory_thread)
             # Load the display thread — from OS when persisted, from memory otherwise.
-            display_thread = bot.conversations.get_thread_for_display(result.thread_id)
+            display_thread = (
+                bot.conversations.get_thread_for_display(result.thread_id)
+                or ThreadState(thread_id=result.thread_id)
+            )
             return {
                 "thread": self.serialize_thread_detail(display_thread),
                 "answer": result.answer,

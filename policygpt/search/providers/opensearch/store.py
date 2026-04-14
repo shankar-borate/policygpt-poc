@@ -152,6 +152,92 @@ class OpenSearchVectorStore(VectorStore):
             body=body,
         )
 
+    def get_cached_document(self, source_path: str) -> dict | None:
+        """Fetch document + section metadata from OpenSearch for the given source_path."""
+        try:
+            # 1. Fetch document record.
+            doc_resp = self.client.search(
+                index=self._documents_index,
+                body={
+                    "query": {"term": {"source_path": source_path}},
+                    "size": 1,
+                },
+            )
+            doc_hits = doc_resp.get("hits", {}).get("hits", [])
+            if not doc_hits:
+                return None
+            doc_src = doc_hits[0]["_source"]
+            doc_id = doc_src.get("doc_id", doc_hits[0]["_id"])
+
+            # 2. Fetch all sections for this document.
+            sec_resp = self.client.search(
+                index=self._sections_index,
+                body={
+                    "query": {"term": {"doc_id": doc_id}},
+                    "size": 500,
+                    "sort": [{"order_index": {"order": "asc"}}],
+                    "_source": [
+                        "section_id", "section_title", "source_path",
+                        "order_index", "section_type", "metadata_tags",
+                        "keywords", "summary", "raw_text",
+                    ],
+                },
+            )
+            sections = []
+            for hit in sec_resp.get("hits", {}).get("hits", []):
+                s = hit["_source"]
+                sections.append({
+                    "section_id":   s.get("section_id", hit["_id"]),
+                    "title":        s.get("section_title", ""),
+                    "source_path":  s.get("source_path", source_path),
+                    "order_index":  int(s.get("order_index", 0)),
+                    "section_type": s.get("section_type", "general"),
+                    "metadata_tags": s.get("metadata_tags", []),
+                    "keywords":     s.get("keywords", []),
+                    "summary":      s.get("summary", ""),
+                    "raw_text":     s.get("raw_text", ""),
+                    "masked_text":  s.get("raw_text", ""),  # redaction not re-applied
+                })
+
+            return {
+                "doc_id":         doc_id,
+                "title":          doc_src.get("title", ""),
+                "source_path":    doc_src.get("source_path", source_path),
+                "summary":        doc_src.get("summary", ""),
+                "version":        doc_src.get("version", ""),
+                "effective_date": doc_src.get("effective_date", ""),
+                "document_type":  doc_src.get("document_type", "document"),
+                "metadata_tags":  doc_src.get("metadata_tags", []),
+                "audiences":      doc_src.get("audiences", []),
+                "keywords":       doc_src.get("keywords", []),
+                "sections":       sections,
+            }
+        except Exception as exc:
+            logger.warning("get_cached_document failed for '%s': %s", source_path, exc)
+            return None
+
+    def count_documents(self) -> int:
+        """Return total number of documents in the documents index."""
+        try:
+            resp = self.client.count(
+                index=self._documents_index,
+                body={"query": {"match_all": {}}},
+            )
+            return int(resp.get("count", 0))
+        except Exception:
+            return 0
+
+    def count_sections(self) -> int:
+        """Return total number of sections in the sections index."""
+        try:
+            resp = self.client.count(
+                index=self._sections_index,
+                body={"query": {"match_all": {}}},
+            )
+            return int(resp.get("count", 0))
+        except Exception:
+            return 0
+
     def document_indexed_for_path(self, source_path: str) -> bool:
         """Return True if a document with this source_path exists in the documents index."""
         try:
@@ -314,6 +400,85 @@ class OpenSearchVectorStore(VectorStore):
                 )
             )
         return results
+
+    # ── Document search (Google-style) ───────────────────────────────────────
+
+    def search_documents(
+        self,
+        query_text: str,
+        user_id: str,
+        page: int = 1,
+        size: int = 10,
+    ) -> dict:
+        """Multi-field full-text search grouped by document.
+
+        Fetches the top N * 8 section hits, deduplicates by doc_id keeping the
+        highest-scoring section per document, then paginates the grouped list.
+        The summary field is preferred for the snippet (concise, clean); raw_text
+        is the fallback.
+        """
+        fetch_size = min(size * 8, 200)
+        must_clause: dict = {
+            "multi_match": {
+                "query": query_text,
+                "fields": [
+                    "section_title^4",
+                    "document_title^3",
+                    "keywords^3",
+                    "summary^2",
+                    "raw_text^1",
+                ],
+                "type": "best_fields",
+                "fuzziness": "AUTO",
+                "operator": "or",
+            }
+        }
+        body: dict[str, Any] = {
+            "size": fetch_size,
+            "query": must_clause,
+            "_source": [
+                "doc_id", "document_title", "section_title",
+                "summary", "raw_text", "source_path", "order_index",
+            ],
+        }
+        if user_id:
+            body["query"] = {
+                "bool": {
+                    "must": must_clause,
+                    "filter": [{"terms": {"user_ids": [user_id]}}],
+                }
+            }
+
+        resp = self.client.search(index=self._sections_index, body=body)
+        hits = resp.get("hits", {}).get("hits", [])
+
+        # One result per document — keep the highest-scoring section.
+        seen: dict[str, dict] = {}
+        for hit in hits:
+            src = hit.get("_source", {})
+            doc_id = src.get("doc_id", hit["_id"])
+            if doc_id in seen:
+                continue
+            text = src.get("summary") or src.get("raw_text", "")
+            snippet = text[:240].rstrip() + ("\u2026" if len(text) > 240 else "")
+            seen[doc_id] = {
+                "document_title": src.get("document_title", ""),
+                "section_title":  src.get("section_title", ""),
+                "snippet":        snippet,
+                "source_path":    src.get("source_path", ""),
+                "section_index":  int(src.get("order_index", 0)),
+                "score":          round(float(hit.get("_score") or 0.0), 4),
+            }
+
+        all_results = list(seen.values())
+        total = len(all_results)
+        from_offset = (page - 1) * size
+        return {
+            "total":   total,
+            "page":    page,
+            "size":    size,
+            "results": all_results[from_offset: from_offset + size],
+        }
 
     # ── Search strategies ─────────────────────────────────────────────────────
 

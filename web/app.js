@@ -1,3 +1,7 @@
+// Read user_id from URL query params once at startup (?user_id=xxx).
+// Falls back to empty string — cookie-based auth is handled server-side.
+const _urlUserId = new URLSearchParams(window.location.search).get("user_id") || "";
+
 const state = {
     health: null,
     domain: null,
@@ -8,10 +12,27 @@ const state = {
     uiError: "",
     pollHandle: null,
     healthRequestInFlight: false,
+    userId: _urlUserId,
+    mode: "chat",   // "chat" | "search"
+    search: {
+        query: "",
+        results: [],
+        total: 0,
+        page: 1,
+        size: 10,
+        loading: false,
+    },
 };
 
 const elements = {
     threadList: document.getElementById("thread-list"),
+    chatModeBtn: document.getElementById("chat-mode-btn"),
+    searchModeBtn: document.getElementById("search-mode-btn"),
+    searchPanel: document.getElementById("search-panel"),
+    searchForm: document.getElementById("search-form"),
+    searchInput: document.getElementById("search-input"),
+    searchResults: document.getElementById("search-results"),
+    searchPagination: document.getElementById("search-pagination"),
     chatTitle: document.getElementById("chat-title"),
     assistantLabel: document.getElementById("assistant-label"),
     heroEyebrow: document.getElementById("hero-eyebrow"),
@@ -166,19 +187,22 @@ function setStatus(health) {
     const progress = health?.progress || {};
     const totalFiles = progress.total_files || 0;
     const processedFiles = progress.processed_files || 0;
+    const isIngesting = health?.ingesting === true;
     const percent = status === "ready"
-        ? 100
+        ? (isIngesting ? Math.max(0, Math.min(Number(progress.percent || 0), 99)) : 100)
         : Math.max(0, Math.min(Number(progress.percent || 0), 100));
 
-    elements.statusPill.textContent = status.replaceAll("_", " ");
+    elements.statusPill.textContent = isIngesting ? "indexing" : status.replaceAll("_", " ");
     elements.statusPill.className = `status-pill status-${status}`;
     elements.progressBar.style.width = `${percent}%`;
 
     if (status === "ready") {
         elements.statusMeta.textContent = `${health.document_count} documents indexed from ${health.document_folder}`;
-        elements.progressCopy.textContent = totalFiles
-            ? `${processedFiles}/${totalFiles} policy files completed.`
-            : "Policy index is ready.";
+        elements.progressCopy.textContent = isIngesting && totalFiles
+            ? `Indexing in background: ${processedFiles}/${totalFiles} files…`
+            : totalFiles
+                ? `${processedFiles}/${totalFiles} policy files completed.`
+                : "Policy index is ready.";
         return;
     }
 
@@ -449,11 +473,33 @@ function render() {
     setStatus(state.health);
     renderThreadList();
     renderHeader();
-    renderMessages();
+    renderMode();
     renderCorpusSummary();
 }
 
+function renderMode() {
+    const isSearch = state.mode === "search";
+
+    elements.chatModeBtn.classList.toggle("active", !isSearch);
+    elements.searchModeBtn.classList.toggle("active", isSearch);
+
+    elements.messages.classList.toggle("hidden", isSearch);
+    elements.composerForm.classList.toggle("hidden", isSearch);
+    elements.searchPanel.classList.toggle("hidden", !isSearch);
+
+    if (isSearch) {
+        elements.hero.classList.add("hidden");
+    } else {
+        renderMessages();
+    }
+}
+
 async function fetchJson(url, options = {}) {
+    // Automatically append user_id query param when sourced from URL.
+    if (state.userId) {
+        const sep = url.includes("?") ? "&" : "?";
+        url = `${url}${sep}user_id=${encodeURIComponent(state.userId)}`;
+    }
     const response = await fetch(url, {
         headers: {
             "Content-Type": "application/json",
@@ -627,6 +673,7 @@ async function bootstrap() {
     await pollHealth();
 }
 
+
 elements.composerInput.addEventListener("input", autosizeComposer);
 elements.composerInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -640,7 +687,101 @@ elements.composerForm.addEventListener("submit", (event) => {
     sendMessage();
 });
 
-elements.newChatButton.addEventListener("click", createThread);
+elements.newChatButton.addEventListener("click", () => {
+    state.mode = "chat";
+    createThread();
+});
+
+// ── Search ────────────────────────────────────────────────────────────────
+
+function renderSearchResults() {
+    const { results, total, page, size, loading, query } = state.search;
+
+    if (loading) {
+        elements.searchResults.innerHTML = '<p class="search-empty">Searching…</p>';
+        elements.searchPagination.classList.add("hidden");
+        return;
+    }
+    if (!query) {
+        elements.searchResults.innerHTML = "";
+        elements.searchPagination.classList.add("hidden");
+        return;
+    }
+    if (!results.length) {
+        elements.searchResults.innerHTML = `<p class="search-empty">No documents found for "${escapeHtml(query)}".</p>`;
+        elements.searchPagination.classList.add("hidden");
+        return;
+    }
+
+    elements.searchResults.innerHTML = results.map((r) => `
+        <a class="search-result-card" href="${escapeHtml(r.document_url)}" target="_blank" rel="noreferrer noopener">
+            <p class="search-result-title">${escapeHtml(r.document_title)}</p>
+            ${r.section_title ? `<p class="search-result-section">${escapeHtml(r.section_title)}</p>` : ""}
+            <p class="search-result-snippet">${escapeHtml(r.snippet)}</p>
+        </a>
+    `).join("");
+
+    const totalPages = Math.ceil(total / size);
+    const from = (page - 1) * size + 1;
+    const to = Math.min(page * size, total);
+
+    if (totalPages > 1) {
+        elements.searchPagination.classList.remove("hidden");
+        elements.searchPagination.innerHTML = `
+            <button class="pagination-btn" id="search-prev-btn" ${page <= 1 ? "disabled" : ""}>&larr; Prev</button>
+            <span class="search-pagination-info">${from}–${to} of ${total} documents</span>
+            <button class="pagination-btn" id="search-next-btn" ${page >= totalPages ? "disabled" : ""}>Next &rarr;</button>
+        `;
+        document.getElementById("search-prev-btn")?.addEventListener("click", () => runSearch(page - 1));
+        document.getElementById("search-next-btn")?.addEventListener("click", () => runSearch(page + 1));
+    } else {
+        elements.searchPagination.classList.toggle("hidden", total === 0);
+        if (total > 0) {
+            elements.searchPagination.innerHTML = `<span class="search-pagination-info">${total} document${total !== 1 ? "s" : ""} found</span>`;
+        }
+    }
+}
+
+async function runSearch(page = 1) {
+    const q = elements.searchInput.value.trim();
+    if (!q) return;
+
+    state.search.query = q;
+    state.search.page = page;
+    state.search.loading = true;
+    renderSearchResults();
+
+    try {
+        const params = new URLSearchParams({ q, page, size: state.search.size });
+        const data = await fetchJson(`/api/search?${params}`);
+        state.search.results = data.results;
+        state.search.total = data.total;
+        state.search.page = data.page;
+    } catch (err) {
+        state.search.results = [];
+        state.search.total = 0;
+        elements.searchResults.innerHTML = `<p class="search-empty">Search failed: ${escapeHtml(err.message)}</p>`;
+    } finally {
+        state.search.loading = false;
+        renderSearchResults();
+    }
+}
+
+elements.chatModeBtn.addEventListener("click", () => {
+    state.mode = "chat";
+    render();
+});
+
+elements.searchModeBtn.addEventListener("click", () => {
+    state.mode = "search";
+    render();
+    elements.searchInput.focus();
+});
+
+elements.searchForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    runSearch(1);
+});
 elements.resetChatButton.addEventListener("click", resetActiveThread);
 
 
