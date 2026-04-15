@@ -7,11 +7,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from policygpt.config import Config
-from policygpt.core.document_links import build_document_open_url, build_document_view_url
+from policygpt.core.document_links import build_document_open_url
 from policygpt.api.renderers.document_viewer import DocumentViewerRenderer
 from policygpt.api.runtime import ServerRuntime
 from policygpt.api.renderers.ui import WebUIRenderer
-from policygpt.extraction.file_extractor import FileExtractor
 from policygpt.models import ThreadState
 
 
@@ -34,7 +33,6 @@ class PolicyApiServer:
         self.runtime = ServerRuntime(config)
         self.ui_renderer = WebUIRenderer(web_dir)
         self.document_viewer = DocumentViewerRenderer(web_dir)
-        self.extractor = FileExtractor(config)
 
     def build_app(self) -> FastAPI:
         @asynccontextmanager
@@ -144,11 +142,9 @@ class PolicyApiServer:
                 "section_title":  r["section_title"],
                 "snippet":        r["snippet"],
                 "score":          r["score"],
-                "document_url": build_document_view_url(
+                "document_url": build_document_open_url(
                     self.config.public_base_url,
-                    source_path=r["source_path"],
-                    section_index=r["section_index"],
-                    section_title=r["section_title"],
+                    r["source_path"],
                 ),
             }
             for r in raw["results"]
@@ -240,44 +236,23 @@ class PolicyApiServer:
         section_title: str = "",
     ) -> HTMLResponse:
         requested_path = self._resolve_document_path(path)
-        document_title, sections = self._load_document_sections(requested_path)
-        normalized_sections = [
-            {
-                "dom_id": f"section-{index}",
-                "title": item["title"],
-                "text": item["text"],
-                "order_index": item["order_index"],
-            }
-            for index, item in enumerate(sections)
-        ]
+        document_title = self._get_document_title(requested_path)
+        open_url = build_document_open_url("", str(requested_path))
 
-        target_dom_id = normalized_sections[0]["dom_id"] if normalized_sections else ""
-        target_title = normalized_sections[0]["title"] if normalized_sections else ""
-
-        if normalized_sections:
-            matched_section = None
-            if section_index is not None:
-                matched_section = next(
-                    (item for item in normalized_sections if item["order_index"] == section_index),
-                    None,
-                )
-            if matched_section is None and section_title.strip():
-                normalized_title = section_title.strip().casefold()
-                matched_section = next(
-                    (item for item in normalized_sections if str(item["title"]).strip().casefold() == normalized_title),
-                    None,
-                )
-            if matched_section is not None:
-                target_dom_id = str(matched_section["dom_id"])
-                target_title = str(matched_section["title"])
+        # For HTML files, use a text fragment so the browser scrolls to and
+        # highlights the matched section text inside the original document.
+        iframe_url = open_url
+        if requested_path.suffix.lower() in {".html", ".htm"} and section_title.strip():
+            from urllib.parse import quote as _quote
+            fragment = _quote(section_title.strip()[:120], safe="")
+            iframe_url = f"{open_url}#:~:text={fragment}"
 
         html = self.document_viewer.render(
             document_title=document_title,
             source_path=str(requested_path),
-            sections=normalized_sections,
-            target_section_id=target_dom_id,
-            target_section_title=target_title or section_title or "Matched section",
-            open_url=build_document_open_url("", str(requested_path)),
+            open_url=open_url,
+            iframe_url=iframe_url,
+            target_section_title=section_title,
         )
         return HTMLResponse(html)
 
@@ -299,19 +274,20 @@ class PolicyApiServer:
 
     @staticmethod
     def serialize_source(source) -> dict:
+        if hasattr(source, "source_path"):
+            title = source.document_title
+            path = source.source_path
+        else:
+            title = source.get("document_title", "")
+            path = source.get("source_path", "")
+        # Normalise separators so the URL is consistent regardless of how the
+        # path was stored (mixed slashes are common on Windows).
+        norm_path = path.replace("\\", "/") if path else ""
         return {
-            "document_title": source.document_title,
-            "section_title": source.section_title,
-            "section_order_index": source.section_order_index,
-            "source_path": source.source_path,
-            "file_name": Path(source.source_path).name,
-            "score": round(source.score, 4),
-            "document_url": build_document_view_url(
-                "",
-                source_path=source.source_path,
-                section_index=source.section_order_index,
-                section_title=source.section_title,
-            ),
+            "document_title": title,
+            "source_path": norm_path,
+            "file_name": Path(path).name if path else "",
+            "document_url": build_document_open_url("", norm_path) if norm_path else "",
         }
 
     def serialize_thread_summary(self, thread) -> dict:
@@ -326,10 +302,19 @@ class PolicyApiServer:
         }
 
     def serialize_thread_detail(self, thread) -> dict:
+        seen_paths: set[str] = set()
+        unique_sources = []
+        for source in thread.last_answer_sources:
+            path = source.source_path if hasattr(source, "source_path") else source.get("source_path", "")
+            # Normalize for case-insensitive / separator-agnostic dedup on Windows
+            dedup_key = path.lower().replace("\\", "/") if path else ""
+            if dedup_key and dedup_key not in seen_paths:
+                seen_paths.add(dedup_key)
+                unique_sources.append(source)
         return {
             **self.serialize_thread_summary(thread),
             "messages": [self.serialize_message(message) for message in thread.display_messages],
-            "sources": [self.serialize_source(source) for source in thread.last_answer_sources],
+            "sources": [self.serialize_source(s) for s in unique_sources],
             "conversation_summary": thread.conversation_summary,
         }
 
@@ -347,32 +332,11 @@ class PolicyApiServer:
 
         return requested_path
 
-    def _load_document_sections(self, requested_path: Path) -> tuple[str, list[dict[str, object]]]:
+    def _get_document_title(self, requested_path: Path) -> str:
         with self.runtime.lock:
             bot = self.runtime.bot
             if bot is not None:
                 for document in bot.documents.values():
-                    if Path(document.source_path).resolve() != requested_path:
-                        continue
-                    return (
-                        document.title,
-                        [
-                            {
-                                "title": section.title,
-                                "text": section.raw_text,
-                                "order_index": section.order_index,
-                            }
-                            for section in document.sections
-                        ],
-                    )
-
-        title, extracted_sections = self.extractor.extract(str(requested_path))
-        sections = [
-            {
-                "title": section_title,
-                "text": section_text,
-                "order_index": index,
-            }
-            for index, (section_title, section_text) in enumerate(extracted_sections)
-        ]
-        return title, sections
+                    if Path(document.source_path).resolve() == requested_path:
+                        return document.title
+        return requested_path.stem.replace("_", " ")

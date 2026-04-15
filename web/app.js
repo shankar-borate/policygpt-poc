@@ -291,24 +291,13 @@ function renderRelatedQuestions(questions) {
 function renderSources(sources) {
     if (!sources || sources.length === 0) return "";
 
-    const seen = new Set();
-    const unique = sources.filter((s) => {
-        if (seen.has(s.document_url)) return false;
-        seen.add(s.document_url);
-        return true;
-    });
-
-    const chips = unique.map((src) => {
-        const sectionWords = (src.section_title || "").trim().split(/\s+/).filter(Boolean);
-        const isGeneric = sectionWords.length === 0 || src.section_title.toLowerCase() === "introduction";
-        const shortLabel = isGeneric
-            ? src.file_name.replace(/\.[^/.]+$/, "")
-            : sectionWords.slice(0, 4).join(" ") + (sectionWords.length > 4 ? "\u2026" : "");
-        const tooltip = src.section_title && !isGeneric
-            ? `${src.document_title} \u203a ${src.section_title}`
-            : src.document_title;
-
-        return `<a class="source-chip" href="${escapeHtml(src.document_url)}" target="_blank" rel="noreferrer noopener" data-tooltip="${escapeHtml(tooltip)}">${escapeHtml(shortLabel)}</a>`;
+    const chips = sources.map((src) => {
+        const fileName = (src.file_name || "").replace(/\.[^/.]+$/, "");
+        const label = fileName || src.document_title || "Policy";
+        const tooltip = src.document_title && src.document_title !== label
+            ? `${src.document_title} (${fileName})`
+            : label;
+        return `<a class="source-chip" href="${escapeHtml(src.document_url)}" target="_blank" rel="noreferrer noopener" data-tooltip="${escapeHtml(tooltip)}">${escapeHtml(label)}</a>`;
     });
 
     return `<div class="source-refs"><span class="source-refs-label">Sources</span><div class="source-chips">${chips.join("")}</div></div>`;

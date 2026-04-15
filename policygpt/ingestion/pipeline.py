@@ -28,6 +28,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from policygpt.ingestion.extractors.registry import ExtractorRegistry
 from policygpt.ingestion.readers.base import IngestMessage, Reader
+from policygpt.ingestion.rewriter.policy_rewriter import PolicyRewriter
 
 if TYPE_CHECKING:
     from policygpt.core.corpus import DocumentCorpus
@@ -68,12 +69,14 @@ class IngestionPipeline:
         extractor_registry: ExtractorRegistry,
         default_user_ids: list[str] | None = None,
         default_domain: str = "",
+        rewriter: PolicyRewriter | None = None,
     ) -> None:
         self._corpus = corpus
         self._reader = reader
         self._registry = extractor_registry
         self._default_user_ids = default_user_ids or []
         self._default_domain = default_domain
+        self._rewriter = rewriter
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -87,12 +90,31 @@ class IngestionPipeline:
     ) -> "IngestionPipeline":
         """Convenience factory that builds the ExtractorRegistry from corpus config."""
         registry = ExtractorRegistry(corpus.config)
+
+        # Build rewriter only when rewrite_policies_enabled=True (ingestion config).
+        # rewrite_save_to_disk (debug/log config) controls whether the improved
+        # HTML is persisted to {debug_log_dir}/improved/ or kept in-memory only.
+        rewriter: PolicyRewriter | None = None
+        if corpus.config.rewrite_policies_enabled:
+            debug_log_dir = (corpus.config.debug_log_dir or "").strip()
+            save_to_disk  = corpus.config.rewrite_save_to_disk and bool(debug_log_dir)
+            output_dir    = Path(debug_log_dir) / "improved" if save_to_disk else None
+            rewriter = PolicyRewriter(
+                output_dir=output_dir,
+                save_to_disk=save_to_disk,
+            )
+            logger.info(
+                "PolicyRewriter enabled — save_to_disk=%s output=%s",
+                save_to_disk, output_dir,
+            )
+
         return cls(
             corpus=corpus,
             reader=reader,
             extractor_registry=registry,
             default_user_ids=default_user_ids,
             default_domain=default_domain,
+            rewriter=rewriter,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -169,6 +191,18 @@ class IngestionPipeline:
             reason = f"no extractor for content_type={message.content_type!r}"
             logger.debug("Skipping %s: %s", message.source_path, reason)
             return ("skipped", reason)
+
+        # ── Step 1: Rewrite HTML for PolicyGPT optimisation ──────────────────
+        # Adds metadata block, TOC, overview, roles table, regulatory tags,
+        # and related policies — all as yellow additions around verbatim text.
+        # Saves improved file to {debug_log_dir}/improved/{filename}.
+        # Falls back silently to original path if anything fails.
+        if self._rewriter is not None and message.content_type == "html":
+            improved_path, improved_content = self._rewriter.rewrite(message.source_path)
+            message.content = improved_content          # always use rewritten content
+            if improved_path != message.source_path:
+                message.source_path = improved_path    # update path only when saved to disk
+            logger.debug("PolicyRewriter: applied to %s", message.file_name)
 
         user_ids: list[str] = message.user_ids or self._default_user_ids
         domain: str = message.domain or self._default_domain

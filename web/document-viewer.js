@@ -39,8 +39,44 @@
         });
     }
 
+    function bindTabBar() {
+        const tabs = document.querySelectorAll(".document-viewer-tab[data-tab]");
+        if (!tabs.length) {
+            return;
+        }
+
+        tabs.forEach((tab) => {
+            tab.addEventListener("click", () => {
+                const targetTab = tab.getAttribute("data-tab");
+
+                // Update tab buttons
+                tabs.forEach((t) => {
+                    const active = t.getAttribute("data-tab") === targetTab;
+                    t.classList.toggle("is-active", active);
+                    t.setAttribute("aria-selected", String(active));
+                });
+
+                // Show / hide panels
+                const sectionsPanel = document.getElementById("tab-panel-sections");
+                const originalPanel = document.getElementById("tab-panel-original");
+                const banner = document.getElementById("viewer-banner");
+
+                if (targetTab === "original") {
+                    if (sectionsPanel) sectionsPanel.hidden = true;
+                    if (originalPanel) originalPanel.hidden = false;
+                    if (banner) banner.hidden = true;
+                } else {
+                    if (sectionsPanel) sectionsPanel.hidden = false;
+                    if (originalPanel) originalPanel.hidden = true;
+                    if (banner) banner.hidden = false;
+                }
+            });
+        });
+    }
+
     function bootstrapViewer() {
         bindTocLinks();
+        bindTabBar();
         const payload = document.body.dataset.target;
         if (!payload) {
             return;

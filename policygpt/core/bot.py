@@ -10,7 +10,7 @@ import numpy as np
 from policygpt.config import Config
 from policygpt.core.conversations import ConversationManager
 from policygpt.core.corpus import DocumentCorpus, ProgressCallback
-from policygpt.core.document_links import build_document_view_url
+from policygpt.core.document_links import build_document_open_url
 from policygpt.models import ChatResult, Message, SourceReference
 from policygpt.models import utc_now_iso
 from policygpt.core.ai.base import AIService
@@ -175,6 +175,7 @@ class PolicyGPTBot:
                     thread.recent_messages.append(
                         Message(role="assistant", content=self._compact_history_message(cached_answer))
                     )
+                    thread.last_answer_sources = cached_sources
                     thread.updated_at = utc_now_iso()
                     return ChatResult(thread_id=thread_id, answer=cached_answer, sources=cached_sources)
 
@@ -217,16 +218,23 @@ class PolicyGPTBot:
                 )
                 top_docs = self._merge_retrieved_documents(top_docs, top_sections)
 
-                sources = [
-                    SourceReference(
+                # One SourceReference per document (highest-scoring section wins).
+                # top_sections is already sorted by score descending so the first
+                # occurrence of each source_path is the best match.
+                _seen_doc_paths: set[str] = set()
+                sources = []
+                for section, score in top_sections:
+                    _key = section.source_path.lower().replace("\\", "/")
+                    if _key in _seen_doc_paths:
+                        continue
+                    _seen_doc_paths.add(_key)
+                    sources.append(SourceReference(
                         document_title=self.documents[section.doc_id].title,
                         section_title=section.title,
                         source_path=section.source_path,
                         score=score,
                         section_order_index=section.order_index,
-                    )
-                    for section, score in top_sections
-                ]
+                    ))
                 # Drop very low-scoring sources that barely contributed — keeps
                 # the reference list focused on genuinely relevant sections.
                 if len(sources) > 1:
@@ -527,6 +535,7 @@ class PolicyGPTBot:
         sub_contexts: list[str] = []
         all_sources: list[SourceReference] = []
         seen_section_ids: set[str] = set()
+        seen_doc_paths: set[str] = set()
 
         for sub_q in sub_questions:
             sub_analysis = self.query_analyzer.analyze(
@@ -552,6 +561,10 @@ class PolicyGPTBot:
                 if section.section_id in seen_section_ids:
                     continue
                 seen_section_ids.add(section.section_id)
+                _doc_key = section.source_path.lower().replace("\\", "/")
+                if _doc_key in seen_doc_paths:
+                    continue
+                seen_doc_paths.add(_doc_key)
                 all_sources.append(SourceReference(
                     document_title=self.documents[section.doc_id].title,
                     section_title=section.title,
@@ -940,21 +953,12 @@ class PolicyGPTBot:
         reference_links: list[str] = []
         seen: set[str] = set()
         for source in sources:
-            file_name = Path(source.source_path).name
-            if not file_name:
+            source_path = source.source_path
+            if not source_path or source_path in seen:
                 continue
-            section_title = self._derive_thread_title(source.section_title, limit=48)
-            label = file_name if not section_title or section_title.casefold() == "introduction" else f"{file_name} | {section_title}"
-            url = build_document_view_url(
-                self.config.public_base_url,
-                source_path=source.source_path,
-                section_index=source.section_order_index,
-                section_title=source.section_title,
-            )
-            dedupe_key = f"{label}|{url}"
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
+            seen.add(source_path)
+            label = source.document_title or Path(source_path).stem
+            url = build_document_open_url(self.config.public_base_url, source_path)
             reference_links.append(f"[{label}]({url})")
 
         if not reference_links:

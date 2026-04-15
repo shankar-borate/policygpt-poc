@@ -470,6 +470,7 @@ class FileExtractor:
         sections: list[tuple[str, str]] = []
         current_title = "Introduction"
         current_parts: list[str] = []
+        heading_seen = False
 
         def flush() -> None:
             nonlocal current_parts
@@ -482,6 +483,7 @@ class FileExtractor:
             if tag.startswith("h"):
                 flush()
                 current_title = text[:200]
+                heading_seen = True
             elif tag == "table":
                 flush()
                 sections.append((current_title, self.clean_whitespace(text)))
@@ -489,6 +491,15 @@ class FileExtractor:
                 current_parts.append(text)
 
         flush()
+
+        # When no heading tags exist, all sections fall back to the default
+        # "Introduction" title which is confusing in the sidebar.  Derive a
+        # meaningful title from the first line of each section's text instead.
+        if not heading_seen and len(sections) > 1:
+            sections = [
+                (self._derive_section_title_from_content(text), text)
+                for _, text in sections
+            ]
 
         if len(sections) == 1:
             title, text = sections[0]
@@ -515,6 +526,23 @@ class FileExtractor:
                 )
 
         return final_sections
+
+    @staticmethod
+    def _derive_section_title_from_content(text: str) -> str:
+        """Derive a section title from content when the document has no heading tags."""
+        first_line = text.split("\n")[0].strip()
+        if not first_line:
+            return "Introduction"
+        # Table format: "Key | Value | Key | Value" — second cell is typically the value
+        if " | " in first_line:
+            cells = [c.strip() for c in first_line.split(" | ") if c.strip()]
+            candidate = cells[1] if len(cells) > 1 else cells[0]
+            if candidate and len(candidate) <= 150:
+                return candidate
+        # Plain text — use first line if short enough to be a title
+        if len(first_line) <= 150:
+            return first_line
+        return "Introduction"
 
     def _split_large_text_into_synthetic_sections(
         self,

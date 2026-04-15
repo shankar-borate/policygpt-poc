@@ -571,6 +571,9 @@ button {
     margin-top: 16px;
     padding-top: 14px;
     border-top: 1px solid var(--border);
+    /* Prevent tooltip overflow from creating a horizontal scrollbar,
+       which would trigger a reflow-vibration loop on chips near the right edge. */
+    overflow-x: clip;
 }
 
 .source-refs-label {
@@ -587,6 +590,7 @@ button {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+    overflow: visible; /* tooltips escape the box; scrollbar suppressed on parent */
 }
 
 .source-chip {
@@ -609,8 +613,7 @@ button {
     transition:
         background-color 140ms ease,
         border-color 140ms ease,
-        box-shadow 140ms ease,
-        transform 140ms ease;
+        box-shadow 140ms ease;
 }
 
 .source-chip::before {
@@ -622,11 +625,7 @@ button {
 .source-chip:hover {
     background: #e8f5f1;
     border-color: rgba(16, 163, 127, 0.35);
-    box-shadow: 0 2px 8px rgba(16, 163, 127, 0.15);
-    transform: translateY(-1px);
-    max-width: none;
-    overflow: visible;
-    text-overflow: unset;
+    box-shadow: 0 4px 12px rgba(16, 163, 127, 0.18);
     z-index: 10;
 }
 
@@ -658,6 +657,13 @@ button {
 .source-chip:hover::after {
     opacity: 1;
     transform: translateY(0);
+}
+
+/* Last chip in a row sits near the right edge — anchor tooltip from the right
+   so it doesn't overflow the container and cause a reflow/vibration loop. */
+.source-chips .source-chip:last-child::after {
+    left: auto;
+    right: 0;
 }
 
 .typing-indicator {

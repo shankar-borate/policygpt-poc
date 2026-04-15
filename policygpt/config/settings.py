@@ -61,6 +61,10 @@ class Config:
     # ── Debug / observability ─────────────────────────────────────────────────
     debug_log_dir: str = r"D:\policy-mgmt\data\test\metadata"
     debug: bool = True
+    # When True, the rewritten HTML is saved to {debug_log_dir}/improved/
+    # so it can be inspected and is cached for subsequent re-ingestions.
+    # When False, the rewrite runs in-memory only — no files are written.
+    rewrite_save_to_disk: bool = True
 
     # ── Supplementary context ─────────────────────────────────────────────────
     # Path to a plain-text file with extra facts (e.g. business rules) injected
@@ -97,6 +101,14 @@ class Config:
     ocr_enabled: bool = False
     ocr_provider: str = "textract"   # only "textract" supported today
     ocr_min_confidence: float = 80.0  # Textract LINE block confidence threshold (0–100)
+
+    # ── Ingestion: policy rewriting ───────────────────────────────────────────
+    # Master switch — pre-processes HTML before extraction.
+    # Adds metadata block, TOC, overview, roles table, regulatory tags, and
+    # related policies as yellow additions around the verbatim policy text.
+    # Does NOT change any original legal language.
+    # Set False to skip rewriting entirely and ingest the source file as-is.
+    rewrite_policies_enabled: bool = True
 
     # ── Ingestion: FAQ generation ─────────────────────────────────────────────
     generate_faq: bool = True

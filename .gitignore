@@ -20,6 +20,15 @@ tests/results/
 artifacts/
 metadata/
 
+# Generated reports — may contain extracted secrets from policy documents
+PolicyGPT_*.csv
+PolicyGPT_*.html
+*.pptx
+~$*.pptx
+
+# Claude Code personal settings
+.claude/
+
 # IDE
 .vscode/
 .idea/
