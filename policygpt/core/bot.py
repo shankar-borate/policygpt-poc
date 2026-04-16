@@ -243,6 +243,8 @@ class PolicyGPTBot:
                     sources = [s for s in sources if s.score >= min_src] or sources[:1]
 
                 is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
+                if not is_answerable:
+                    sources = []
                 if is_answerable:
                     prompt_payload = self._build_answer_context(
                         thread=thread,
