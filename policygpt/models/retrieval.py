@@ -8,6 +8,7 @@ class SourceReference:
     source_path: str
     score: float
     section_order_index: int = 0
+    original_source_path: str = ""
 
 
 @dataclass

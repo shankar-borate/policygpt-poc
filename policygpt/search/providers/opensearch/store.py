@@ -106,10 +106,11 @@ class OpenSearchVectorStore(VectorStore):
                 "metadata_tags":  document.metadata_tags,
                 "audiences":      document.audiences,
                 "keywords":       document.keywords,
-                "source_path":    document.source_path,
-                "summary":        document.summary,
-                "user_ids":       str_user_ids,
-                "domain":         domain,
+                "source_path":          document.source_path,
+                "original_source_path": document.original_source_path,
+                "summary":              document.summary,
+                "user_ids":             str_user_ids,
+                "domain":               domain,
             },
         )
         for section in document.sections:
@@ -200,17 +201,18 @@ class OpenSearchVectorStore(VectorStore):
                 })
 
             return {
-                "doc_id":         doc_id,
-                "title":          doc_src.get("title", ""),
-                "source_path":    doc_src.get("source_path", source_path),
-                "summary":        doc_src.get("summary", ""),
-                "version":        doc_src.get("version", ""),
-                "effective_date": doc_src.get("effective_date", ""),
-                "document_type":  doc_src.get("document_type", "document"),
-                "metadata_tags":  doc_src.get("metadata_tags", []),
-                "audiences":      doc_src.get("audiences", []),
-                "keywords":       doc_src.get("keywords", []),
-                "sections":       sections,
+                "doc_id":                doc_id,
+                "title":                 doc_src.get("title", ""),
+                "source_path":           doc_src.get("source_path", source_path),
+                "original_source_path":  doc_src.get("original_source_path", ""),
+                "summary":               doc_src.get("summary", ""),
+                "version":               doc_src.get("version", ""),
+                "effective_date":        doc_src.get("effective_date", ""),
+                "document_type":         doc_src.get("document_type", "document"),
+                "metadata_tags":         doc_src.get("metadata_tags", []),
+                "audiences":             doc_src.get("audiences", []),
+                "keywords":              doc_src.get("keywords", []),
+                "sections":              sections,
             }
         except Exception as exc:
             logger.warning("get_cached_document failed for '%s': %s", source_path, exc)

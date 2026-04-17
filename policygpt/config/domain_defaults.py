@@ -22,6 +22,11 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         # has room to give complete, well-structured answers.
         "chat_max_output_tokens": 5400,
 
+        # Policy folders often contain PDFs, PPTX decks, and Word docs alongside
+        # HTML files — convert them all to HTML so the table-aware extractor
+        # handles structured content correctly.
+        "to_html_enabled": True,
+
         # Policy HTML documents frequently contain scanned images, org charts,
         # and approval matrices — OCR these so their text is searchable.
         "ocr_enabled": True,
@@ -39,6 +44,19 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         # timelines.  A moderate budget is sufficient.
         "chat_max_output_tokens": 2700,
 
+        # Contest documents are PDFs (and may include PPTX/DOCX) — convert to
+        # HTML first so the table-aware extractor can parse reward slabs and
+        # eligibility criteria as structured rows/columns.
+        # Converted files go to {debug_log_dir}/html/.
+        "to_html_enabled": True,
+
+        # After PDF→HTML conversion the PolicyRewriter runs to add metadata
+        # block, classification banner, and TOC.  ISO/RBI regulatory tags are
+        # not injected (no matching keywords in contest docs) but the structural
+        # additions still improve search quality.  Files saved to
+        # {debug_log_dir}/improved/ and cached for subsequent re-ingestions.
+        "rewrite_policies_enabled": True,
+
         # Contest documents also embed reward tables and eligibility charts
         # as images — OCR them for complete coverage.
         "ocr_enabled": True,
@@ -49,5 +67,37 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         "hybrid_keyword_weight": 0.20,
         "hybrid_similarity_weight": 0.15,
         "hybrid_vector_weight": 0.65,
+    },
+    "product_technical": {
+        # Technical answers often include multi-step procedures, architecture
+        # descriptions, and configuration tables — allow a generous output budget.
+        "chat_max_output_tokens": 5400,
+
+        # Source documents include PDFs (design docs), PPTX (architecture decks),
+        # DOCX (runbooks) — convert them all to HTML so the table-aware extractor
+        # handles structured content correctly.
+        "to_html_enabled": True,
+
+        # Per-format conversion flags.
+        # Excel is disabled — infrastructure-sizing workbooks can produce 6 MB+
+        # HTML per sheet which hangs the extractor.  Re-enable once the extractor
+        # handles very large tables efficiently.
+        "pdf_to_html_enabled": True,
+        "docx_to_html_enabled": True,
+        "pptx_to_html_enabled": True,
+        "excel_to_html_enabled": True,
+        "image_to_html_enabled": True,
+
+        # OCR is off by default — enable only when AWS Textract credentials are
+        # available and the documents contain diagrams or screenshots.
+        # "ocr_enabled": True,
+        # "ocr_min_confidence": 75.0,
+
+        # Technical queries use precise terminology (service names, config keys,
+        # CLI flags) — keyword search gets a strong weight to match exact terms
+        # while vector search covers paraphrased or high-level questions.
+        "hybrid_keyword_weight": 0.40,
+        "hybrid_similarity_weight": 0.10,
+        "hybrid_vector_weight": 0.50,
     },
 }

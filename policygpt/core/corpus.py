@@ -196,6 +196,7 @@ class DocumentCorpus:
         total_files: int = 0,
         user_ids: list[str | int] | None = None,
         domain: str = "",
+        original_source_path: str = "",
     ) -> tuple[str, str]:
         path_obj = Path(path)
         file_name = path_obj.name
@@ -228,6 +229,7 @@ class DocumentCorpus:
                     doc_id=cached["doc_id"],
                     title=cached["title"],
                     source_path=cached["source_path"],
+                    original_source_path=cached.get("original_source_path", ""),
                     raw_text="",
                     masked_text="",
                     summary=cached["summary"],
@@ -261,8 +263,17 @@ class DocumentCorpus:
                 self.documents[cached["doc_id"]] = _cached_doc
                 return ("ingested", f"restored from OpenSearch ({len(cached['sections'])} sections)")
 
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        print(f"    [corpus] {file_name} — extracting sections …", flush=True)
         title, sections = self.extractor.extract(path)
         full_text = "\n\n".join(text for _, text in sections).strip()
+        print(
+            f"    [corpus] {file_name} — {len(sections)} section(s) extracted, "
+            f"{len(full_text):,} chars ({_time.perf_counter()-_t0:.1f}s)",
+            flush=True,
+        )
         if not full_text:
             skip_reason = "no extractable text found" if extension == ".pdf" else "skipped empty document"
             self._emit_progress(
@@ -283,6 +294,8 @@ class DocumentCorpus:
             total_files,
             f"{file_name} - summarizing document",
         )
+        print(f"    [corpus] {file_name} — summarizing document …", flush=True)
+        _t = _time.perf_counter()
         document_summary = self._create_document_summary(
             masked_title=masked_title,
             masked_text=masked_full_text,
@@ -291,6 +304,7 @@ class DocumentCorpus:
             total_files=total_files,
             file_name=file_name,
         )
+        print(f"    [corpus] {file_name} — summary done ({_time.perf_counter()-_t:.1f}s)", flush=True)
 
         document_faq = ""
         faq_qa_pairs: list[tuple[str, str]] = []
@@ -302,10 +316,13 @@ class DocumentCorpus:
                 total_files,
                 f"{file_name} - generating FAQ",
             )
+            print(f"    [corpus] {file_name} — generating FAQ …", flush=True)
+            _t = _time.perf_counter()
             document_faq = self._generate_document_faq(
                 masked_title=masked_title,
                 masked_text=masked_full_text,
             )
+            print(f"    [corpus] {file_name} — FAQ done ({_time.perf_counter()-_t:.1f}s)", flush=True)
             if document_faq and self.config.faq_fastpath_enabled:
                 faq_qa_pairs = self._parse_faq_qa_pairs(document_faq)
                 if faq_qa_pairs:
@@ -328,13 +345,18 @@ class DocumentCorpus:
                 total_files,
                 f"{file_name} - extracting entities",
             )
+            print(f"    [corpus] {file_name} — extracting entities …", flush=True)
+            _t = _time.perf_counter()
             document_entity_map = self.entity_extractor.extract(
                 title=masked_title,
                 masked_text=masked_full_text,
                 max_output_tokens=self.config.entity_map_max_output_tokens,
                 char_budget=max(4000, self.config.doc_summary_input_token_budget * 2),
             )
+            print(f"    [corpus] {file_name} — entities done ({_time.perf_counter()-_t:.1f}s)", flush=True)
 
+        print(f"    [corpus] {file_name} — embedding document …", flush=True)
+        _t = _time.perf_counter()
         document_embedding = self._build_enriched_embedding(
             title,
             document_summary,
@@ -342,12 +364,14 @@ class DocumentCorpus:
             faq=document_faq,
             entity_enrichment=document_entity_map.to_enrichment_text(),
         )
+        print(f"    [corpus] {file_name} — doc embedding done ({_time.perf_counter()-_t:.1f}s)", flush=True)
 
         document_id = str(uuid.uuid4())
         document = DocumentRecord(
             doc_id=document_id,
             title=title,
             source_path=path,
+            original_source_path=original_source_path,
             raw_text=full_text,
             masked_text=masked_full_text,
             summary=document_summary,
@@ -377,8 +401,13 @@ class DocumentCorpus:
         valid_sections = [(section_title, section_text) for section_title, section_text in sections if section_text.strip()]
         total_sections = len(valid_sections)
 
+        print(f"    [corpus] {file_name} — processing {total_sections} section(s) …", flush=True)
         for index, (section_title, section_text) in enumerate(valid_sections, start=1):
             section_label = self._format_progress_label(section_title)
+            print(
+                f"    [corpus] {file_name} — section [{index}/{total_sections}]: {section_label[:60]} …",
+                flush=True,
+            )
             self._emit_progress(
                 progress_callback,
                 processed_files,
@@ -758,7 +787,8 @@ class DocumentCorpus:
         if self.config.debug:
             print("\nTop sections:")
             for section, score in results:
-                print(f"  {score:.4f} | {self.documents[section.doc_id].title} :: {section.title}")
+                _doc_title = self.documents[section.doc_id].title if section.doc_id in self.documents else section.source_path
+                print(f"  {score:.4f} | {_doc_title} :: {section.title}")
 
         return results
 

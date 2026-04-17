@@ -46,6 +46,7 @@ class IngestMessage:
     domain: str
     user_ids: list[str]
     metadata: dict = field(default_factory=dict)
+    original_source_path: str = ""   # set by pipeline when source is converted to HTML
 
 
 class Reader(ABC):

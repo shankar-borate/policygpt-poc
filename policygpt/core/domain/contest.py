@@ -124,11 +124,15 @@ PROFILE = DomainProfile(
 
     # ── Web UI ────────────────────────────────────────────────────────────────
     ui_assistant_label="Agency Sales Assistant",
-    ui_eyebrow="Ask contest & policy questions",
+    ui_eyebrow="Ask contest questions",
     ui_description=(
         "Get instant answers on contest eligibility, FYFP thresholds, rewards, and timelines — "
-        "grounded in your indexed policy documents."
+        "grounded in your indexed contest documents."
     ),
+    ui_sidebar_title="Chat with contest docs",
+    ui_sidebar_subtitle="Ask questions across the contest folder and get grounded answers.",
+    ui_search_placeholder="Search contest documents...",
+    ui_input_placeholder="Ask about rewards, FYFP thresholds, eligibility, timelines...",
     ui_prompt_chips=(
         ("List all contests", "List all active contests and who is eligible for each — FC, EIM, or ACH."),
         ("FYFP thresholds", "What is the minimum FYFP threshold for FC to qualify for each contest?"),

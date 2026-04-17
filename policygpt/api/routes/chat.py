@@ -69,6 +69,10 @@ class PolicyApiServer:
             "assistant_label": profile.ui_assistant_label,
             "eyebrow": profile.ui_eyebrow,
             "description": profile.ui_description,
+            "sidebar_title": profile.ui_sidebar_title,
+            "sidebar_subtitle": profile.ui_sidebar_subtitle,
+            "search_placeholder": profile.ui_search_placeholder,
+            "input_placeholder": profile.ui_input_placeholder,
             "prompt_chips": [
                 {"label": label, "prompt": prompt}
                 for label, prompt in profile.ui_prompt_chips
@@ -277,17 +281,22 @@ class PolicyApiServer:
         if hasattr(source, "source_path"):
             title = source.document_title
             path = source.source_path
+            original_path = getattr(source, "original_source_path", "") or ""
         else:
             title = source.get("document_title", "")
             path = source.get("source_path", "")
+            original_path = source.get("original_source_path", "") or ""
         # Normalise separators so the URL is consistent regardless of how the
         # path was stored (mixed slashes are common on Windows).
         norm_path = path.replace("\\", "/") if path else ""
+        # When the source was converted to HTML (e.g. PDF/XLSX → HTML for
+        # extraction), open the original file instead of the generated HTML.
+        open_path = original_path.replace("\\", "/") if original_path else norm_path
         return {
             "document_title": title,
             "source_path": norm_path,
-            "file_name": Path(path).name if path else "",
-            "document_url": build_document_open_url("", norm_path) if norm_path else "",
+            "file_name": Path(open_path).name if open_path else "",
+            "document_url": build_document_open_url("", open_path) if open_path else "",
         }
 
     def serialize_thread_summary(self, thread) -> dict:

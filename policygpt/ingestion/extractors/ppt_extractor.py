@@ -43,7 +43,8 @@ class PptExtractor(Extractor):
 
     @property
     def supported_content_types(self) -> frozenset[str]:
-        return frozenset({"ppt"})
+        # "ppt" — legacy generic type; "pptx" — OOXML format from FolderReader.
+        return frozenset({"ppt", "pptx"})
 
     def extract(self, message: IngestMessage) -> ExtractedDocument:
         if message.content_type not in self.supported_content_types:

@@ -11,12 +11,12 @@ from policygpt.extraction.ocr import TextractOCR
 class FileExtractor:
     HTML_SEMANTIC_TAGS = (
         "h1", "h2", "h3", "h4", "h5", "h6",
-        "p", "li", "table", "tr", "td", "th",
+        "p", "li", "table",
         "blockquote", "pre", "dd", "dt",
     )
     HTML_BLOCK_TAGS = (
         "article", "section", "main", "aside", "header", "footer", "nav",
-        "div", "p", "li", "table", "tr", "td", "th", "blockquote", "pre",
+        "div", "p", "li", "table", "blockquote", "pre",
         "dd", "dt", "dl", "ul", "ol",
         "h1", "h2", "h3", "h4", "h5", "h6",
     )
@@ -69,9 +69,18 @@ class FileExtractor:
         return Path(path).stem, []
 
     def extract_from_html(self, path: str) -> tuple[str, list[tuple[str, str]]]:
-        html = Path(path).read_text(encoding="utf-8", errors="ignore")
-        raw_text = self._extract_text_from_raw_html(html)
+        import time as _t
+        _fname = Path(path).name
+        _t0 = _t.perf_counter()
 
+        html = Path(path).read_text(encoding="utf-8", errors="ignore")
+        print(f"      [extract] {_fname} — read {len(html):,} bytes ({_t.perf_counter()-_t0:.2f}s)", flush=True)
+
+        _ts = _t.perf_counter()
+        raw_text = self._extract_text_from_raw_html(html)
+        print(f"      [extract] {_fname} — raw_text {len(raw_text):,} chars ({_t.perf_counter()-_ts:.2f}s)", flush=True)
+
+        _ts = _t.perf_counter()
         try:
             soup = BeautifulSoup(html, "lxml")
         except Exception:
@@ -79,6 +88,7 @@ class FileExtractor:
                 soup = BeautifulSoup(html, "html.parser")
             except Exception:
                 soup = None
+        print(f"      [extract] {_fname} — BS4 parse done ({_t.perf_counter()-_ts:.2f}s)", flush=True)
 
         if soup is None:
             title = self._select_text_document_title(
@@ -102,32 +112,57 @@ class FileExtractor:
                     label = f"[Image{': ' + alt if alt else ''}]"
                     ocr_units.append(("p", f"{label}\n{ocr_text}"))
 
+        _ts = _t.perf_counter()
         for tag in soup(["script", "style", "noscript", "svg", "img", "meta", "link"]):
             tag.decompose()
+        print(f"      [extract] {_fname} — tag decompose done ({_t.perf_counter()-_ts:.2f}s)", flush=True)
 
         html_title = ""
         if soup.title and soup.title.text.strip():
             html_title = self.clean_whitespace(soup.title.text)
 
+        _ts = _t.perf_counter()
         primary_units = self._extract_html_semantic_units(soup)
-        fallback_units = self._extract_html_block_units(soup)
-        body_root = soup.body or soup
-        body_text = self.clean_whitespace(body_root.get_text("\n", strip=True))
-        fallback_text = body_text if len(body_text) >= len(raw_text) else raw_text
+        print(f"      [extract] {_fname} — semantic units: {len(primary_units)} ({_t.perf_counter()-_ts:.2f}s)", flush=True)
 
-        units = primary_units
-        if self._should_prefer_html_block_units(primary_units, fallback_units, body_text):
-            units = fallback_units
+        if self._has_substantive_body_units(primary_units):
+            # Primary extraction found good content (headings, paragraphs, tables).
+            # Skip the expensive fallback path — avoids O(n) get_text() traversal
+            # on large documents such as converted Excel sheets with many cells.
+            units = primary_units
+        else:
+            # Primary came up empty or thin — try block-level fallback.
+            _ts = _t.perf_counter()
+            fallback_units = self._extract_html_block_units(soup)
+            print(f"      [extract] {_fname} — block units: {len(fallback_units)} ({_t.perf_counter()-_ts:.2f}s)", flush=True)
 
-        if not self._has_substantive_body_units(units) and fallback_text:
-            units = self._build_html_text_fallback_units(fallback_text)
+            _ts = _t.perf_counter()
+            body_root = soup.body or soup
+            body_text = self.clean_whitespace(body_root.get_text("\n", strip=True))
+            print(f"      [extract] {_fname} — get_text {len(body_text):,} chars ({_t.perf_counter()-_ts:.2f}s)", flush=True)
+
+            fallback_text = body_text if len(body_text) >= len(raw_text) else raw_text
+
+            units = primary_units
+            if self._should_prefer_html_block_units(primary_units, fallback_units, body_text):
+                units = fallback_units
+
+            if not self._has_substantive_body_units(units) and fallback_text:
+                units = self._build_html_text_fallback_units(fallback_text)
 
         # Append OCR units after the main content so they form their own
         # section(s) and are fully shown when their text matches a query.
         units = units + ocr_units
 
+        _ts = _t.perf_counter()
         title = self._select_document_title(path=path, html_title=html_title, units=units)
-        return title, self._group_units_into_sections(units)
+        print(f"      [extract] {_fname} — select_title done ({_t.perf_counter()-_ts:.2f}s)", flush=True)
+
+        _ts = _t.perf_counter()
+        sections = self._group_units_into_sections(units)
+        print(f"      [extract] {_fname} — grouped into {len(sections)} sections ({_t.perf_counter()-_ts:.2f}s)", flush=True)
+        print(f"      [extract] {_fname} — TOTAL extract time {_t.perf_counter()-_t0:.2f}s", flush=True)
+        return title, sections
 
     def extract_from_plain_text(self, path: str) -> tuple[str, list[tuple[str, str]]]:
         text = self.clean_whitespace(self.read_text_file(path))
@@ -272,6 +307,11 @@ class FileExtractor:
             node_name = node.name.lower()
 
             if node_name == "table":
+                # Skip tables that are nested inside an already-emitted outer table —
+                # the outer table's plain-text already captured their content.
+                ancestor_table = node.find_parent("table")
+                if ancestor_table is not None and id(ancestor_table) in emitted_table_ids:
+                    continue
                 table_text = self._table_to_plain_text(node)
                 if not table_text:
                     continue
@@ -281,11 +321,6 @@ class FileExtractor:
                     emitted_table_ids.add(id(node))
                     units.append(("table", table_text))
                 continue
-
-            if node_name in {"tr", "td", "th"}:
-                ancestor_table = node.find_parent("table")
-                if ancestor_table is not None and id(ancestor_table) in emitted_table_ids:
-                    continue
 
             text = self.clean_whitespace(node.get_text(" ", strip=True))
             if not text:
@@ -298,14 +333,33 @@ class FileExtractor:
 
         return units
 
-    @staticmethod
-    def _table_to_plain_text(table_node) -> str:
+    @classmethod
+    def _table_to_plain_text(cls, table_node) -> str:
+        """Convert an HTML table to pipe-delimited plain text, one row per line.
+
+        Only rows that directly belong to *this* table are processed — nested
+        tables are not traversed as separate rows.  If a cell itself contains a
+        nested table, that nested table is converted recursively and its rows are
+        inlined (semicolon-separated) into the parent cell value so no HTML leaks
+        into the output.
+        """
         rows: list[str] = []
         for tr in table_node.find_all("tr"):
-            cells = [
-                re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip()
-                for cell in tr.find_all(["th", "td"])
-            ]
+            # Only process rows whose nearest ancestor <table> is this table.
+            if tr.find_parent("table") is not table_node:
+                continue
+            cells: list[str] = []
+            for cell in tr.find_all(["th", "td"]):
+                # Skip cells that belong to a nested <tr>, not this one.
+                if cell.find_parent("tr") is not tr:
+                    continue
+                nested_table = cell.find("table")
+                if nested_table:
+                    nested_text = cls._table_to_plain_text(nested_table)
+                    cell_text = re.sub(r"\s+", " ", nested_text.replace("\n", "; ")).strip()
+                else:
+                    cell_text = re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip()
+                cells.append(cell_text)
             row_text = " | ".join(c for c in cells if c)
             if row_text:
                 rows.append(row_text)
@@ -371,22 +425,53 @@ class FileExtractor:
         if not html:
             return ""
 
+        import time as _t
+        _ts0 = _t.perf_counter()
+
+        # Step 1: remove HTML comments (safe DOTALL — no backreference).
         stripped = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+        print(f"      [raw] comments {_t.perf_counter()-_ts0:.2f}s", flush=True)
+
+        # Step 2: remove paired block tags that contain content we don't want
+        # (script, style, noscript, svg).  Split into separate per-tag calls
+        # instead of one backreference regex — avoids O(n²) scanning caused by
+        # the lazy .*? + backreference on void elements like <meta>/<link> which
+        # have no closing tags and force the engine to scan the entire file.
+        _ts = _t.perf_counter()
+        for _tag in ("script", "style", "noscript", "svg"):
+            stripped = re.sub(
+                rf"<{_tag}\b[^>]*>.*?</{_tag}\s*>",
+                " ",
+                stripped,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        print(f"      [raw] block-tag strip {_t.perf_counter()-_ts:.2f}s", flush=True)
+
+        # Step 3: remove void / self-closing elements (no closing tag needed).
+        _ts = _t.perf_counter()
+        stripped = re.sub(r"<(?:meta|link|img|br|hr|input)\b[^>]*?/?>", " ", stripped, flags=re.IGNORECASE)
+        print(f"      [raw] void-tag strip {_t.perf_counter()-_ts:.2f}s", flush=True)
+
+        # Step 4: turn block-level closing tags into newlines.
+        _ts = _t.perf_counter()
         stripped = re.sub(
-            r"<(script|style|noscript|svg|img|meta|link)\b.*?>.*?</\1\s*>",
-            " ",
-            stripped,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        stripped = re.sub(
-            r"<\s*(br|/p|/div|/section|/article|/li|/tr|/td|/th|/h[1-6]|hr)\b[^>]*>",
+            r"<\s*(?:br|/p|/div|/section|/article|/li|/tr|/td|/th|/h[1-6]|hr)\b[^>]*>",
             "\n",
             stripped,
             flags=re.IGNORECASE,
         )
+        print(f"      [raw] newline-tags {_t.perf_counter()-_ts:.2f}s", flush=True)
+
+        # Step 5: strip all remaining tags.
+        _ts = _t.perf_counter()
         stripped = re.sub(r"<[^>]+>", " ", stripped)
+        print(f"      [raw] remaining-tags {_t.perf_counter()-_ts:.2f}s", flush=True)
+
+        _ts = _t.perf_counter()
         stripped = unescape(stripped)
-        return self.clean_whitespace(stripped)
+        result = self.clean_whitespace(stripped)
+        print(f"      [raw] unescape+clean {_t.perf_counter()-_ts:.2f}s | total {_t.perf_counter()-_ts0:.2f}s", flush=True)
+        return result
 
     @staticmethod
     def _normalize_html_text(text: str) -> str:
@@ -468,6 +553,7 @@ class FileExtractor:
 
     def _group_units_into_sections(self, units: list[tuple[str, str]]) -> list[tuple[str, str]]:
         sections: list[tuple[str, str]] = []
+        table_texts: set[str] = set()
         current_title = "Introduction"
         current_parts: list[str] = []
         heading_seen = False
@@ -485,8 +571,13 @@ class FileExtractor:
                 current_title = text[:200]
                 heading_seen = True
             elif tag == "table":
+                # Tables are atomic — the entire <table> is one section regardless
+                # of size.  Splitting would break row/column context (dates, rule
+                # values, etc. embedded in cells would lose their column headers).
                 flush()
-                sections.append((current_title, self.clean_whitespace(text)))
+                clean_text = self.clean_whitespace(text)
+                table_texts.add(clean_text)
+                sections.append((current_title, clean_text))
             else:
                 current_parts.append(text)
 
@@ -518,7 +609,8 @@ class FileExtractor:
 
         final_sections: list[tuple[str, str]] = []
         for title, text in sections:
-            if len(text) <= self.config.max_section_chars:
+            # Table sections are atomic — never split them regardless of size.
+            if text in table_texts or len(text) <= self.config.max_section_chars:
                 final_sections.append((title, text))
             else:
                 final_sections.extend(

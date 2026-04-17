@@ -29,6 +29,7 @@ class DocumentRecord:
     doc_id: str
     title: str
     source_path: str
+    original_source_path: str = ""   # pre-conversion path (e.g. .xlsx/.pdf) when to_html_enabled
     raw_text: str
     masked_text: str
     summary: str

@@ -128,6 +128,10 @@ PROFILE = DomainProfile(
         "Get instant answers on HR, IT, finance, and workplace policies — "
         "grounded in your indexed policy documents."
     ),
+    ui_sidebar_title="Chat with policy docs",
+    ui_sidebar_subtitle="Ask questions across the policy folder and get grounded answers.",
+    ui_search_placeholder="Search policy documents...",
+    ui_input_placeholder="Ask about leave, travel, expenses, IT rules, approvals...",
     ui_prompt_chips=(
         ("Leave entitlements", "What types of leave are available and what is the entitlement for each?"),
         ("Travel policy", "What is the travel policy — booking process, eligibility, and limits?"),

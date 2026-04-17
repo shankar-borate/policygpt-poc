@@ -49,7 +49,12 @@ class ImageExtractor(Extractor):
 
     @property
     def supported_content_types(self) -> frozenset[str]:
-        return frozenset({"image"})
+        # "image" — legacy generic type used by SQS/API readers.
+        # Individual extension types — emitted by FolderReader for raw images.
+        return frozenset({
+            "image",
+            "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp",
+        })
 
     def extract(self, message: IngestMessage) -> ExtractedDocument:
         if message.content_type not in self.supported_content_types:

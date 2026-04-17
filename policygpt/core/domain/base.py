@@ -52,11 +52,15 @@ class DomainProfile:
     entity_examples: str                  # example JSON block for few-shot guidance
 
     # ── Web UI ────────────────────────────────────────────────────────────────
-    # Returned by /api/domain so the frontend hero card is fully server-driven.
+    # Returned by /api/domain so the frontend is fully server-driven.
     ui_assistant_label: str              # header eyebrow, e.g. "Enterprise Policy Assistant"
     ui_eyebrow: str                      # hero card eyebrow, e.g. "Ask policy questions"
     ui_description: str                  # hero card subtitle
     ui_prompt_chips: tuple               # ((label, full_prompt), ...) shown as quick-start chips
+    ui_sidebar_title: str                # sidebar <h1>, e.g. "Chat with contest docs"
+    ui_sidebar_subtitle: str             # sidebar muted subtitle
+    ui_search_placeholder: str           # search input placeholder
+    ui_input_placeholder: str            # composer textarea placeholder
 
 
 _REGISTRY: dict[str, DomainProfile] = {}

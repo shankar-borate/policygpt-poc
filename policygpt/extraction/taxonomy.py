@@ -234,6 +234,12 @@ INTENT_PATTERNS: dict[str, tuple[str, ...]] = {
         "all available", "how many types", "every type", "what all",
         "complete list", "all the types", "all policies", "all leaves",
         "all benefits", "all options",
+        # Contest / scheme listing (date-sensitive — needs current date context)
+        "all contests", "active contests", "ongoing contests", "current contests",
+        "list contests", "show contests", "which contests", "what contests",
+        "all schemes", "active schemes", "current schemes",
+        "all rewards", "active rewards", "current rewards",
+        "show me all", "tell me all",
     ),
     "checklist": ("checklist", "what should i do", "what do i need to do", "list of steps"),
     "process": (

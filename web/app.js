@@ -443,6 +443,14 @@ function renderDomainUI() {
     elements.heroEyebrow.textContent = domain.eyebrow;
     elements.heroDescription.textContent = domain.description;
 
+    const sidebarTitle = document.getElementById("sidebar-title");
+    const sidebarSubtitle = document.getElementById("sidebar-subtitle");
+    if (sidebarTitle && domain.sidebar_title) sidebarTitle.textContent = domain.sidebar_title;
+    if (sidebarSubtitle && domain.sidebar_subtitle) sidebarSubtitle.textContent = domain.sidebar_subtitle;
+    if (domain.search_placeholder) elements.searchInput.placeholder = domain.search_placeholder;
+    if (domain.input_placeholder) elements.composerInput.placeholder = domain.input_placeholder;
+    document.title = domain.sidebar_title || document.title;
+
     elements.promptRow.innerHTML = domain.prompt_chips
         .map((chip) =>
             `<button class="prompt-chip" type="button" data-prompt="${escapeHtml(chip.prompt)}">${escapeHtml(chip.label)}</button>`

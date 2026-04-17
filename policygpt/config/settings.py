@@ -5,7 +5,7 @@ It is frozen (immutable after construction) so components can safely cache
 references to it.
 
 Switching domains, models, or accuracy/cost trade-offs is a one-line change:
-  domain_type      — "contest" | "policy" | any registered domain
+  domain_type      — "contest" | "policy" | "product_technical" | any registered domain
   ai_profile       — "openai" | "bedrock-20b" | "bedrock-120b" | ...
   accuracy_profile — "vhigh" | "high" | "medium" | "low"
   runtime_cost_profile — "standard" | "aggressive"
@@ -26,8 +26,17 @@ from policygpt.config.presets import (
 @dataclass(frozen=True)
 class Config:
     # ── Storage ───────────────────────────────────────────────────────────────
-    document_folder: str = r"D:\policy-mgmt\data\test"
-    supported_file_patterns: tuple[str, ...] = ("*.html", "*.htm", "*.txt", "*.pdf")
+    # Change this ONE path to relocate all derived paths (debug_log_dir,
+    # supplementary_facts_file) — they are derived automatically in __post_init__.
+    document_folder: str = r"D:\policy-mgmt\data\product"
+    supported_file_patterns: tuple[str, ...] = (
+        "*.html", "*.htm", "*.txt",
+        "*.pdf",
+        "*.pptx", "*.ppt",
+        "*.docx", "*.doc",
+        "*.xlsx", "*.xls",
+        "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.tif", "*.webp",
+    )
     excluded_file_name_parts: tuple[str, ...] = ("_summary",)
 
     # ── AI model selection ────────────────────────────────────────────────────
@@ -59,7 +68,9 @@ class Config:
     usd_to_inr_exchange_rate: float = 93.0
 
     # ── Debug / observability ─────────────────────────────────────────────────
-    debug_log_dir: str = r"D:\policy-mgmt\data\test\metadata"
+    # Derived from document_folder in __post_init__ when left empty.
+    # Override via POLICY_GPT_DEBUG_LOG_DIR env var if needed.
+    debug_log_dir: str = ""
     debug: bool = True
     # When True, the rewritten HTML is saved to {debug_log_dir}/improved/
     # so it can be inspected and is cached for subsequent re-ingestions.
@@ -69,13 +80,14 @@ class Config:
     # ── Supplementary context ─────────────────────────────────────────────────
     # Path to a plain-text file with extra facts (e.g. business rules) injected
     # into every LLM prompt but never shown to the user as a source.
-    supplementary_facts_file: str = r"D:\policy-mgmt\data\test\metadata\supplementary_facts.txt"
+    # Derived from document_folder in __post_init__ when left empty.
+    supplementary_facts_file: str = ""
 
     # ── Domain ────────────────────────────────────────────────────────────────
     # Selects domain profile (prompt text, entity categories, etc.) from domain/.
-    # Built-in values: "contest" | "policy"
-    # Add a new file under policygpt/domain/ to register additional types.
-    domain_type: str = "policy"
+    # Built-in values: "contest" | "policy" | "product_technical"
+    # Add a new file under policygpt/core/domain/ to register additional types.
+    domain_type: str = "product_technical"
 
     # ── Ingestion: access control ─────────────────────────────────────────────
     # User IDs that are granted access to every document ingested at server
@@ -101,6 +113,21 @@ class Config:
     ocr_enabled: bool = False
     ocr_provider: str = "textract"   # only "textract" supported today
     ocr_min_confidence: float = 80.0  # Textract LINE block confidence threshold (0–100)
+
+    # ── Ingestion: document → HTML conversion ────────────────────────────────
+    # Master switch — when True, non-HTML documents are converted to HTML before
+    # extraction so tables are parsed as structured rows/columns.
+    # Converted files are cached in {debug_log_dir}/html/.
+    # Enabled per-domain in config/domain_defaults.py.
+    to_html_enabled: bool = False
+
+    # Per-format switches (only take effect when to_html_enabled=True).
+    # Set False for any format that causes extraction problems in a given domain.
+    pdf_to_html_enabled: bool = True
+    docx_to_html_enabled: bool = True
+    pptx_to_html_enabled: bool = True
+    excel_to_html_enabled: bool = True
+    image_to_html_enabled: bool = True
 
     # ── Ingestion: policy rewriting ───────────────────────────────────────────
     # Master switch — pre-processes HTML before extraction.
@@ -212,7 +239,7 @@ class Config:
     opensearch_password: str = ""
     opensearch_use_ssl: bool = True
     opensearch_verify_certs: bool = False
-    opensearch_index_prefix: str = "policygpt"
+    opensearch_index_prefix: str = "product"
 
     # ── Hybrid search weights ─────────────────────────────────────────────────
     # Controls the blend of the three complementary retrieval mechanisms.
@@ -366,11 +393,32 @@ class Config:
             "hybrid_keyword_weight",
             "hybrid_similarity_weight",
             "hybrid_vector_weight",
+            "rewrite_policies_enabled",
+            "to_html_enabled",
+            "pdf_to_html_enabled",
+            "docx_to_html_enabled",
+            "pptx_to_html_enabled",
+            "excel_to_html_enabled",
+            "image_to_html_enabled",
         ):
             if field_name in domain_overrides:
                 default_value = Config.__dataclass_fields__[field_name].default
                 if getattr(self, field_name) == default_value:
                     object.__setattr__(self, field_name, domain_overrides[field_name])
+
+        # Derive debug_log_dir and supplementary_facts_file from document_folder
+        # when they are not explicitly set.  This means changing document_folder
+        # is the only edit needed to relocate all three paths.
+        metadata_dir = os.path.join(self.document_folder, "metadata")
+        os.makedirs(metadata_dir, exist_ok=True)
+        if not self.debug_log_dir:
+            object.__setattr__(self, "debug_log_dir", metadata_dir)
+        if not self.supplementary_facts_file:
+            object.__setattr__(
+                self,
+                "supplementary_facts_file",
+                os.path.join(metadata_dir, "supplementary_facts.txt"),
+            )
 
     @classmethod
     def from_env(cls) -> "Config":

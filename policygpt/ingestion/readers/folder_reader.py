@@ -24,20 +24,29 @@ from policygpt.ingestion.readers.base import IngestMessage, Reader
 
 logger = logging.getLogger(__name__)
 
-# Maps lowercase suffix → content_type string understood by ExtractorRegistry.
+# Maps lowercase suffix → content_type string understood by ExtractorRegistry
+# and HtmlConverterRegistry.  Non-HTML formats that can be converted to HTML
+# are listed with their own content_type so the converter registry can select
+# the right converter; after conversion the content_type becomes "html".
 _EXTENSION_MAP: dict[str, str] = {
     ".html": "html",
     ".htm":  "html",
     ".txt":  "text",
     ".pdf":  "pdf",
+    ".pptx": "pptx",
     ".ppt":  "ppt",
-    ".pptx": "ppt",
-    ".jpg":  "image",
-    ".jpeg": "image",
-    ".png":  "image",
-    ".tiff": "image",
-    ".tif":  "image",
-    ".bmp":  "image",
+    ".docx": "docx",
+    ".doc":  "doc",
+    ".xlsx": "xlsx",
+    ".xls":  "xls",
+    ".jpg":  "jpg",
+    ".jpeg": "jpeg",
+    ".png":  "png",
+    ".gif":  "gif",
+    ".bmp":  "bmp",
+    ".tiff": "tiff",
+    ".tif":  "tif",
+    ".webp": "webp",
 }
 
 # File-name substrings that mark generated artefacts — skip them so the
@@ -123,4 +132,7 @@ class FolderReader(Reader):
         """Read file bytes for binary types, decoded text for text types."""
         if content_type in {"html", "text"}:
             return path.read_text(encoding="utf-8", errors="ignore")
+        # All other formats (pdf, pptx, docx, xlsx, images …) are binary.
+        # The converter pipeline reads from source_path directly, so the
+        # content bytes are passed through but not deeply parsed here.
         return path.read_bytes()

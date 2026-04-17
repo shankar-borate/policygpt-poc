@@ -62,6 +62,46 @@ class PolicyGPTBot:
     def sections(self):
         return self.corpus.sections
 
+    def _get_doc_for_section(self, section):
+        """Return the DocumentRecord for *section*, handling stale doc_ids.
+
+        OpenSearch may return sections whose doc_id was generated in a previous
+        ingestion run (different UUID than the current in-memory documents).
+        When that happens, fall back to matching on source_path so we can still
+        return a sensible document title rather than raising KeyError.
+        Returns None only when no match can be found at all.
+        """
+        doc = self.documents.get(section.doc_id)
+        if doc is not None:
+            return doc
+        # Fallback: scan by normalized source_path.
+        norm = section.source_path.lower().replace("\\", "/")
+        for d in self.documents.values():
+            if d.source_path.lower().replace("\\", "/") == norm:
+                return d
+        return None
+
+    def _get_doc_title_for_section(self, section) -> str:
+        """Return the document title for *section*, with a safe fallback."""
+        from pathlib import Path as _Path
+        doc = self._get_doc_for_section(section)
+        if doc is not None:
+            return doc.title
+        # Last resort: derive a readable title from the file name.
+        return _Path(section.source_path).stem.replace("_", " ")
+
+    def _get_original_source_path_for_section(self, section) -> str:
+        """Return original_source_path for *section*'s document (pre-conversion path).
+
+        When a document was converted from PDF/XLSX/etc. to HTML before ingestion,
+        this returns the pre-conversion path so reference links open the source file
+        rather than the generated HTML.  Falls back to "" when not applicable.
+        """
+        doc = self._get_doc_for_section(section)
+        if doc is not None:
+            return getattr(doc, "original_source_path", "") or ""
+        return ""
+
     @property
     def threads(self):
         return self.conversations.threads
@@ -229,11 +269,12 @@ class PolicyGPTBot:
                         continue
                     _seen_doc_paths.add(_key)
                     sources.append(SourceReference(
-                        document_title=self.documents[section.doc_id].title,
+                        document_title=self._get_doc_title_for_section(section),
                         section_title=section.title,
                         source_path=section.source_path,
                         score=score,
                         section_order_index=section.order_index,
+                        original_source_path=self._get_original_source_path_for_section(section),
                     ))
                 # Drop very low-scoring sources that barely contributed — keeps
                 # the reference list focused on genuinely relevant sections.
@@ -568,11 +609,12 @@ class PolicyGPTBot:
                     continue
                 seen_doc_paths.add(_doc_key)
                 all_sources.append(SourceReference(
-                    document_title=self.documents[section.doc_id].title,
+                    document_title=self._get_doc_title_for_section(section),
                     section_title=section.title,
                     source_path=section.source_path,
                     score=score,
                     section_order_index=section.order_index,
+                    original_source_path=self._get_original_source_path_for_section(section),
                 ))
             sub_context = self._build_answer_context(
                 thread=thread,
@@ -882,7 +924,7 @@ class PolicyGPTBot:
             return False
 
         best_section, best_score = top_sections[0]
-        best_document = self.documents[best_section.doc_id]
+        best_document = self._get_doc_for_section(best_section)
         if best_score < self.config.answerability_min_section_score:
             return False
 
@@ -895,7 +937,7 @@ class PolicyGPTBot:
         # Also trust strong topic/metadata alignment as an alternative
         # to exact term match in evidence blocks.
         section_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_section.metadata_tags)
-        document_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_document.metadata_tags)
+        document_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_document.metadata_tags) if best_document else 0.0
         if max(section_topic_alignment, document_topic_alignment) >= 0.55:
             return True
 
@@ -1149,9 +1191,57 @@ class PolicyGPTBot:
             and not query_analysis.exact_match_expected
         )
 
+    def _role_clarification_instruction(
+        self, query_analysis: QueryAnalysis, user_question: str
+    ) -> str:
+        """Return a role-clarification instruction for the LLM when the answer
+        likely varies by role and the user has not stated their role.
+
+        Returns an empty string when no clarification is needed.
+        """
+        # Only applies to domains that define roles (contest, policy).
+        role_categories = getattr(self.config.domain_profile, "entity_categories", frozenset())
+        if "role" not in role_categories:
+            return ""
+
+        # Only trigger for eligibility or reward queries (not generic listing).
+        role_sensitive_intents = {"eligibility", "threshold", "reward", "benefit"}
+        if not role_sensitive_intents & set(query_analysis.intents):
+            # Also trigger if the question wording implies role-specific detail
+            q_lower = user_question.casefold()
+            role_keywords = ("eligible", "qualify", "qualify for", "threshold", "reward", "earn")
+            if not any(kw in q_lower for kw in role_keywords):
+                return ""
+
+        # Check whether the user already mentioned a role in the question.
+        q_lower = user_question.casefold()
+        known_roles = [
+            e.name.casefold()
+            for e in (self.corpus.entity_lookup or {}).values()
+            if getattr(e, "category", "") == "role"
+        ]
+        # Fallback role list when entity map hasn't been built yet.
+        if not known_roles:
+            known_roles = ["fc", "eim", "ach", "fls", "esl", "manager", "agent"]
+
+        role_mentioned = any(role in q_lower for role in known_roles)
+        if role_mentioned:
+            return ""
+
+        # Build comma-separated role list from known roles (de-dup, title-case).
+        role_display = ", ".join(sorted({r.upper() for r in known_roles[:8]}))
+        return (
+            f"Role note: The question does not mention a specific role. "
+            f"If the answer differs by role ({role_display}), answer for each role separately "
+            f"and end with: '**Could you share your role so I can focus on what applies to you?**'"
+        )
+
     @staticmethod
     def _needs_current_date_context(query_analysis: QueryAnalysis) -> bool:
-        if {"eligibility", "timeline"} & set(query_analysis.intents):
+        # Always inject the date for eligibility, timeline, and aggregate queries.
+        # Aggregate queries (list all X, active contests, ongoing rewards) depend
+        # on the date to determine what is currently active vs expired.
+        if {"eligibility", "timeline", "aggregate"} & set(query_analysis.intents):
             return True
 
         normalized_question = query_analysis.normalized_question.casefold()
@@ -1177,6 +1267,16 @@ class PolicyGPTBot:
             "expired",
             "ended",
             "closed",
+            # Active/ongoing listing — user wants to know what is running today
+            "active",
+            "ongoing",
+            "running",
+            "available",
+            "live",
+            "which contest",
+            "what contest",
+            "list contest",
+            "list all",
         )
         return any(marker in normalized_question for marker in date_sensitive_markers)
 
@@ -1575,10 +1675,14 @@ class PolicyGPTBot:
                 f"Background facts (use to supplement retrieved evidence; do not cite as a source):\n"
                 f"{self._supplementary_facts}"
             )
+        role_instruction = self._role_clarification_instruction(
+            query_analysis, query_analysis.original_question
+        )
         prompt_parts.append(
             "Answer only from the evidence. Prefer raw evidence over summaries. Never mention internal IDs. "
             "If the evidence states explicit exclusions, exceptions, or disqualifying conditions, include them in the answer — "
             "do not silently omit negative conditions."
+            + (f"\n{role_instruction}" if role_instruction else "")
         )
         return "\n\n".join(part for part in prompt_parts if part.strip())
 
@@ -1633,11 +1737,12 @@ class PolicyGPTBot:
         lines.extend(["", "=== Top Sections ==="])
         if top_sections:
             for index, (section, score) in enumerate(top_sections, start=1):
-                document = self.documents[section.doc_id]
+                document = self._get_doc_for_section(section)
+                doc_title = document.title if document else self._get_doc_title_for_section(section)
                 snippets = self.corpus.extract_evidence_snippets(section, query_analysis)
                 lines.extend(
                     [
-                        f"{index}. {document.title} :: {section.title} | score={score:.4f} | file={section.source_path}",
+                        f"{index}. {doc_title} :: {section.title} | score={score:.4f} | file={section.source_path}",
                         f"   type={section.section_type or 'general'} | tags={', '.join(section.metadata_tags) or 'none'}",
                         f"   summary={self.redactor.unmask_text(section.summary).strip() or '(empty)'}",
                         "   snippets:",
@@ -1747,9 +1852,8 @@ class PolicyGPTBot:
         if top_sections:
             lines.extend(
                 [
-                    f"- {self.documents[section.doc_id].title} :: {section.title} | score={score:.4f} | file={section.source_path}"
+                    f"- {self._get_doc_title_for_section(section)} :: {section.title} | score={score:.4f} | file={section.source_path}"
                     for section, score in top_sections
-                    if section.doc_id in self.documents
                 ]
             )
         else:

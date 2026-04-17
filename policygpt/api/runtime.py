@@ -27,6 +27,9 @@ class ServerRuntime:
         self.indexing_total_files = 0
         self.indexing_current_file: str | None = None
         self.ingestion_running = False
+        # Cached counts — updated by the progress callback (in-memory, no OpenSearch query).
+        self._cached_document_count: int = 0
+        self._cached_section_count: int = 0
 
     def start_indexing(self) -> None:
         with self.lock:
@@ -45,6 +48,8 @@ class ServerRuntime:
             self.indexing_total_files = 0
             self.indexing_current_file = None
             self.ingestion_running = False
+            self._cached_document_count = 0
+            self._cached_section_count = 0
             self.worker = Thread(target=self._initialize_worker, daemon=True)
             self.worker.start()
 
@@ -76,24 +81,20 @@ class ServerRuntime:
         }
 
     def get_document_count(self) -> int:
-        """Live document count — queries OpenSearch when available, else falls back to in-memory."""
+        """Cached document count — updated by the ingestion progress callback.
+        Returns in-memory count immediately without blocking the async event loop."""
+        if self._cached_document_count > 0:
+            return self._cached_document_count
         bot = self.bot
-        if bot is not None:
-            vs = bot.corpus._vector_store
-            if vs is not None and hasattr(vs, "count_documents"):
-                return vs.count_documents()
-            return len(bot.documents)
-        return 0
+        return len(bot.documents) if bot is not None else 0
 
     def get_section_count(self) -> int:
-        """Live section count — queries OpenSearch when available, else falls back to in-memory."""
+        """Cached section count — updated by the ingestion progress callback.
+        Returns in-memory count immediately without blocking the async event loop."""
+        if self._cached_section_count > 0:
+            return self._cached_section_count
         bot = self.bot
-        if bot is not None:
-            vs = bot.corpus._vector_store
-            if vs is not None and hasattr(vs, "count_sections"):
-                return vs.count_sections()
-            return len(bot.sections)
-        return 0
+        return len(bot.sections) if bot is not None else 0
 
     # ── Worker ────────────────────────────────────────────────────────────────
 
@@ -179,12 +180,17 @@ class ServerRuntime:
         processed_files: int,
         total_files: int,
         current_file: str | None,
-        *_,  # document_count / section_count — queried live from OS, not stored
+        document_count: int = 0,
+        section_count: int = 0,
     ) -> None:
         with self.lock:
             self.indexing_processed_files = processed_files
             self.indexing_total_files = total_files
             self.indexing_current_file = current_file
+            if document_count > 0:
+                self._cached_document_count = document_count
+            if section_count > 0:
+                self._cached_section_count = section_count
 
     def usage_payload(self) -> dict:
         return self.usage_tracker.snapshot()
