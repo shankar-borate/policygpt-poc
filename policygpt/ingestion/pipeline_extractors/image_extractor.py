@@ -1,6 +1,6 @@
 """ImageExtractor — extracts text from standalone image files via OCR.
 
-Delegates to TextractOCR (AWS Textract) when config.ocr_enabled=True.
+Delegates to TextractOCR (AWS Textract) when config.ingestion.ocr_enabled=True.
 When OCR is disabled the document is ingested with empty sections (best-effort).
 
 Supported image formats: JPEG, PNG, TIFF, BMP.
@@ -63,8 +63,8 @@ class ImageExtractor(Extractor):
             )
         title = _humanize_stem(Path(message.file_name).stem)
 
-        if not self._config.ocr_enabled:
-            logger.debug(
+        if not self._config.ingestion.ocr_enabled:
+            logger.storage.debug(
                 "OCR disabled — skipping image %s", message.source_path
             )
             return ExtractedDocument(title=title, sections=[])
@@ -72,7 +72,7 @@ class ImageExtractor(Extractor):
         ocr = self._get_ocr()
         ocr_text = ocr.extract_from_path(message.source_path)
         if not ocr_text.strip():
-            logger.debug("No OCR text extracted from %s", message.source_path)
+            logger.storage.debug("No OCR text extracted from %s", message.source_path)
             return ExtractedDocument(title=title, sections=[])
 
         return ExtractedDocument(
@@ -88,6 +88,6 @@ class ImageExtractor(Extractor):
 
             self._ocr = TextractOCR(
                 region=self._config.aws_region,
-                min_confidence=self._config.ocr_min_confidence,
+                min_confidence=self._config.ingestion.ocr_min_confidence,
             )
         return self._ocr

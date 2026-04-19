@@ -1,335 +1,101 @@
-"""Core Config dataclass and from_env() loader.
-
-Config is the single object passed to every component (bot, corpus, server).
-It is frozen (immutable after construction) so components can safely cache
-references to it.
+"""Core Config dataclass — composes typed sub-configs for each concern.
 
 Switching domains, models, or accuracy/cost trade-offs is a one-line change:
-  domain_type      — "contest" | "policy" | "product_technical" | any registered domain
-  ai_profile       — "openai" | "bedrock-20b" | "bedrock-120b" | ...
-  accuracy_profile — "vhigh" | "high" | "medium" | "low"
+  domain_type          — "contest" | "policy" | "product_technical"
+  ai_profile           — "openai" | "bedrock-20b" | "bedrock-120b" | ...
+  accuracy_profile     — "vhigh" | "high" | "medium" | "low"
   runtime_cost_profile — "standard" | "aggressive"
 """
+
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
-from policygpt.constants import FileExtension, OCRProvider
+from policygpt.config.ai_config import AIConfig
+from policygpt.config.cache_config import CacheConfig
+from policygpt.config.conversation_config import ConversationConfig
 from policygpt.config.domain_defaults import DOMAIN_CONFIG_OVERRIDES
-
-# Derive glob patterns from the single source of truth for file extensions.
-_SUPPORTED_FILE_PATTERNS: tuple[str, ...] = tuple(f"*{ext.value}" for ext in FileExtension)
 from policygpt.config.env_loader import _env_bool, _env_float, _env_int
+from policygpt.config.ingestion_config import IngestionConfig
+from policygpt.config.output_config import OutputConfig
 from policygpt.config.presets import (
     ACCURACY_PROFILE_PRESETS,
     AI_PROFILE_PRESETS,
     RUNTIME_COST_PROFILE_PRESETS,
 )
+from policygpt.config.retrieval_config import RetrievalConfig
+from policygpt.config.search_config import SearchConfig
+from policygpt.config.storage_config import StorageConfig
+
+# Maps each preset field name → the sub-config attribute that owns it.
+_PRESET_OWNERS: dict[str, str] = {
+    # RetrievalConfig
+    "top_docs": "retrieval", "top_sections_per_doc": "retrieval",
+    "max_sections_to_llm": "retrieval", "rerank_section_candidates": "retrieval",
+    "exact_top_docs": "retrieval", "exact_top_sections_per_doc": "retrieval",
+    "exact_max_sections_to_llm": "retrieval", "exact_rerank_section_candidates": "retrieval",
+    "broad_top_docs": "retrieval", "broad_top_sections_per_doc": "retrieval",
+    "broad_max_sections_to_llm": "retrieval", "broad_rerank_section_candidates": "retrieval",
+    "max_evidence_snippets_per_section": "retrieval",
+    "evidence_snippet_char_limit": "retrieval",
+    "embedding_raw_excerpt_chars": "retrieval",
+    "answer_context_doc_summary_char_limit": "retrieval",
+    "evidence_chunk_char_limit": "retrieval",
+    "evidence_neighboring_units": "retrieval",
+    "small_section_full_text_chars": "retrieval",
+    "exact_answer_evidence_char_limit": "retrieval",
+    "broad_answer_evidence_char_limit": "retrieval",
+    "answer_evidence_block_limit_exact": "retrieval",
+    "answer_evidence_block_limit_broad": "retrieval",
+    # ConversationConfig
+    "max_recent_messages": "conversation",
+    "summarize_after_turns": "conversation",
+    # IngestionConfig
+    "doc_summary_input_token_budget": "ingestion",
+    "doc_summary_combine_token_budget": "ingestion",
+    "section_summary_input_token_budget": "ingestion",
+    "min_recursive_summary_token_budget": "ingestion",
+    # OutputConfig
+    "doc_summary_max_output_tokens": "output",
+    "doc_summary_max_output_tokens_cap": "output",
+    "doc_summary_chunk_max_output_tokens": "output",
+    "section_summary_max_output_tokens": "output",
+    "chat_max_output_tokens": "output",
+    "conversation_summary_max_output_tokens": "output",
+    "include_document_metadata_in_answers": "output",
+    "include_section_metadata_in_answers": "output",
+    "include_document_orientation_in_answers": "output",
+    "include_section_orientation_in_answers": "output",
+}
+
+_OUTPUT_BOOL_FIELDS = frozenset({
+    "include_document_metadata_in_answers",
+    "include_section_metadata_in_answers",
+    "include_document_orientation_in_answers",
+    "include_section_orientation_in_answers",
+})
 
 
 @dataclass(frozen=True)
 class Config:
-    # ── Storage ───────────────────────────────────────────────────────────────
-    # Change this ONE path to relocate all derived paths (debug_log_dir,
-    # supplementary_facts_file) — they are derived automatically in __post_init__.
-    document_folder: str = r"D:\policy-mgmt\data\product"
-    supported_file_patterns: tuple[str, ...] = _SUPPORTED_FILE_PATTERNS
-    excluded_file_name_parts: tuple[str, ...] = ("_summary",)
-
-    # ── AI model selection ────────────────────────────────────────────────────
-    # Change this one value to switch the entire model stack.
-    # Options: openai | bedrock-20b | bedrock-120b | bedrock-claude-sonnet-4-6 | bedrock-claude-opus-4-6
+    # ── Top-level profile knobs ───────────────────────────────────────────────
     ai_profile: str = "bedrock-120b"
-
-    # ── Quality / cost knobs ──────────────────────────────────────────────────
-    # Change accuracy_profile to tune retrieval breadth and output budgets.
-    # Options: vhigh | high | medium | low
     accuracy_profile: str = "vhigh"
-
-    # Change runtime_cost_profile to tune per-request cost without affecting
-    # ingestion quality or model selection.
-    # Options: standard | aggressive
     runtime_cost_profile: str = "standard"
-
-    # ── Resolved at __post_init__ from ai_profile ─────────────────────────────
-    ai_provider: str = ""
-    chat_model: str = ""
-    embedding_model: str = ""
-    bedrock_gpt_model_size: str = ""
-
-    # ── Network / endpoints ───────────────────────────────────────────────────
-    public_base_url: str = "http://127.0.0.1:8012"
-    bedrock_region: str = "ap-south-1"
-
-    # ── Currency ──────────────────────────────────────────────────────────────
-    usd_to_inr_exchange_rate: float = 93.0
-
-    # ── Debug / observability ─────────────────────────────────────────────────
-    # Derived from document_folder in __post_init__ when left empty.
-    # Override via POLICY_GPT_DEBUG_LOG_DIR env var if needed.
-    debug_log_dir: str = ""
-    debug: bool = True
-    # When True, the rewritten HTML is saved to {debug_log_dir}/improved/
-    # so it can be inspected and is cached for subsequent re-ingestions.
-    # When False, the rewrite runs in-memory only — no files are written.
-    rewrite_save_to_disk: bool = True
-
-    # ── Supplementary context ─────────────────────────────────────────────────
-    # Path to a plain-text file with extra facts (e.g. business rules) injected
-    # into every LLM prompt but never shown to the user as a source.
-    # Derived from document_folder in __post_init__ when left empty.
-    supplementary_facts_file: str = ""
-
-    # ── Domain ────────────────────────────────────────────────────────────────
-    # Selects domain profile (prompt text, entity categories, etc.) from domain/.
-    # Built-in values: "contest" | "policy" | "product_technical"
-    # Add a new file under policygpt/core/domain/ to register additional types.
     domain_type: str = "product_technical"
 
-    # ── Ingestion: access control ─────────────────────────────────────────────
-    # User IDs that are granted access to every document ingested at server
-    # startup.  Set via POLICY_GPT_INGESTION_USER_IDS (comma-separated) so the
-    # documents are queryable by those users through OpenSearch.
-    # Leave empty (default) only when hybrid_search_enabled=False, because an
-    # empty list means the OpenSearch user_id filter never matches anything.
-    ingestion_user_ids: tuple[str, ...] = ("100", "101", "102", "103", "104", "105", "106", "107", "108", "109")
+    # ── Sub-configs (mutable so __post_init__ can apply presets) ─────────────
+    ai: AIConfig = field(default_factory=AIConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
+    ingestion: IngestionConfig = field(default_factory=IngestionConfig)
+    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
+    conversation: ConversationConfig = field(default_factory=ConversationConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
 
-    # ── Redaction ─────────────────────────────────────────────────────────────
-    redaction_rules: dict[str, str] = field(
-        default_factory=lambda: {
-            "Kotak": "KKK",
-            "kotak": "KKK",
-            "KOTAK": "KKK",
-        }
-    )
-
-    # ── OCR ───────────────────────────────────────────────────────────────────
-    # When enabled, images inside HTML files are passed through AWS Textract
-    # and the extracted text is indexed alongside the surrounding content.
-    # Configured per-domain in config/domain_defaults.py.
-    ocr_enabled: bool = False
-    ocr_provider: OCRProvider = OCRProvider.TEXTRACT
-    ocr_min_confidence: float = 80.0  # Textract LINE block confidence threshold (0–100)
-
-    # ── Image fetching ────────────────────────────────────────────────────────
-    # Maximum size (bytes) of a single image that will be resolved, stored, and
-    # optionally OCR'd.  Images exceeding this cap are silently skipped.
-    # Default: 1 MB.  Set via POLICY_GPT_IMAGE_MAX_BYTES env var.
-    image_max_bytes: int = 1 * 1024 * 1024
-
-    # ── Ingestion: document → HTML conversion ────────────────────────────────
-    # Master switch — when True, non-HTML documents are converted to HTML before
-    # extraction so tables are parsed as structured rows/columns.
-    # Converted files are cached in {debug_log_dir}/html/.
-    # Enabled per-domain in config/domain_defaults.py.
-    to_html_enabled: bool = False
-
-    # Per-format switches (only take effect when to_html_enabled=True).
-    # Set False for any format that causes extraction problems in a given domain.
-    pdf_to_html_enabled: bool = True
-    docx_to_html_enabled: bool = True
-    pptx_to_html_enabled: bool = True
-    excel_to_html_enabled: bool = True
-    image_to_html_enabled: bool = True
-
-    # ── Ingestion: policy rewriting ───────────────────────────────────────────
-    # Master switch — pre-processes HTML before extraction.
-    # Adds metadata block, TOC, overview, roles table, regulatory tags, and
-    # related policies as yellow additions around the verbatim policy text.
-    # Does NOT change any original legal language.
-    # Set False to skip rewriting entirely and ingest the source file as-is.
-    rewrite_policies_enabled: bool = True
-
-    # ── Ingestion: FAQ generation ─────────────────────────────────────────────
-    generate_faq: bool = True
-    faq_max_questions: int = 30
-    faq_max_output_tokens: int = 6000  # increased to accommodate paragraph-style answers (10–30 lines each)
-
-    # ── Ingestion: entity extraction ──────────────────────────────────────────
-    generate_entity_map: bool = True
-    entity_map_max_output_tokens: int = 3600
-
-    # ── Retrieval: FAQ fast-path ──────────────────────────────────────────────
-    faq_fastpath_enabled: bool = True
-    faq_fastpath_min_score: float = 0.92
-    aggregate_faq_top_k: int = 30
-
-    # ── Retrieval: section / document counts ──────────────────────────────────
-    # Defaults match the "high" accuracy preset; __post_init__ overwrites these
-    # based on accuracy_profile and runtime_cost_profile.
-    top_docs: int = 3
-    top_sections_per_doc: int = 3
-    max_sections_to_llm: int = 4
-    rerank_section_candidates: int = 12
-    exact_top_docs: int = 2
-    exact_top_sections_per_doc: int = 4
-    exact_max_sections_to_llm: int = 3
-    exact_rerank_section_candidates: int = 10
-    broad_top_docs: int = 6
-    broad_top_sections_per_doc: int = 6
-    broad_max_sections_to_llm: int = 8
-    broad_rerank_section_candidates: int = 24
-
-    # ── Retrieval: evidence sizing ────────────────────────────────────────────
-    max_evidence_snippets_per_section: int = 3
-    evidence_snippet_char_limit: int = 320
-    embedding_raw_excerpt_chars: int = 600
-    answer_context_doc_summary_char_limit: int = 260
-    evidence_chunk_char_limit: int = 900
-    evidence_neighboring_units: int = 1
-    small_section_full_text_chars: int = 1500
-    exact_answer_evidence_char_limit: int = 1600
-    broad_answer_evidence_char_limit: int = 1200
-    answer_evidence_block_limit_exact: int = 2
-    answer_evidence_block_limit_broad: int = 2
-
-    # ── Conversation ──────────────────────────────────────────────────────────
-    max_recent_messages: int = 6
-    recent_chat_message_char_limit: int = 0
-    summarize_after_turns: int = 8
-
-    # ── Ingestion: section chunking ───────────────────────────────────────────
-    min_section_chars: int = 300
-    target_section_chars: int = 1800
-    max_section_chars: int = 3200
-    token_estimate_chars_per_token: int = 4
-    token_estimate_tokens_per_word: float = 1.3
-
-    # ── Ingestion: summarisation token budgets ────────────────────────────────
-    doc_summary_input_token_budget: int = 6000
-    doc_summary_combine_token_budget: int = 4500
-    section_summary_input_token_budget: int = 2500
-    min_recursive_summary_token_budget: int = 250
-    skip_section_summary: bool = False
-
-    # ── Output token limits ───────────────────────────────────────────────────
-    doc_summary_max_output_tokens: int = 1200
-    doc_summary_max_output_tokens_cap: int = 2400
-    doc_summary_chunk_max_output_tokens: int = 660
-    section_summary_max_output_tokens: int = 660
-    chat_max_output_tokens: int = 2700
-    conversation_summary_max_output_tokens: int = 750
-
-    # ── Answer context flags ──────────────────────────────────────────────────
-    # None means "use the runtime_cost_profile default".
-    include_document_metadata_in_answers: bool | None = None
-    include_section_metadata_in_answers: bool | None = None
-    include_document_orientation_in_answers: bool | None = None
-    include_section_orientation_in_answers: bool | None = None
-
-    # ── AI rate limiting ──────────────────────────────────────────────────────
-    ai_rate_limit_retries: int = 2
-    ai_rate_limit_backoff_seconds: float = 8.0
-
-    # ── Hybrid search ─────────────────────────────────────────────────────────
-    # Master switch — set True to route retrieval through an external vector store.
-    # When False (default) the existing in-memory path is used unchanged.
-    hybrid_search_enabled: bool = True
-
-    # Which vector store backend to use.
-    # Must match a key in policygpt/search/factory.py registry.
-    # Swap to "pinecone" / "weaviate" / "pgvector" to switch backends with
-    # zero other code changes.
-    hybrid_search_provider: str = "opensearch"
-
-    # ── OpenSearch provider config ────────────────────────────────────────────
-    # Used only when hybrid_search_provider = "opensearch".
-    # Credentials must be set via environment variables (loaded from opensearch.env).
-    # See opensearch.env.example — never put real credentials in this file.
-    opensearch_host: str = ""
-    opensearch_port: int = 9200
-    opensearch_username: str = ""
-    opensearch_password: str = ""
-    opensearch_use_ssl: bool = True
-    opensearch_verify_certs: bool = False
-    opensearch_index_prefix: str = "product6"
-
-    # ── Hybrid search weights ─────────────────────────────────────────────────
-    # Controls the blend of the three complementary retrieval mechanisms.
-    # Values are normalised at blend time so they do not need to sum to 1.0,
-    # but it is clearest if they do.
-    # Override per domain in config/domain_defaults.py.
-    #
-    #   keyword    — BM25 exact/fuzzy term match (strong for clause numbers,
-    #                defined terms, exact policy names)
-    #   similarity — more_like_this vocabulary overlap (good for paraphrases
-    #                and synonym-rich policy language)
-    #   vector     — dense kNN semantic search (best for intent/meaning queries)
-    hybrid_keyword_weight: float = 0.30
-    hybrid_similarity_weight: float = 0.20
-    hybrid_vector_weight: float = 0.50
-
-    # ── Retrieval scoring weights ─────────────────────────────────────────────
-    doc_semantic_weight: float = 0.48
-    doc_lexical_weight: float = 0.24
-    doc_title_weight: float = 0.16
-    doc_metadata_weight: float = 0.12
-    section_semantic_weight: float = 0.36
-    section_lexical_weight: float = 0.24
-    section_parent_weight: float = 0.16
-    section_title_weight: float = 0.12
-    section_metadata_weight: float = 0.12
-
-    # ── Answerability thresholds ──────────────────────────────────────────────
-    answerability_min_section_score: float = 0.24
-    answerability_high_confidence_score: float = 0.50
-    answerability_min_support_matches: int = 1
-    answerability_min_support_matches_multi_doc: int = 2
-    answerability_min_exact_evidence_matches: int = 1
-    exact_query_section_parent_weight_scale: float = 0.75
-
-    # ── Grounding guard ───────────────────────────────────────────────────────
-    # After the LLM produces an answer, a cheap second call checks whether every
-    # factual claim is supported by the evidence. Flags the answer if not.
-    grounding_guard_enabled: bool = True
-    grounding_guard_max_output_tokens: int = 20
-
-    # ── Answer confidence classification ─────────────────────────────────────
-    confidence_high_score: float = 0.55
-    confidence_medium_score: float = 0.38
-
-    # ── Source filtering ──────────────────────────────────────────────────────
-    # After retrieval, sources whose score falls below
-    # best_score * source_score_min_scaling are dropped from the citation list.
-    source_score_min_scaling: float = 0.45
-
-    # ── Related-question suggestions ─────────────────────────────────────────
-    related_questions_min_score: float = 0.55
-
-    # ── Clarification trigger ─────────────────────────────────────────────────
-    # Questions shorter than this (chars) are treated as potentially ambiguous.
-    ambiguous_query_min_length: int = 35
-    # When confidence is LOW, append a follow-up nudge to the answer.
-    followup_on_low_confidence: bool = True
-
-    # ── Dual-answer (close-confidence disambiguation) ─────────────────────────
-    # When the second-best document scores >= this fraction of the best document,
-    # present both answers and ask the user to choose.
-    dual_answer_enabled: bool = True
-    dual_answer_score_ratio: float = 0.88
-
-    # ── Preferred-document score boost ───────────────────────────────────────
-    # Added to a document/section score when its ID is in the preferred set
-    # (i.e. it was referenced in the previous turn of the conversation).
-    preferred_doc_score_boost: float = 0.08
-
-    # ── Document-lookup answerability threshold ───────────────────────────────
-    document_lookup_score_threshold: float = 0.55
-
-    # ── Topic-alignment threshold ─────────────────────────────────────────────
-    topic_alignment_threshold: float = 0.55
-
-    # ── Exact-match score floor ────────────────────────────────────────────────
-    # When filtering sections for exact-match queries, the score floor is:
-    #   max(best_score * exact_score_floor_scale, exact_score_floor_min)
-    exact_score_floor_min: float = 0.55
-    exact_score_floor_scale: float = 0.65
-
-    # ── Intent classification LLM ─────────────────────────────────────────────
-    intent_classification_max_tokens: int = 10
-    clarifying_question_max_tokens: int = 60
-
-    # ── Domain profile (computed properties) ──────────────────────────────────
+    # ── Domain computed properties ────────────────────────────────────────────
 
     @property
     def domain_profile(self):
@@ -343,175 +109,237 @@ class Config:
     # ── Initialisation ────────────────────────────────────────────────────────
 
     def __post_init__(self) -> None:
-        # Validate and resolve ai_profile
+        # 1. Resolve and validate ai_profile
         ai_profile = (self.ai_profile or "openai").strip().lower()
         ai_preset = AI_PROFILE_PRESETS.get(ai_profile)
         if ai_preset is None:
-            supported = ", ".join(sorted(AI_PROFILE_PRESETS))
-            raise ValueError(f"Config.ai_profile must be one of: {supported}")
+            raise ValueError(f"Config.ai_profile must be one of: {', '.join(sorted(AI_PROFILE_PRESETS))}")
+        object.__setattr__(self, "ai_profile", ai_profile)
+        self.ai.ai_provider = ai_preset["ai_provider"]
+        self.ai.chat_model = (self.ai.chat_model or "").strip() or ai_preset["chat_model"]
+        self.ai.embedding_model = (self.ai.embedding_model or "").strip() or ai_preset["embedding_model"]
+        self.ai.bedrock_gpt_model_size = ai_preset["bedrock_gpt_model_size"]
 
-        # Validate and resolve accuracy_profile
+        # 2. Resolve and validate accuracy_profile; apply preset
         accuracy_profile = (self.accuracy_profile or "high").strip().lower()
         accuracy_preset = ACCURACY_PROFILE_PRESETS.get(accuracy_profile)
         if accuracy_preset is None:
-            supported = ", ".join(sorted(ACCURACY_PROFILE_PRESETS))
-            raise ValueError(f"Config.accuracy_profile must be one of: {supported}")
+            raise ValueError(f"Config.accuracy_profile must be one of: {', '.join(sorted(ACCURACY_PROFILE_PRESETS))}")
+        object.__setattr__(self, "accuracy_profile", accuracy_profile)
 
-        # Validate and resolve runtime_cost_profile
+        high_preset = ACCURACY_PROFILE_PRESETS["high"]
+        for field_name, preset_value in accuracy_preset.items():
+            owner = getattr(self, _PRESET_OWNERS[field_name])
+            if getattr(owner, field_name) == high_preset[field_name]:
+                setattr(owner, field_name, preset_value)
+
+        # 3. Resolve and validate runtime_cost_profile; apply preset
         runtime_cost_profile = (self.runtime_cost_profile or "standard").strip().lower()
         runtime_cost_preset = RUNTIME_COST_PROFILE_PRESETS.get(runtime_cost_profile)
         if runtime_cost_preset is None:
-            supported = ", ".join(sorted(RUNTIME_COST_PROFILE_PRESETS))
-            raise ValueError(f"Config.runtime_cost_profile must be one of: {supported}")
-
-        object.__setattr__(self, "ai_profile", ai_profile)
-        object.__setattr__(self, "accuracy_profile", accuracy_profile)
+            raise ValueError(f"Config.runtime_cost_profile must be one of: {', '.join(sorted(RUNTIME_COST_PROFILE_PRESETS))}")
         object.__setattr__(self, "runtime_cost_profile", runtime_cost_profile)
-        object.__setattr__(self, "ai_provider", ai_preset["ai_provider"])
-        object.__setattr__(self, "chat_model", (self.chat_model or "").strip() or ai_preset["chat_model"])
-        object.__setattr__(self, "embedding_model", (self.embedding_model or "").strip() or ai_preset["embedding_model"])
-        object.__setattr__(self, "bedrock_gpt_model_size", ai_preset["bedrock_gpt_model_size"])
 
-        # Apply accuracy preset — preserve any field already tuned away from
-        # the "high" baseline so explicit overrides are not clobbered.
-        high_accuracy_preset = ACCURACY_PROFILE_PRESETS["high"]
-        for field_name, preset_value in accuracy_preset.items():
-            if getattr(self, field_name) == high_accuracy_preset[field_name]:
-                object.__setattr__(self, field_name, preset_value)
-
-        # Apply runtime cost preset
-        standard_runtime_cost_preset = RUNTIME_COST_PROFILE_PRESETS["standard"]
-        explicit_runtime_bool_fields = {
-            "include_document_metadata_in_answers",
-            "include_section_metadata_in_answers",
-            "include_document_orientation_in_answers",
-            "include_section_orientation_in_answers",
-        }
+        standard_preset = RUNTIME_COST_PROFILE_PRESETS["standard"]
         if runtime_cost_profile == "standard":
-            for field_name, preset_value in standard_runtime_cost_preset.items():
-                if field_name in explicit_runtime_bool_fields and getattr(self, field_name) is None:
-                    object.__setattr__(self, field_name, preset_value)
+            for field_name, preset_value in standard_preset.items():
+                owner = getattr(self, _PRESET_OWNERS[field_name])
+                if field_name in _OUTPUT_BOOL_FIELDS and getattr(owner, field_name) is None:
+                    setattr(owner, field_name, preset_value)
         else:
             for field_name, preset_value in runtime_cost_preset.items():
-                current_value = getattr(self, field_name)
-                if field_name in explicit_runtime_bool_fields:
-                    if current_value is None:
-                        object.__setattr__(self, field_name, preset_value)
+                owner = getattr(self, _PRESET_OWNERS[field_name])
+                current = getattr(owner, field_name)
+                if field_name in _OUTPUT_BOOL_FIELDS:
+                    if current is None:
+                        setattr(owner, field_name, preset_value)
                     continue
-                baseline_value = accuracy_preset.get(field_name, standard_runtime_cost_preset[field_name])
-                if current_value == baseline_value:
-                    object.__setattr__(self, field_name, preset_value)
+                baseline = accuracy_preset.get(field_name, standard_preset[field_name])
+                if current == baseline:
+                    setattr(owner, field_name, preset_value)
 
-        # Scale up limits for the 120B model's larger context window.
-        # These are floor values — already-tuned-higher fields are left alone.
-        if self.bedrock_gpt_model_size == "120b":
-            _120b_floors: dict[str, int] = {
-                "chat_max_output_tokens": 6000,
+        # 4. Scale up limits for the 120B model's larger context window
+        if self.ai.bedrock_gpt_model_size == "120b":
+            for field_name, floor in {
                 "exact_answer_evidence_char_limit": 3000,
                 "broad_answer_evidence_char_limit": 2500,
                 "evidence_chunk_char_limit": 2000,
                 "answer_evidence_block_limit_exact": 4,
                 "answer_evidence_block_limit_broad": 4,
-                "doc_summary_input_token_budget": 12000,
-                "doc_summary_combine_token_budget": 9000,
                 "answer_context_doc_summary_char_limit": 500,
                 "small_section_full_text_chars": 3000,
-            }
-            for field_name, floor_value in _120b_floors.items():
-                if getattr(self, field_name) < floor_value:
-                    object.__setattr__(self, field_name, floor_value)
+            }.items():
+                if getattr(self.retrieval, field_name) < floor:
+                    setattr(self.retrieval, field_name, floor)
 
-        # Apply domain-specific Config overrides (config/domain_defaults.py).
-        # Runs last so values compound on top of model-floor adjustments above.
+            for field_name, floor in {
+                "doc_summary_input_token_budget": 12000,
+                "doc_summary_combine_token_budget": 9000,
+            }.items():
+                if getattr(self.ingestion, field_name) < floor:
+                    setattr(self.ingestion, field_name, floor)
+
+            if self.output.chat_max_output_tokens < 6000:
+                self.output.chat_max_output_tokens = 6000
+
+        # 5. Apply domain-specific Config overrides
         domain_overrides = DOMAIN_CONFIG_OVERRIDES.get(self.domain_type, {})
 
-        # chat_max_output_tokens — treated as a floor (higher of model or domain wins).
         if "chat_max_output_tokens" in domain_overrides:
-            object.__setattr__(
-                self,
-                "chat_max_output_tokens",
-                max(self.chat_max_output_tokens, int(domain_overrides["chat_max_output_tokens"])),
+            self.output.chat_max_output_tokens = max(
+                self.output.chat_max_output_tokens,
+                int(domain_overrides["chat_max_output_tokens"]),
             )
 
-        # Boolean / scalar domain overrides — only apply when the field is
-        # still at its dataclass default (respects explicit constructor args).
         for field_name in (
-            "ocr_enabled",
-            "ocr_min_confidence",
-            "hybrid_keyword_weight",
-            "hybrid_similarity_weight",
-            "hybrid_vector_weight",
-            "rewrite_policies_enabled",
-            "to_html_enabled",
-            "pdf_to_html_enabled",
-            "docx_to_html_enabled",
-            "pptx_to_html_enabled",
-            "excel_to_html_enabled",
-            "image_to_html_enabled",
+            "ocr_enabled", "ocr_min_confidence", "rewrite_policies_enabled",
+            "to_html_enabled", "pdf_to_html_enabled", "docx_to_html_enabled",
+            "pptx_to_html_enabled", "excel_to_html_enabled", "image_to_html_enabled",
         ):
             if field_name in domain_overrides:
-                default_value = Config.__dataclass_fields__[field_name].default
-                if getattr(self, field_name) == default_value:
-                    object.__setattr__(self, field_name, domain_overrides[field_name])
+                default_value = IngestionConfig.__dataclass_fields__[field_name].default
+                if getattr(self.ingestion, field_name) == default_value:
+                    setattr(self.ingestion, field_name, domain_overrides[field_name])
 
-        # Derive debug_log_dir and supplementary_facts_file from document_folder
-        # when they are not explicitly set.  This means changing document_folder
-        # is the only edit needed to relocate all three paths.
-        metadata_dir = os.path.join(self.document_folder, "metadata")
+        for field_name in ("hybrid_keyword_weight", "hybrid_similarity_weight", "hybrid_vector_weight"):
+            if field_name in domain_overrides:
+                default_value = SearchConfig.__dataclass_fields__[field_name].default
+                if getattr(self.search, field_name) == default_value:
+                    setattr(self.search, field_name, domain_overrides[field_name])
+
+        # 6. Derive debug_log_dir and supplementary_facts_file from document_folder
+        metadata_dir = os.path.join(self.storage.document_folder, "metadata")
         os.makedirs(metadata_dir, exist_ok=True)
-        if not self.debug_log_dir:
-            object.__setattr__(self, "debug_log_dir", metadata_dir)
-        if not self.supplementary_facts_file:
-            object.__setattr__(
-                self,
-                "supplementary_facts_file",
-                os.path.join(metadata_dir, "supplementary_facts.txt"),
-            )
+        if not self.storage.debug_log_dir:
+            self.storage.debug_log_dir = metadata_dir
+        if not self.storage.supplementary_facts_file:
+            self.storage.supplementary_facts_file = os.path.join(metadata_dir, "supplementary_facts.txt")
 
     @classmethod
     def from_env(cls) -> "Config":
         """Build a Config from environment variables, falling back to defaults."""
         base = cls()
-        debug_log_dir_env = os.getenv("POLICY_GPT_DEBUG_LOG_DIR")
         debug_env = os.getenv("POLICY_GPT_DEBUG")
+
+        ai = AIConfig(
+            bedrock_region=(
+                os.getenv("AWS_BEDROCK_REGION", os.getenv("AWS_REGION", base.ai.bedrock_region)).strip()
+                or base.ai.bedrock_region
+            ),
+        )
+
+        storage = StorageConfig(
+            public_base_url=os.getenv("POLICY_GPT_PUBLIC_BASE_URL", base.storage.public_base_url).rstrip("/"),
+            usd_to_inr_exchange_rate=_env_float("POLICY_GPT_USD_TO_INR_RATE", base.storage.usd_to_inr_exchange_rate),
+            debug_log_dir=os.getenv("POLICY_GPT_DEBUG_LOG_DIR", base.storage.debug_log_dir) or "",
+            debug=(
+                base.storage.debug
+                if debug_env is None
+                else debug_env.strip().lower() in {"1", "true", "yes", "on"}
+            ),
+        )
+
+        ingestion = IngestionConfig(
+            doc_summary_input_token_budget=_env_int(
+                "POLICY_GPT_DOC_SUMMARY_INPUT_TOKEN_BUDGET", base.ingestion.doc_summary_input_token_budget
+            ),
+            doc_summary_combine_token_budget=_env_int(
+                "POLICY_GPT_DOC_SUMMARY_COMBINE_TOKEN_BUDGET", base.ingestion.doc_summary_combine_token_budget
+            ),
+            section_summary_input_token_budget=_env_int(
+                "POLICY_GPT_SECTION_SUMMARY_INPUT_TOKEN_BUDGET", base.ingestion.section_summary_input_token_budget
+            ),
+            min_recursive_summary_token_budget=_env_int(
+                "POLICY_GPT_MIN_RECURSIVE_SUMMARY_TOKEN_BUDGET", base.ingestion.min_recursive_summary_token_budget
+            ),
+            skip_section_summary=bool(_env_bool("POLICY_GPT_SKIP_SECTION_SUMMARY", base.ingestion.skip_section_summary)),
+            image_max_bytes=_env_int("POLICY_GPT_IMAGE_MAX_BYTES", base.ingestion.image_max_bytes),
+            ingestion_user_ids=(
+                tuple(
+                    uid.strip()
+                    for uid in os.getenv("POLICY_GPT_INGESTION_USER_IDS", "").split(",")
+                    if uid.strip()
+                )
+                or base.ingestion.ingestion_user_ids
+            ),
+        )
+
+        retrieval = RetrievalConfig(
+            answer_context_doc_summary_char_limit=_env_int(
+                "POLICY_GPT_ANSWER_CONTEXT_DOC_SUMMARY_CHAR_LIMIT",
+                base.retrieval.answer_context_doc_summary_char_limit,
+            ),
+        )
+
+        output = OutputConfig(
+            doc_summary_max_output_tokens=_env_int(
+                "POLICY_GPT_DOC_SUMMARY_MAX_OUTPUT_TOKENS", base.output.doc_summary_max_output_tokens
+            ),
+            doc_summary_chunk_max_output_tokens=_env_int(
+                "POLICY_GPT_DOC_SUMMARY_CHUNK_MAX_OUTPUT_TOKENS", base.output.doc_summary_chunk_max_output_tokens
+            ),
+            section_summary_max_output_tokens=_env_int(
+                "POLICY_GPT_SECTION_SUMMARY_MAX_OUTPUT_TOKENS", base.output.section_summary_max_output_tokens
+            ),
+            include_document_metadata_in_answers=_env_bool(
+                "POLICY_GPT_INCLUDE_DOCUMENT_METADATA_IN_ANSWERS", base.output.include_document_metadata_in_answers
+            ),
+            include_section_metadata_in_answers=_env_bool(
+                "POLICY_GPT_INCLUDE_SECTION_METADATA_IN_ANSWERS", base.output.include_section_metadata_in_answers
+            ),
+            include_document_orientation_in_answers=_env_bool(
+                "POLICY_GPT_INCLUDE_DOCUMENT_ORIENTATION_IN_ANSWERS",
+                base.output.include_document_orientation_in_answers,
+            ),
+            include_section_orientation_in_answers=_env_bool(
+                "POLICY_GPT_INCLUDE_SECTION_ORIENTATION_IN_ANSWERS",
+                base.output.include_section_orientation_in_answers,
+            ),
+        )
+
+        conversation = ConversationConfig(
+            recent_chat_message_char_limit=_env_int(
+                "POLICY_GPT_RECENT_CHAT_MESSAGE_CHAR_LIMIT", base.conversation.recent_chat_message_char_limit
+            ),
+        )
+
+        cache = CacheConfig(
+            cache_provider=os.getenv("CACHE_PROVIDER", base.cache.cache_provider).strip().lower()
+            or base.cache.cache_provider,
+            redis_host=os.getenv("REDIS_HOST", base.cache.redis_host).strip(),
+            redis_port=_env_int("REDIS_PORT", base.cache.redis_port),
+            redis_db=_env_int("REDIS_DB", base.cache.redis_db),
+            redis_password=os.getenv("REDIS_PASSWORD", base.cache.redis_password),
+            redis_ssl=bool(_env_bool("REDIS_SSL", base.cache.redis_ssl)),
+            redis_ssl_ca_certs=os.getenv("REDIS_SSL_CA_CERTS", base.cache.redis_ssl_ca_certs),
+            redis_key_prefix=os.getenv("REDIS_KEY_PREFIX", base.cache.redis_key_prefix).strip()
+            or base.cache.redis_key_prefix,
+        )
+
+        search = SearchConfig(
+            opensearch_host=os.getenv("OS_HOST", base.search.opensearch_host).strip(),
+            opensearch_port=_env_int("OS_PORT", base.search.opensearch_port),
+            opensearch_username=os.getenv("OS_USERNAME", base.search.opensearch_username).strip(),
+            opensearch_password=os.getenv("OS_PASSWORD", base.search.opensearch_password),
+            opensearch_use_ssl=bool(_env_bool("OS_USE_SSL", base.search.opensearch_use_ssl)),
+            opensearch_verify_certs=bool(_env_bool("OS_VERIFY_CERTS", base.search.opensearch_verify_certs)),
+            opensearch_index_prefix=os.getenv("OS_INDEX_PREFIX", base.search.opensearch_index_prefix).strip()
+            or base.search.opensearch_index_prefix,
+        )
+
         return cls(
             ai_profile=os.getenv("POLICY_GPT_AI_PROFILE", base.ai_profile).strip() or base.ai_profile,
-            accuracy_profile=os.getenv("POLICY_GPT_ACCURACY_PROFILE", base.accuracy_profile).strip() or base.accuracy_profile,
-            runtime_cost_profile=os.getenv("POLICY_GPT_RUNTIME_COST_PROFILE", base.runtime_cost_profile).strip() or base.runtime_cost_profile,
-            chat_model=base.chat_model,
-            embedding_model=base.embedding_model,
-            public_base_url=os.getenv("POLICY_GPT_PUBLIC_BASE_URL", base.public_base_url).rstrip("/"),
-            bedrock_region=os.getenv("AWS_BEDROCK_REGION", os.getenv("AWS_REGION", base.bedrock_region)).strip() or base.bedrock_region,
-            usd_to_inr_exchange_rate=_env_float("POLICY_GPT_USD_TO_INR_RATE", base.usd_to_inr_exchange_rate),
-            doc_summary_input_token_budget=_env_int("POLICY_GPT_DOC_SUMMARY_INPUT_TOKEN_BUDGET", base.doc_summary_input_token_budget),
-            doc_summary_combine_token_budget=_env_int("POLICY_GPT_DOC_SUMMARY_COMBINE_TOKEN_BUDGET", base.doc_summary_combine_token_budget),
-            section_summary_input_token_budget=_env_int("POLICY_GPT_SECTION_SUMMARY_INPUT_TOKEN_BUDGET", base.section_summary_input_token_budget),
-            min_recursive_summary_token_budget=_env_int("POLICY_GPT_MIN_RECURSIVE_SUMMARY_TOKEN_BUDGET", base.min_recursive_summary_token_budget),
-            skip_section_summary=bool(_env_bool("POLICY_GPT_SKIP_SECTION_SUMMARY", base.skip_section_summary)),
-            doc_summary_max_output_tokens=_env_int("POLICY_GPT_DOC_SUMMARY_MAX_OUTPUT_TOKENS", base.doc_summary_max_output_tokens),
-            doc_summary_chunk_max_output_tokens=_env_int("POLICY_GPT_DOC_SUMMARY_CHUNK_MAX_OUTPUT_TOKENS", base.doc_summary_chunk_max_output_tokens),
-            section_summary_max_output_tokens=_env_int("POLICY_GPT_SECTION_SUMMARY_MAX_OUTPUT_TOKENS", base.section_summary_max_output_tokens),
-            answer_context_doc_summary_char_limit=_env_int("POLICY_GPT_ANSWER_CONTEXT_DOC_SUMMARY_CHAR_LIMIT", base.answer_context_doc_summary_char_limit),
-            recent_chat_message_char_limit=_env_int("POLICY_GPT_RECENT_CHAT_MESSAGE_CHAR_LIMIT", base.recent_chat_message_char_limit),
-            include_document_metadata_in_answers=_env_bool("POLICY_GPT_INCLUDE_DOCUMENT_METADATA_IN_ANSWERS", base.include_document_metadata_in_answers),
-            include_section_metadata_in_answers=_env_bool("POLICY_GPT_INCLUDE_SECTION_METADATA_IN_ANSWERS", base.include_section_metadata_in_answers),
-            include_document_orientation_in_answers=_env_bool("POLICY_GPT_INCLUDE_DOCUMENT_ORIENTATION_IN_ANSWERS", base.include_document_orientation_in_answers),
-            include_section_orientation_in_answers=_env_bool("POLICY_GPT_INCLUDE_SECTION_ORIENTATION_IN_ANSWERS", base.include_section_orientation_in_answers),
-            debug_log_dir=base.debug_log_dir if debug_log_dir_env is None else debug_log_dir_env.strip(),
-            debug=base.debug if debug_env is None else debug_env.strip().lower() in {"1", "true", "yes", "on"},
+            accuracy_profile=os.getenv("POLICY_GPT_ACCURACY_PROFILE", base.accuracy_profile).strip()
+            or base.accuracy_profile,
+            runtime_cost_profile=os.getenv("POLICY_GPT_RUNTIME_COST_PROFILE", base.runtime_cost_profile).strip()
+            or base.runtime_cost_profile,
             domain_type=os.getenv("POLICY_GPT_DOMAIN_TYPE", base.domain_type).strip() or base.domain_type,
-            # OpenSearch credentials — read from env only, never from code defaults
-            opensearch_host=os.getenv("OS_HOST", base.opensearch_host).strip(),
-            opensearch_port=_env_int("OS_PORT", base.opensearch_port),
-            opensearch_username=os.getenv("OS_USERNAME", base.opensearch_username).strip(),
-            opensearch_password=os.getenv("OS_PASSWORD", base.opensearch_password),
-            opensearch_use_ssl=bool(_env_bool("OS_USE_SSL", base.opensearch_use_ssl)),
-            opensearch_verify_certs=bool(_env_bool("OS_VERIFY_CERTS", base.opensearch_verify_certs)),
-            opensearch_index_prefix=os.getenv("OS_INDEX_PREFIX", base.opensearch_index_prefix).strip() or base.opensearch_index_prefix,
-            ingestion_user_ids=tuple(
-                uid.strip()
-                for uid in os.getenv("POLICY_GPT_INGESTION_USER_IDS", "").split(",")
-                if uid.strip()
-            ),
-            image_max_bytes=_env_int("POLICY_GPT_IMAGE_MAX_BYTES", base.image_max_bytes),
+            ai=ai,
+            storage=storage,
+            ingestion=ingestion,
+            retrieval=retrieval,
+            output=output,
+            conversation=conversation,
+            cache=cache,
+            search=search,
         )

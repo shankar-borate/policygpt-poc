@@ -35,10 +35,10 @@ def create_vector_store(config: Config) -> Optional[VectorStore]:
     Returns None when opensearch_enabled=False so corpus.py can fall back to
     the existing in-memory retrieval path without any code change.
     """
-    if not config.hybrid_search_enabled:
+    if not config.search.hybrid_search_enabled:
         return None
 
-    provider = config.hybrid_search_provider
+    provider = config.search.hybrid_search_provider
     import_path = _PROVIDER_REGISTRY.get(provider)
 
     if import_path is None:
@@ -49,12 +49,12 @@ def create_vector_store(config: Config) -> Optional[VectorStore]:
 
     # Validate OpenSearch credentials are present before attempting connection
     if provider == "opensearch":
-        if not config.opensearch_host:
+        if not config.search.opensearch_host:
             raise RuntimeError(
                 "OS_HOST is not set. "
                 "Copy opensearch.env.example to opensearch.env and fill in credentials."
             )
-        if not config.opensearch_username or not config.opensearch_password:
+        if not config.search.opensearch_username or not config.search.opensearch_password:
             raise RuntimeError(
                 "OS_USERNAME or OS_PASSWORD is not set. "
                 "Copy opensearch.env.example to opensearch.env and fill in credentials."
@@ -73,7 +73,7 @@ def create_vector_store(config: Config) -> Optional[VectorStore]:
     embedding_dim = _resolve_embedding_dim(config)
     store.ensure_index(embedding_dim)
 
-    logger.info("Vector store ready: provider=%s  index_prefix=%s", provider, config.opensearch_index_prefix)
+    logger.info("Vector store ready: provider=%s  index_prefix=%s", provider, config.search.opensearch_index_prefix)
     return store
 
 
@@ -86,7 +86,7 @@ def _import_class(dotted_path: str):
 
 def _resolve_embedding_dim(config: Config) -> int:
     """Return the embedding vector dimension for the configured model."""
-    model = (config.embedding_model or "").lower()
+    model = (config.ai.embedding_model or "").lower()
     # Titan text embedding v2 → 1024; v1 → 1536; OpenAI ada-002 → 1536
     if "v2" in model and "titan" in model:
         return 1024

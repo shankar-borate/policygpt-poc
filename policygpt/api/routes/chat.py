@@ -91,7 +91,7 @@ class PolicyApiServer:
             "status": display_status,
             "ingesting": status == "ingesting",
             "error": self.runtime.error,
-            "document_folder": self.runtime.document_folder,
+            "document_folder": self.runtime.storage.document_folder,
             "document_count": self.runtime.get_document_count(),
             "section_count": self.runtime.get_section_count(),
             "thread_count": len(bot.threads) if bot else 0,
@@ -115,7 +115,7 @@ class PolicyApiServer:
             raise HTTPException(status_code=422, detail="Query cannot be empty.")
 
         user_id = _resolve_user_id(http_request, user_id)
-        if not user_id and self.config.hybrid_search_enabled:
+        if not user_id and self.config.search.hybrid_search_enabled:
             raise HTTPException(status_code=401, detail="user_id cookie or query param is required.")
 
         page = max(1, page)
@@ -149,7 +149,7 @@ class PolicyApiServer:
                 "snippet":        r["snippet"],
                 "score":          r["score"],
                 "document_url": build_document_open_url(
-                    self.config.public_base_url,
+                    self.config.storage.public_base_url,
                     r["source_path"],
                 ),
             }
@@ -206,7 +206,7 @@ class PolicyApiServer:
             raise HTTPException(status_code=422, detail="Message cannot be empty.")
 
         user_id = _resolve_user_id(http_request, user_id) or None
-        if user_id is None and self.config.hybrid_search_enabled:
+        if user_id is None and self.config.search.hybrid_search_enabled:
             raise HTTPException(status_code=401, detail="user_id cookie or query param is required.")
 
         with self.runtime.lock:
@@ -357,7 +357,7 @@ class PolicyApiServer:
 
     def _resolve_document_path(self, path: str) -> Path:
         requested_path = Path(path).resolve()
-        allowed_root = Path(self.config.document_folder).resolve()
+        allowed_root = Path(self.config.storage.document_folder).resolve()
 
         try:
             requested_path.relative_to(allowed_root)

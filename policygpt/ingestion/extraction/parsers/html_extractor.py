@@ -57,17 +57,17 @@ class HtmlExtractor(BaseExtractor):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        if config.ocr_enabled:
+        if config.ingestion.ocr_enabled:
             if getattr(config, "ocr_provider", OCRProvider.TEXTRACT) == OCRProvider.CLAUDE:
                 self._ocr: TextractOCR | ClaudeVisionOCR | None = ClaudeVisionOCR()
             else:
                 self._ocr = TextractOCR(
-                    region=config.bedrock_region,
-                    min_confidence=config.ocr_min_confidence,
+                    region=config.ai.bedrock_region,
+                    min_confidence=config.ingestion.ocr_min_confidence,
                 )
         else:
             self._ocr = None
-        self._image_fetcher = ImageFetcher(max_bytes=config.image_max_bytes)
+        self._image_fetcher = ImageFetcher(max_bytes=config.ingestion.image_max_bytes)
 
     # ── Public interface ───────────────────────────────────────────────────────
 

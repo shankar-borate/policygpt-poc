@@ -99,9 +99,9 @@ class IngestionPipeline:
         # rewrite_save_to_disk (debug/log config) controls whether the improved
         # HTML is persisted to {debug_log_dir}/improved/ or kept in-memory only.
         rewriter: PolicyRewriter | None = None
-        if corpus.config.rewrite_policies_enabled:
-            debug_log_dir = (corpus.config.debug_log_dir or "").strip()
-            save_to_disk  = corpus.config.rewrite_save_to_disk and bool(debug_log_dir)
+        if corpus.config.ingestion.rewrite_policies_enabled:
+            debug_log_dir = (corpus.config.storage.debug_log_dir or "").strip()
+            save_to_disk  = corpus.config.storage.rewrite_save_to_disk and bool(debug_log_dir)
             output_dir    = Path(debug_log_dir) / "improved" if save_to_disk else None
             rewriter = PolicyRewriter(
                 output_dir=output_dir,
@@ -117,23 +117,23 @@ class IngestionPipeline:
         # subsequent runs.  Per-format flags in config control which converters
         # are active (pdf_to_html_enabled, docx_to_html_enabled, etc.).
         html_converter_registry: HtmlConverterRegistry | None = None
-        if corpus.config.to_html_enabled:
-            debug_log_dir = (corpus.config.debug_log_dir or "").strip()
+        if corpus.config.ingestion.to_html_enabled:
+            debug_log_dir = (corpus.config.storage.debug_log_dir or "").strip()
             if debug_log_dir:
                 html_dir = Path(debug_log_dir) / "html"
 
                 # Build the set of content-types to skip based on per-format flags.
                 cfg = corpus.config
                 skip_cts: set[str] = set()
-                if not cfg.pdf_to_html_enabled:
+                if not cfg.ingestion.pdf_to_html_enabled:
                     skip_cts.update({"pdf"})
-                if not cfg.docx_to_html_enabled:
+                if not cfg.ingestion.docx_to_html_enabled:
                     skip_cts.update({"docx", "doc"})
-                if not cfg.pptx_to_html_enabled:
+                if not cfg.ingestion.pptx_to_html_enabled:
                     skip_cts.update({"pptx", "ppt"})
-                if not cfg.excel_to_html_enabled:
+                if not cfg.ingestion.excel_to_html_enabled:
                     skip_cts.update({"xlsx", "xls"})
-                if not cfg.image_to_html_enabled:
+                if not cfg.ingestion.image_to_html_enabled:
                     skip_cts.update({"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp"})
 
                 html_converter_registry = HtmlConverterRegistry(
@@ -288,7 +288,7 @@ class IngestionPipeline:
             )
             # Use first result for this message; extras are handled via _extra_messages
             html_path, html_content = all_conversions[0]
-            logger.debug(
+            logger.storage.debug(
                 "HtmlConverterRegistry: converted %s (%s) → %s (%d part(s))",
                 message.file_name, message.content_type, html_path, len(all_conversions),
             )
@@ -316,7 +316,7 @@ class IngestionPipeline:
 
         if not self._registry.supports(message.content_type):
             reason = f"no extractor for content_type={message.content_type!r}"
-            logger.debug("Skipping %s: %s", message.source_path, reason)
+            logger.storage.debug("Skipping %s: %s", message.source_path, reason)
             return ("skipped", reason)
 
         # ── Step 2: Rewrite HTML for PolicyGPT optimisation ──────────────────
@@ -328,7 +328,7 @@ class IngestionPipeline:
             if improved_path != message.source_path:
                 message.source_path = improved_path
             print(f"  [Rewrite]  {message.file_name} — done in {_time.perf_counter()-_t:.1f}s", flush=True)
-            logger.debug("PolicyRewriter: applied to %s", message.file_name)
+            logger.storage.debug("PolicyRewriter: applied to %s", message.file_name)
 
         user_ids: list[str] = message.user_ids or self._default_user_ids
         domain: str = message.domain or self._default_domain

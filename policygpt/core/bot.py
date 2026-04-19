@@ -30,6 +30,7 @@ from policygpt.ingestion.extraction.redaction import Redactor
 from policygpt.ingestion.extraction.taxonomy import unique_preserving_order
 from policygpt.observability.usage_metrics import LLMUsageTracker
 from policygpt.config.user_profiles import UserProfile
+from policygpt.cache import CacheManager, build_cache_backend
 
 
 class PolicyGPTBot:
@@ -43,10 +44,11 @@ class PolicyGPTBot:
         corpus: DocumentCorpus | None = None,
         conversations: ConversationManager | None = None,
         thread_repo=None,
+        cache: CacheManager | None = None,
     ) -> None:
         self.config = config
         self.usage_tracker = usage_tracker
-        self.redactor = redactor or Redactor(config.redaction_rules)
+        self.redactor = redactor or Redactor(config.ingestion.redaction_rules)
         self.ai = ai or self._build_ai_service()
         self.extractor = extractor or FileExtractor(config)
         self.query_analyzer = QueryAnalyzer()
@@ -55,12 +57,22 @@ class PolicyGPTBot:
             extractor=self.extractor,
             ai=self.ai,
             redactor=self.redactor,
+            cache=self.cache,
+        )
+        self.cache = cache or CacheManager(
+            backend=build_cache_backend(
+                provider=config.cache.cache_provider,
+                redis_host=config.cache.redis_host,
+                redis_port=config.cache.redis_port,
+                redis_db=config.cache.redis_db,
+                redis_password=config.cache.redis_password,
+                redis_ssl=config.cache.redis_ssl,
+                redis_ssl_ca_certs=config.cache.redis_ssl_ca_certs,
+                redis_key_prefix=config.cache.redis_key_prefix,
+            )
         )
         self.conversations = conversations or ConversationManager(repo=thread_repo)
         self._supplementary_facts: str = self._load_supplementary_facts()
-        # In-memory answer cache: (normalized_question, frozenset(active_doc_ids)) → (answer, sources).
-        # Only caches non-context-dependent queries. Cleared on process restart.
-        self._answer_cache: dict[tuple, tuple[str, list[SourceReference]]] = {}
 
     @property
     def documents(self):
@@ -202,7 +214,7 @@ class PolicyGPTBot:
             # answer directly without running the full RAG pipeline.
             faq_hit = self.corpus.faq_fastpath_lookup(
                 query_vec,
-                min_score=self.config.faq_fastpath_min_score,
+                min_score=self.config.retrieval.faq_fastpath_min_score,
                 user_id=user_id,
             )
             if faq_hit:
@@ -224,7 +236,7 @@ class PolicyGPTBot:
             if not query_analysis.context_dependent:
                 _norm_q = re.sub(r"\s+", " ", user_question.strip().casefold())
                 _cache_key = (_norm_q, frozenset(thread.active_doc_ids))
-                _cached = self._answer_cache.get(_cache_key)
+                _cached = self.cache.get_answer(_norm_q, frozenset(thread.active_doc_ids))
                 if _cached is not None:
                     cached_answer, cached_sources = _cached
                     thread.display_messages.append(Message(role="user", content=user_question))
@@ -297,7 +309,7 @@ class PolicyGPTBot:
                 # the reference list focused on genuinely relevant sections.
                 if len(sources) > 1:
                     best_src_score = sources[0].score
-                    min_src = max(self.config.answerability_min_section_score, best_src_score * self.config.source_score_min_scaling)
+                    min_src = max(self.config.retrieval.answerability_min_section_score, best_src_score * self.config.retrieval.source_score_min_scaling)
                     sources = [s for s in sources if s.score >= min_src] or sources[:1]
 
                 is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
@@ -369,7 +381,7 @@ class PolicyGPTBot:
                             purpose="chat_answer",
                             system_prompt=self.redactor.mask_text(self._system_prompt(user_profile)),
                             user_prompt=self.redactor.mask_text(prompt_payload),
-                            max_output_tokens=self.config.chat_max_output_tokens,
+                            max_output_tokens=self.config.output.chat_max_output_tokens,
                         )
                         answer_text = self._normalize_answer_markdown(self.redactor.unmask_text(masked_answer))
                         if not self._check_answer_grounding(answer_text, prompt_payload):
@@ -385,7 +397,7 @@ class PolicyGPTBot:
                     # ── Feature 1b: follow-up nudge on LOW confidence ──────────
                     if (
                         confidence == ConfidenceLevel.LOW
-                        and self.config.followup_on_low_confidence
+                        and self.config.retrieval.followup_on_low_confidence
                         and not self._is_dual_answer_candidate(top_docs, top_sections, query_analysis)
                     ):
                         followup = self._generate_low_confidence_followup(
@@ -420,7 +432,7 @@ class PolicyGPTBot:
             final_answer = self._sanitize_answer_for_user(answer_text.strip())
             # Populate cache for eligible queries (non-context-dependent + answerable)
             if _cache_key is not None and is_answerable:
-                self._answer_cache[_cache_key] = (final_answer, sources)
+                self.cache.set_answer(_norm_q, frozenset(thread.active_doc_ids), final_answer, sources)
             self._write_retrieval_log(
                 thread_id=thread.thread_id,
                 user_question=user_question,
@@ -434,7 +446,7 @@ class PolicyGPTBot:
                 sources=sources,
             )
 
-            recent_message_limit = max(0, self.config.max_recent_messages)
+            recent_message_limit = max(0, self.config.conversation.max_recent_messages)
             thread.recent_messages.append(Message(role="user", content=user_question))
             thread.recent_messages.append(
                 Message(
@@ -458,7 +470,7 @@ class PolicyGPTBot:
                 thread.title = self._derive_thread_title(user_question)
             thread.updated_at = utc_now_iso()
 
-            if len(thread.recent_messages) >= self.config.summarize_after_turns:
+            if len(thread.recent_messages) >= self.config.conversation.summarize_after_turns:
                 thread.conversation_summary = self._refresh_conversation_summary(thread)
 
             return ChatResult(
@@ -484,29 +496,34 @@ class PolicyGPTBot:
         return self.chat(thread_id, user_question).answer
 
     def _embed_one(self, text: str) -> np.ndarray:
-        return self.corpus.embed_text(text)
+        cached = self.cache.get_embedding(text)
+        if cached is not None:
+            return cached
+        vector = self.corpus.embed_text(text)
+        self.cache.set_embedding(text, vector)
+        return vector
 
     def _build_ai_service(self) -> AIService:
-        if self.config.ai_provider == AIProvider.BEDROCK:
+        if self.config.ai.ai_provider == AIProvider.BEDROCK:
             return BedrockService(
-                chat_model=self.config.chat_model,
-                embedding_model=self.config.embedding_model,
-                region_name=self.config.bedrock_region,
-                rate_limit_retries=self.config.ai_rate_limit_retries,
-                rate_limit_backoff_seconds=self.config.ai_rate_limit_backoff_seconds,
+                chat_model=self.config.ai.chat_model,
+                embedding_model=self.config.ai.embedding_model,
+                region_name=self.config.ai.bedrock_region,
+                rate_limit_retries=self.config.ai.ai_rate_limit_retries,
+                rate_limit_backoff_seconds=self.config.ai.ai_rate_limit_backoff_seconds,
                 usage_tracker=self.usage_tracker,
             )
 
-        if self.config.ai_provider == AIProvider.OPENAI:
+        if self.config.ai.ai_provider == AIProvider.OPENAI:
             return OpenAIService(
-                self.config.chat_model,
-                self.config.embedding_model,
-                rate_limit_retries=self.config.ai_rate_limit_retries,
-                rate_limit_backoff_seconds=self.config.ai_rate_limit_backoff_seconds,
+                self.config.ai.chat_model,
+                self.config.ai.embedding_model,
+                rate_limit_retries=self.config.ai.ai_rate_limit_retries,
+                rate_limit_backoff_seconds=self.config.ai.ai_rate_limit_backoff_seconds,
                 usage_tracker=self.usage_tracker,
             )
 
-        raise ValueError(f"Unsupported AI provider: {self.config.ai_provider}")
+        raise ValueError(f"Unsupported AI provider: {self.config.ai.ai_provider}")
 
     def _conversational_reply(self, intent: str, user_message: str = "") -> str:
         """Return a natural LLM-generated reply for non-policy conversational messages.
@@ -629,7 +646,7 @@ class PolicyGPTBot:
             raw = self.ai.llm_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_output_tokens=self.config.intent_classification_max_tokens,
+                max_output_tokens=self.config.retrieval.intent_classification_max_tokens,
             )
             category = raw.strip().lower().split()[0] if raw.strip() else ConversationalIntent.POLICY
             valid = {i.value for i in ConversationalIntent}
@@ -645,7 +662,7 @@ class PolicyGPTBot:
         Returns True (grounded) on any failure so the guard never suppresses
         a valid answer due to an LLM error.
         """
-        if not self.config.grounding_guard_enabled:
+        if not self.config.retrieval.grounding_guard_enabled:
             return True
         if not answer.strip() or not evidence_context.strip():
             return True
@@ -670,7 +687,7 @@ class PolicyGPTBot:
             raw = self.ai.llm_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_output_tokens=self.config.grounding_guard_max_output_tokens,
+                max_output_tokens=self.config.retrieval.grounding_guard_max_output_tokens,
             )
             return "ungrounded" not in raw.strip().lower()
         except Exception:
@@ -721,7 +738,7 @@ class PolicyGPTBot:
         Skipped for: multi-doc queries (already expects many sources), exact-match
         queries (single clear answer expected), context-dependent follow-ups.
         """
-        if not self.config.dual_answer_enabled:
+        if not self.config.retrieval.dual_answer_enabled:
             return False
         if query_analysis.multi_doc_expected or query_analysis.context_dependent:
             return False
@@ -735,9 +752,9 @@ class PolicyGPTBot:
         if score_a <= 0:
             return False
         # Only trigger when both docs are genuinely good (not just both mediocre)
-        if score_a < self.config.confidence_medium_score:
+        if score_a < self.config.retrieval.confidence_medium_score:
             return False
-        return (score_b / score_a) >= self.config.dual_answer_score_ratio
+        return (score_b / score_a) >= self.config.retrieval.dual_answer_score_ratio
 
     def _build_dual_answer(
         self,
@@ -780,7 +797,7 @@ class PolicyGPTBot:
                     purpose="dual_answer",
                     system_prompt=self.redactor.mask_text(self._system_prompt(user_profile)),
                     user_prompt=self.redactor.mask_text(payload),
-                    max_output_tokens=self.config.chat_max_output_tokens,
+                    max_output_tokens=self.config.output.chat_max_output_tokens,
                 )
                 return self._normalize_answer_markdown(self.redactor.unmask_text(raw))
             except Exception:
@@ -873,7 +890,7 @@ class PolicyGPTBot:
             purpose="chat_answer",
             system_prompt=self.redactor.mask_text(self._system_prompt()),
             user_prompt=self.redactor.mask_text(combined_payload),
-            max_output_tokens=self.config.chat_max_output_tokens,
+            max_output_tokens=self.config.output.chat_max_output_tokens,
         )
         answer = self._normalize_answer_markdown(self.redactor.unmask_text(masked))
         return answer, all_sources
@@ -883,9 +900,9 @@ class PolicyGPTBot:
         if not top_sections:
             return ConfidenceLevel.LOW
         best_score = top_sections[0][1]
-        if best_score >= self.config.confidence_high_score:
+        if best_score >= self.config.retrieval.confidence_high_score:
             return ConfidenceLevel.HIGH
-        if best_score >= self.config.confidence_medium_score:
+        if best_score >= self.config.retrieval.confidence_medium_score:
             return ConfidenceLevel.MEDIUM
         return ConfidenceLevel.LOW
 
@@ -907,7 +924,7 @@ class PolicyGPTBot:
         seen: set[str] = set()
         related: list[str] = []
         for score, q, _, _ in candidates:
-            if score < self.config.related_questions_min_score:
+            if score < self.config.retrieval.related_questions_min_score:
                 break  # Results are sorted descending — stop when score drops off
             q_lower = q.strip().casefold()
             if q_lower == asked_lower or q_lower in seen:
@@ -955,7 +972,7 @@ class PolicyGPTBot:
             reply = self.ai.llm_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_output_tokens=self.config.clarifying_question_max_tokens,
+                max_output_tokens=self.config.retrieval.clarifying_question_max_tokens,
             ).strip()
             return reply if reply else ""
         except Exception:
@@ -1006,7 +1023,7 @@ class PolicyGPTBot:
         context.  It is never returned to the user as a source or citation.
         Returns empty string when the file is absent or unreadable.
         """
-        facts_path = (self.config.supplementary_facts_file or "").strip()
+        facts_path = (self.config.storage.supplementary_facts_file or "").strip()
         if not facts_path:
             return ""
         path = Path(facts_path)
@@ -1093,8 +1110,8 @@ class PolicyGPTBot:
         if config is None:
             return False
         return (
-            config.ai_provider == AIProvider.BEDROCK
-            and config.bedrock_gpt_model_size in {BedRockModelSize.SMALL, BedRockModelSize.LARGE}
+            config.ai.ai_provider == AIProvider.BEDROCK
+            and config.ai.bedrock_gpt_model_size in {BedRockModelSize.SMALL, BedRockModelSize.LARGE}
         )
 
     # Keywords that signal the user wants output as a table.
@@ -1210,7 +1227,7 @@ class PolicyGPTBot:
     ) -> bool:
         if QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents and top_docs:
             best_document = top_docs[0][0]
-            if self.corpus.document_lookup_score(query_analysis, best_document) >= self.config.document_lookup_score_threshold:
+            if self.corpus.document_lookup_score(query_analysis, best_document) >= self.config.retrieval.document_lookup_score_threshold:
                 return True
 
         if not top_sections:
@@ -1218,20 +1235,20 @@ class PolicyGPTBot:
 
         best_section, best_score = top_sections[0]
         best_document = self._get_doc_for_section(best_section)
-        if best_score < self.config.answerability_min_section_score:
+        if best_score < self.config.retrieval.answerability_min_section_score:
             return False
 
         # Fix #6: if retrieval score is high enough, trust semantic
         # retrieval even when lexical term overlap is weak (user may use
         # synonyms or different phrasing).
-        if best_score >= self.config.answerability_high_confidence_score:
+        if best_score >= self.config.retrieval.answerability_high_confidence_score:
             return True
 
         # Also trust strong topic/metadata alignment as an alternative
         # to exact term match in evidence blocks.
         section_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_section.metadata_tags)
         document_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_document.metadata_tags) if best_document else 0.0
-        if max(section_topic_alignment, document_topic_alignment) >= self.config.topic_alignment_threshold:
+        if max(section_topic_alignment, document_topic_alignment) >= self.config.retrieval.topic_alignment_threshold:
             return True
 
         support_match_count = 0
@@ -1245,15 +1262,15 @@ class PolicyGPTBot:
             if query_analysis.exact_match_expected:
                 exact_evidence_match_count += self.corpus.precise_evidence_match_count(section, query_analysis)
 
-        if support_match_count < self.config.answerability_min_support_matches:
+        if support_match_count < self.config.retrieval.answerability_min_support_matches:
             return False
 
         if query_analysis.exact_match_expected:
-            if exact_evidence_match_count < self.config.answerability_min_exact_evidence_matches:
+            if exact_evidence_match_count < self.config.retrieval.answerability_min_exact_evidence_matches:
                 return False
 
         if query_analysis.multi_doc_expected and len({document.doc_id for document, _ in top_docs}) > 1:
-            if len(supporting_doc_ids) < self.config.answerability_min_support_matches_multi_doc:
+            if len(supporting_doc_ids) < self.config.retrieval.answerability_min_support_matches_multi_doc:
                 return False
 
         section_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_section.metadata_tags)
@@ -1378,7 +1395,7 @@ class PolicyGPTBot:
                 )
                 asked_lower = query_analysis.original_question.strip().casefold()
                 for score, q, _, _ in candidates:
-                    if score < self.config.related_questions_min_score * 0.85:
+                    if score < self.config.retrieval.related_questions_min_score * 0.85:
                         break
                     if q.strip().casefold() == asked_lower:
                         continue
@@ -1423,7 +1440,7 @@ class PolicyGPTBot:
                 continue
             seen.add(source_path)
             label = source.document_title or Path(source_path).stem
-            url = build_document_open_url(self.config.public_base_url, source_path)
+            url = build_document_open_url(self.config.storage.public_base_url, source_path)
             reference_links.append(f"[{label}]({url})")
 
         if not reference_links:
@@ -1541,7 +1558,7 @@ class PolicyGPTBot:
     def _compact_history_message(self, text: str) -> str:
         compact = self._sanitize_answer_for_user((text or "").strip())
         compact = re.sub(r"\n{2,}Reference:\s.*$", "", compact, flags=re.DOTALL | re.IGNORECASE)
-        limit = max(0, self.config.recent_chat_message_char_limit)
+        limit = max(0, self.config.conversation.recent_chat_message_char_limit)
         if limit:
             return self._truncate_context_text(compact, limit)
         return compact
@@ -1756,7 +1773,7 @@ class PolicyGPTBot:
     ) -> list[tuple]:
         if query_analysis.exact_match_expected:
             best_score = top_sections[0][1] if top_sections else 0.0
-            score_floor = max(best_score * self.config.exact_score_floor_scale, self.config.exact_score_floor_min) if best_score else 0.0
+            score_floor = max(best_score * self.config.retrieval.exact_score_floor_scale, self.config.retrieval.exact_score_floor_min) if best_score else 0.0
             filtered_sections: list[tuple] = []
             noisy_markers = (
                 "requiring verification",
@@ -1931,7 +1948,7 @@ class PolicyGPTBot:
             doc_scores[section.doc_id] = max(doc_scores.get(section.doc_id, 0.0), score)
         for doc_id in preferred_set:
             if doc_id in doc_scores:
-                doc_scores[doc_id] += self.config.preferred_doc_score_boost
+                doc_scores[doc_id] += self.config.retrieval.preferred_doc_score_boost
         ranked = sorted(doc_scores, key=lambda d: doc_scores[d], reverse=True)
         return [(self.documents[doc_id], doc_scores[doc_id]) for doc_id in ranked]
 
@@ -1968,7 +1985,7 @@ class PolicyGPTBot:
             for doc_id, alias in doc_aliases.items()
             if doc_id in self.documents
         ]
-        recent_message_limit = max(0, self.config.max_recent_messages)
+        recent_message_limit = max(0, self.config.conversation.max_recent_messages)
         recent_chat = "\n".join(
             f"{message.role.upper()}: {self._compact_history_message(message.content)}"
             for message in (
@@ -1983,12 +2000,12 @@ class PolicyGPTBot:
             doc_alias = doc_aliases.get(document.doc_id, "D?")
             orientation_summary = self._truncate_context_text(
                 self.redactor.unmask_text(document.summary),
-                self.config.answer_context_doc_summary_char_limit,
+                self.config.retrieval.answer_context_doc_summary_char_limit,
             )
             doc_context_lines = [
                 f"[{doc_alias}]",
             ]
-            if not minimal_context and self.config.include_document_metadata_in_answers:
+            if not minimal_context and self.config.output.include_document_metadata_in_answers:
                 doc_context_lines.append(
                     f"Metadata: type={document.document_type or 'document'}; "
                     f"tags={', '.join(document.metadata_tags) or 'none'}; "
@@ -1999,7 +2016,7 @@ class PolicyGPTBot:
             if (
                 not minimal_context
                 and not query_analysis.exact_match_expected
-                and self.config.include_document_orientation_in_answers
+                and self.config.output.include_document_orientation_in_answers
             ):
                 doc_context_lines.append(f"Summary:\n{orientation_summary or '(empty)'}")
             if len(doc_context_lines) > 1:
@@ -2018,7 +2035,7 @@ class PolicyGPTBot:
             # being limited by doc-level retrieval scoring.
             faq_hits = self.corpus.search_faq_questions(
                 query_vec=query_vec if query_vec is not None else self._embed_one(query_analysis.original_question),
-                top_k=self.config.aggregate_faq_top_k,
+                top_k=self.config.retrieval.aggregate_faq_top_k,
                 user_id=user_id,
             )
             if faq_hits:
@@ -2036,7 +2053,7 @@ class PolicyGPTBot:
                     if not faq_text:
                         faq_text = self._truncate_context_text(
                             self.redactor.unmask_text(document.summary),
-                            self.config.answer_context_doc_summary_char_limit,
+                            self.config.retrieval.answer_context_doc_summary_char_limit,
                         )
                     else:
                         faq_text = self.redactor.unmask_text(faq_text)
@@ -2074,7 +2091,7 @@ class PolicyGPTBot:
                 )
                 section_orientation = self._truncate_context_text(
                     self.redactor.unmask_text(section.summary),
-                    self.config.answer_context_doc_summary_char_limit,
+                    self.config.retrieval.answer_context_doc_summary_char_limit,
                 )
                 # Content-type hint helps the LLM interpret the evidence correctly
                 _raw_text = section.raw_text or ""
@@ -2087,14 +2104,14 @@ class PolicyGPTBot:
                 section_context_lines = [
                     f"[{evidence_tag} {section.title}] [{_ctype}]",
                 ]
-                if not minimal_context and self.config.include_section_metadata_in_answers:
+                if not minimal_context and self.config.output.include_section_metadata_in_answers:
                     section_context_lines.append(
                         f"Section type: {section.section_type or 'general'} | Tags: {', '.join(section.metadata_tags) or 'none'}"
                     )
                 if (
                     not minimal_context
                     and not query_analysis.exact_match_expected
-                    and self.config.include_section_orientation_in_answers
+                    and self.config.output.include_section_orientation_in_answers
                 ):
                     section_context_lines.append(f"Summary:\n{section_orientation or '(empty)'}")
                 section_context_lines.append(f"Evidence:\n{raw_evidence_text}")
@@ -2389,12 +2406,12 @@ class PolicyGPTBot:
         output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
     def _resolve_debug_log_dir(self) -> Path | None:
-        if not self.config.debug:
+        if not self.config.storage.debug:
             return None
-        raw_path = (self.config.debug_log_dir or "").strip()
+        raw_path = (self.config.storage.debug_log_dir or "").strip()
         if not raw_path:
             return None
-        base_path = Path(self.config.document_folder)
+        base_path = Path(self.config.storage.document_folder)
         candidate = Path(raw_path)
         if not candidate.is_absolute():
             candidate = base_path / candidate
@@ -2449,8 +2466,8 @@ class PolicyGPTBot:
         write_llm_debug_log_pair(
             log_root=self._resolve_debug_log_dir(),
             redactor=self.redactor,
-            provider=self.config.ai_provider,
-            model_name=self.config.chat_model,
+            provider=self.config.ai.ai_provider,
+            model_name=self.config.ai.chat_model,
             purpose=purpose,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -2494,6 +2511,6 @@ class PolicyGPTBot:
             purpose="conversation_summary",
             system_prompt=self.redactor.mask_text(system_prompt),
             user_prompt=self.redactor.mask_text(user_prompt),
-            max_output_tokens=self.config.conversation_summary_max_output_tokens,
+            max_output_tokens=self.config.output.conversation_summary_max_output_tokens,
         )
         return self.redactor.unmask_text(summary)

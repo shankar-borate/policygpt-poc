@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import numpy as np
 
+from policygpt.cache import CacheManager
 from policygpt.config import Config
 from policygpt.core.retrieval.query_analyzer import QueryAnalysis
 from policygpt.models.documents import SectionRecord
@@ -28,9 +29,10 @@ logger = logging.getLogger(__name__)
 class OpenSearchRetriever:
     """Retrieves sections from a VectorStore and resolves them to SectionRecords."""
 
-    def __init__(self, store: VectorStore, config: Config) -> None:
+    def __init__(self, store: VectorStore, config: Config, cache: CacheManager | None = None) -> None:
         self.store = store
         self.config = config
+        self.cache = cache or CacheManager()
         self._hybrid = HybridSearcher(store, config)
 
     def retrieve(
@@ -58,7 +60,7 @@ class OpenSearchRetriever:
             text=query_text,
             embedding=query_embedding,
             # Over-fetch so the downstream reranker has enough candidates
-            top_k=max(top_k * 2, self.config.rerank_section_candidates),
+            top_k=max(top_k * 2, self.config.retrieval.rerank_section_candidates),
             filters=self._build_filters(user_id),
         )
 
@@ -86,7 +88,13 @@ class OpenSearchRetriever:
         Returns {"doc_id": ["__no_access__"]} when the user has no assignments
         — the impossible value ensures zero results rather than all results.
         """
-        doc_ids = self.store.get_accessible_doc_ids(user_id)
+        hit, cached_ids = self.cache.get_acl_resolved(user_id)
+        if hit:
+            doc_ids = cached_ids
+        else:
+            doc_ids = self.store.get_accessible_doc_ids(user_id)
+            self.cache.set_acl(user_id, doc_ids)
+
         if doc_ids is None:
             return {}  # admin — unrestricted
         if not doc_ids:

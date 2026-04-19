@@ -34,7 +34,7 @@ def _l2_normalize(v: np.ndarray) -> np.ndarray:
 class FaqGenerator(Enricher):
     """Generates an LLM FAQ, parses Q/A pairs, and embeds each question.
 
-    Only runs when config.generate_faq=True and config.faq_fastpath_enabled=True.
+    Only runs when config.ingestion.generate_faq=True and config.retrieval.faq_fastpath_enabled=True.
     If either flag is off the enricher is a no-op so the pipeline does not need
     to be re-wired.
 
@@ -49,7 +49,7 @@ class FaqGenerator(Enricher):
 
     def enrich(self, doc: EnrichedDocument, message: IngestMessage) -> EnrichedDocument:
         config = self._corpus.config
-        if not config.generate_faq:
+        if not config.ingestion.generate_faq:
             return doc
 
         masked_title = self._corpus.redactor.mask_text(doc.extracted.title)
@@ -76,7 +76,7 @@ class FaqGenerator(Enricher):
         except Exception:
             pass  # debug output is non-critical
 
-        if not config.faq_fastpath_enabled:
+        if not config.retrieval.faq_fastpath_enabled:
             return doc
 
         qa_pairs = self._corpus._parse_faq_qa_pairs(faq_text)

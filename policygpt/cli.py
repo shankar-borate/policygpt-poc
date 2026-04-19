@@ -7,7 +7,7 @@ class PolicyGPTCli:
         self.config = config or Config.from_env()
 
     def run(self) -> None:
-        folder = self.config.document_folder
+        folder = self.config.storage.document_folder
         print(f"Ingesting folder: {folder}")
         bot = create_ready_bot(folder=folder, config=self.config)
 

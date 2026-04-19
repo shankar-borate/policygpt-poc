@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class EntityEnricher(Enricher):
     """Extracts named entities with categories, context, and synonyms.
 
-    Only runs when config.generate_entity_map=True.
+    Only runs when config.ingestion.generate_entity_map=True.
 
     Parameters
     ----------
@@ -37,7 +37,7 @@ class EntityEnricher(Enricher):
         self._corpus = corpus
 
     def enrich(self, doc: EnrichedDocument, message: IngestMessage) -> EnrichedDocument:
-        if not self._corpus.config.generate_entity_map:
+        if not self._corpus.config.ingestion.generate_entity_map:
             return doc
 
         masked_title = self._corpus.redactor.mask_text(doc.extracted.title)
@@ -49,8 +49,8 @@ class EntityEnricher(Enricher):
             doc.entity_map = self._corpus.entity_extractor.extract(
                 title=masked_title,
                 masked_text=masked_full_text,
-                max_output_tokens=config.entity_map_max_output_tokens,
-                char_budget=max(4000, config.doc_summary_input_token_budget * 2),
+                max_output_tokens=config.ingestion.entity_map_max_output_tokens,
+                char_budget=max(4000, config.ingestion.doc_summary_input_token_budget * 2),
             )
         except Exception as exc:
             logger.warning("Entity extraction failed for %s: %s", message.source_path, exc)

@@ -64,9 +64,9 @@ class HybridSearcher:
     ) -> dict[SearchType, float]:
         """Return the weight for each requested + configured search type."""
         all_weights = {
-            SearchType.KEYWORD:    self.config.hybrid_keyword_weight,
-            SearchType.SIMILARITY: self.config.hybrid_similarity_weight,
-            SearchType.VECTOR:     self.config.hybrid_vector_weight,
+            SearchType.KEYWORD:    self.config.search.hybrid_keyword_weight,
+            SearchType.SIMILARITY: self.config.search.hybrid_similarity_weight,
+            SearchType.VECTOR:     self.config.search.hybrid_vector_weight,
         }
         return {
             st: w

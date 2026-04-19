@@ -10,7 +10,7 @@ from policygpt.observability.usage_metrics import LLMUsageTracker
 
 def _build_thread_repo(config: Config):
     """Return a ThreadRepository when OpenSearch is configured, else None."""
-    if not config.hybrid_search_enabled:
+    if not config.search.hybrid_search_enabled:
         return None
     try:
         from policygpt.storage.threads import ThreadRepository
@@ -33,7 +33,7 @@ def create_bot(
     use ServerRuntime which handles it automatically.
     """
     resolved_config = config or Config.from_env()
-    if resolved_config.ai_provider == "openai" and not os.getenv("OPENAI_API_KEY"):
+    if resolved_config.ai.ai_provider == "openai" and not os.getenv("OPENAI_API_KEY"):
         raise EnvironmentError("OPENAI_API_KEY is not set in environment variables.")
     thread_repo = _build_thread_repo(resolved_config)
     return PolicyGPTBot(
@@ -55,8 +55,8 @@ def create_ready_bot(
     create_bot() + a background ingestion thread instead.
     """
     resolved_config = config or Config.from_env()
-    resolved_folder = folder or resolved_config.document_folder
-    user_ids = list(resolved_config.ingestion_user_ids)
+    resolved_folder = folder or resolved_config.storage.document_folder
+    user_ids = list(resolved_config.ingestion.ingestion_user_ids)
     domain = resolved_config.domain_type
 
     bot = create_bot(config=resolved_config, usage_tracker=usage_tracker)

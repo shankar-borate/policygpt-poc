@@ -62,7 +62,7 @@ class Summarizer(Enricher):
             masked_section_title = self._corpus.redactor.mask_text(section_title)
             masked_section_text = self._corpus.redactor.mask_text(section_text)
             try:
-                if config.skip_section_summary:
+                if config.ingestion.skip_section_summary:
                     summary = self._corpus._build_fallback_section_summary(
                         section_title=masked_section_title,
                         section_text=masked_section_text,

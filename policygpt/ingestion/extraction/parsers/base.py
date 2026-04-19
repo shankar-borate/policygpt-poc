@@ -134,12 +134,12 @@ class BaseExtractor(ABC):
         current_len = 0
 
         for paragraph in paragraphs:
-            paragraph_parts = self._split_oversized_text_block(paragraph, self.config.target_section_chars)
+            paragraph_parts = self._split_oversized_text_block(paragraph, self.config.ingestion.target_section_chars)
             for paragraph_part in paragraph_parts:
                 paragraph_len = len(paragraph_part)
-                too_big = current_len + paragraph_len > self.config.target_section_chars
+                too_big = current_len + paragraph_len > self.config.ingestion.target_section_chars
 
-                if current and too_big and current_len >= self.config.min_section_chars:
+                if current and too_big and current_len >= self.config.ingestion.min_section_chars:
                     chunks.append("\n\n".join(current))
                     current = [paragraph_part]
                     current_len = paragraph_len
@@ -226,7 +226,7 @@ class BaseExtractor(ABC):
             if not text:
                 return []
             if title and title != "Introduction":
-                if len(text) <= self.config.max_section_chars:
+                if len(text) <= self.config.ingestion.max_section_chars:
                     return [ExtractedSection(title=title, text=text)]
                 return [
                     ExtractedSection(title=t, text=x)
@@ -238,7 +238,7 @@ class BaseExtractor(ABC):
 
         final_sections: list[ExtractedSection] = []
         for title, text in sections:
-            if text in table_texts or len(text) <= self.config.max_section_chars:
+            if text in table_texts or len(text) <= self.config.ingestion.max_section_chars:
                 final_sections.append(ExtractedSection(title=title, text=text))
             else:
                 final_sections.extend(

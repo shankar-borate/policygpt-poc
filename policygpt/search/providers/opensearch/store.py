@@ -48,10 +48,10 @@ class OpenSearchVectorStore(VectorStore):
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self._sections_index  = f"{config.opensearch_index_prefix}_sections"
-        self._documents_index = f"{config.opensearch_index_prefix}_documents"
-        self._faqs_index      = f"{config.opensearch_index_prefix}_faqs"
-        self._recipient_index = f"{config.opensearch_index_prefix}_recipient"
+        self._sections_index  = f"{config.search.opensearch_index_prefix}_sections"
+        self._documents_index = f"{config.search.opensearch_index_prefix}_documents"
+        self._faqs_index      = f"{config.search.opensearch_index_prefix}_faqs"
+        self._recipient_index = f"{config.search.opensearch_index_prefix}_recipient"
         self._client = None  # lazy — created on first use
         # ACL collaborator — wired up after the client is ready
         self._acl: OpenSearchACL | None = None
@@ -62,12 +62,12 @@ class OpenSearchVectorStore(VectorStore):
     def client(self):
         if self._client is None:
             self._client = create_client(
-                host=self.config.opensearch_host,
-                port=self.config.opensearch_port,
-                username=self.config.opensearch_username,
-                password=self.config.opensearch_password,
-                use_ssl=self.config.opensearch_use_ssl,
-                verify_certs=self.config.opensearch_verify_certs,
+                host=self.config.search.opensearch_host,
+                port=self.config.search.opensearch_port,
+                username=self.config.search.opensearch_username,
+                password=self.config.search.opensearch_password,
+                use_ssl=self.config.search.opensearch_use_ssl,
+                verify_certs=self.config.search.opensearch_verify_certs,
             )
             self._acl = OpenSearchACL(self._client, self._recipient_index)
         return self._client
@@ -156,7 +156,7 @@ class OpenSearchVectorStore(VectorStore):
         str_user_ids = [str(uid) for uid in user_ids]
         self.grant_access(str_user_ids, document.doc_id)
 
-        logger.debug(
+        logger.storage.debug(
             "Indexed document '%s' with %d sections (domain=%s, users=%d)",
             document.title, len(document.sections), domain, len(user_ids),
         )
@@ -301,7 +301,7 @@ class OpenSearchVectorStore(VectorStore):
             )
         # Remove all user assignments for this document
         self.revoke_all_access_for_doc(doc_id)
-        logger.debug("Deleted document %s from OpenSearch", doc_id)
+        logger.storage.debug("Deleted document %s from OpenSearch", doc_id)
 
     def index_faq_pairs(
         self,
@@ -341,7 +341,7 @@ class OpenSearchVectorStore(VectorStore):
                 body=body,
             )
 
-        logger.debug(
+        logger.storage.debug(
             "Indexed %d FAQ pairs for document '%s' (domain=%s)",
             len(qa_pairs), document_title, domain,
         )

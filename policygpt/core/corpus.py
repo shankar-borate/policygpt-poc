@@ -19,6 +19,7 @@ from policygpt.ingestion.extraction.metadata_extractor import MetadataExtractor
 from policygpt.core.retrieval.query_analyzer import QueryAnalysis
 from policygpt.ingestion.extraction.redaction import Redactor
 from policygpt.ingestion.extraction.taxonomy import keywordize_text, normalize_text, tokenize_text, unique_preserving_order
+from policygpt.cache import CacheManager
 from policygpt.search import VectorStore, OpenSearchRetriever, create_vector_store
 
 
@@ -50,6 +51,7 @@ class DocumentCorpus:
         extractor: FileExtractor,
         ai: AIService,
         redactor: Redactor,
+        cache: CacheManager | None = None,
     ) -> None:
         self.config = config
         self.extractor = extractor
@@ -71,9 +73,10 @@ class DocumentCorpus:
         # ── Hybrid search (optional external vector store) ────────────────
         # None  → use existing in-memory retrieval (hybrid_search_enabled=False)
         # set   → delegate retrieve_top_sections() to OpenSearchRetriever
+        self._cache = cache or CacheManager()
         self._vector_store: Optional[VectorStore] = create_vector_store(config)
         self._os_retriever: Optional[OpenSearchRetriever] = (
-            OpenSearchRetriever(self._vector_store, config)
+            OpenSearchRetriever(self._vector_store, config, cache=self._cache)
             if self._vector_store is not None else None
         )
 
@@ -178,7 +181,7 @@ class DocumentCorpus:
                         total_files,
                         f"{file_name} - skipped after error: {self._format_error_for_progress(exc)}",
                     )
-                    if self.config.debug:
+                    if self.config.storage.debug:
                         print(f"Skipped document after error: {path}")
                         print(f"  {type(exc).__name__}: {exc}")
 
@@ -309,7 +312,7 @@ class DocumentCorpus:
         document_faq = ""
         faq_qa_pairs: list[tuple[str, str]] = []
         faq_q_embeddings: list[np.ndarray] = []
-        if self.config.generate_faq:
+        if self.config.ingestion.generate_faq:
             self._emit_progress(
                 progress_callback,
                 processed_files,
@@ -323,7 +326,7 @@ class DocumentCorpus:
                 masked_text=masked_full_text,
             )
             print(f"    [corpus] {file_name} — FAQ done ({_time.perf_counter()-_t:.1f}s)", flush=True)
-            if document_faq and self.config.faq_fastpath_enabled:
+            if document_faq and self.config.retrieval.faq_fastpath_enabled:
                 faq_qa_pairs = self._parse_faq_qa_pairs(document_faq)
                 if faq_qa_pairs:
                     # Embed "Q: ... A: ..." combined so the vector captures
@@ -338,7 +341,7 @@ class DocumentCorpus:
                         faq_q_embeddings = []
 
         document_entity_map = DocumentEntityMap()
-        if self.config.generate_entity_map:
+        if self.config.ingestion.generate_entity_map:
             self._emit_progress(
                 progress_callback,
                 processed_files,
@@ -350,8 +353,8 @@ class DocumentCorpus:
             document_entity_map = self.entity_extractor.extract(
                 title=masked_title,
                 masked_text=masked_full_text,
-                max_output_tokens=self.config.entity_map_max_output_tokens,
-                char_budget=max(4000, self.config.doc_summary_input_token_budget * 2),
+                max_output_tokens=self.config.ingestion.entity_map_max_output_tokens,
+                char_budget=max(4000, self.config.ingestion.doc_summary_input_token_budget * 2),
             )
             print(f"    [corpus] {file_name} — entities done ({_time.perf_counter()-_t:.1f}s)", flush=True)
 
@@ -421,7 +424,7 @@ class DocumentCorpus:
             masked_section_text = self.redactor.mask_text(section_text)
             section_metadata = self.metadata_extractor.extract_section_metadata(title, section_title, section_text)
             try:
-                if self.config.skip_section_summary:
+                if self.config.ingestion.skip_section_summary:
                     section_summary = self._build_fallback_section_summary(
                         section_title=masked_section_title,
                         section_text=masked_section_text,
@@ -443,7 +446,7 @@ class DocumentCorpus:
                         f"{self._format_error_for_progress(exc)}"
                     ),
                 )
-                if self.config.debug:
+                if self.config.storage.debug:
                     print(f"Skipped section in {path}: {section_title}")
                     print(f"  {type(exc).__name__}: {exc}")
                 self._write_ingestion_failure_log(
@@ -522,7 +525,7 @@ class DocumentCorpus:
             f"{file_name} - finished with {len(document.sections)} sections",
         )
 
-        if self.config.debug:
+        if self.config.storage.debug:
             print(f"Ingested: {path}")
             print(f"  Title: {title}")
             print(f"  Sections: {len(document.sections)}")
@@ -539,7 +542,7 @@ class DocumentCorpus:
         Files are named  <source_stem>_section1.txt, <source_stem>_section2.txt …
         so they are easy to inspect alongside the source document.
         """
-        debug_log_dir = (self.config.debug_log_dir or "").strip()
+        debug_log_dir = (self.config.storage.debug_log_dir or "").strip()
         if not debug_log_dir:
             return
 
@@ -635,21 +638,21 @@ class DocumentCorpus:
 
     def _rerank_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
-            return max(self.config.broad_rerank_section_candidates, self.config.rerank_section_candidates)
+            return max(self.config.retrieval.broad_rerank_section_candidates, self.config.retrieval.rerank_section_candidates)
         if query_analysis.exact_match_expected:
             return max(
-                self.config.exact_rerank_section_candidates,
-                self.config.exact_top_sections_per_doc * 2,
-                self.config.exact_max_sections_to_llm * 2,
+                self.config.retrieval.exact_rerank_section_candidates,
+                self.config.retrieval.exact_top_sections_per_doc * 2,
+                self.config.retrieval.exact_max_sections_to_llm * 2,
             )
-        return self.config.rerank_section_candidates
+        return self.config.retrieval.rerank_section_candidates
 
     def _section_result_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
-            return max(self.config.broad_max_sections_to_llm, self.config.max_sections_to_llm)
+            return max(self.config.retrieval.broad_max_sections_to_llm, self.config.retrieval.max_sections_to_llm)
         if query_analysis.exact_match_expected:
-            return max(1, min(self.config.exact_max_sections_to_llm, self.config.max_sections_to_llm))
-        return self.config.max_sections_to_llm
+            return max(1, min(self.config.retrieval.exact_max_sections_to_llm, self.config.retrieval.max_sections_to_llm))
+        return self.config.retrieval.max_sections_to_llm
 
     def _select_diverse_sections(
         self,
@@ -687,7 +690,7 @@ class DocumentCorpus:
 
         block_limit = limit or self._answer_evidence_block_limit_for_query(query_analysis)
         char_limit = self._answer_evidence_char_limit_for_query(query_analysis)
-        if len(raw_text) <= min(self.config.small_section_full_text_chars, char_limit):
+        if len(raw_text) <= min(self.config.retrieval.small_section_full_text_chars, char_limit):
             return [raw_text]
 
         units = self._split_text_into_evidence_units(raw_text)
@@ -706,8 +709,8 @@ class DocumentCorpus:
         scored_units.sort(key=lambda item: (item[1], -item[0]), reverse=True)
         selected_spans: list[tuple[int, int]] = []
         for index, _ in scored_units:
-            span_start = max(0, index - self.config.evidence_neighboring_units)
-            span_end = min(len(units) - 1, index + self.config.evidence_neighboring_units)
+            span_start = max(0, index - self.config.retrieval.evidence_neighboring_units)
+            span_end = min(len(units) - 1, index + self.config.retrieval.evidence_neighboring_units)
             span = (span_start, span_end)
             if any(not (span_end < existing_start or span_start > existing_end) for existing_start, existing_end in selected_spans):
                 continue
@@ -743,15 +746,15 @@ class DocumentCorpus:
 
     def _answer_evidence_block_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
-            return max(self.config.answer_evidence_block_limit_broad, 2)
-        return max(self.config.answer_evidence_block_limit_exact, 1)
+            return max(self.config.retrieval.answer_evidence_block_limit_broad, 2)
+        return max(self.config.retrieval.answer_evidence_block_limit_exact, 1)
 
     def _answer_evidence_char_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
-            return max(self.config.broad_answer_evidence_char_limit, self.config.evidence_chunk_char_limit)
+            return max(self.config.retrieval.broad_answer_evidence_char_limit, self.config.retrieval.evidence_chunk_char_limit)
         if query_analysis.exact_match_expected:
-            return max(self.config.exact_answer_evidence_char_limit, self.config.small_section_full_text_chars)
-        return max(self.config.broad_answer_evidence_char_limit, self.config.evidence_chunk_char_limit)
+            return max(self.config.retrieval.exact_answer_evidence_char_limit, self.config.retrieval.small_section_full_text_chars)
+        return max(self.config.retrieval.broad_answer_evidence_char_limit, self.config.retrieval.evidence_chunk_char_limit)
 
     def _score_evidence_unit(
         self,
@@ -845,7 +848,7 @@ class DocumentCorpus:
         query_analysis: QueryAnalysis,
         limit: int | None = None,
     ) -> list[str]:
-        snippet_limit = limit or self.config.max_evidence_snippets_per_section
+        snippet_limit = limit or self.config.retrieval.max_evidence_snippets_per_section
         evidence_blocks = self.extract_answer_evidence_blocks(
             section,
             query_analysis,
@@ -854,7 +857,7 @@ class DocumentCorpus:
         if not evidence_blocks:
             return []
         return [
-            self._truncate_text(block, self.config.evidence_snippet_char_limit)
+            self._truncate_text(block, self.config.retrieval.evidence_snippet_char_limit)
             for block in evidence_blocks[:snippet_limit]
         ]
 
@@ -1141,13 +1144,13 @@ class DocumentCorpus:
     def list_supported_policy_files(self, folder_path: str) -> list[str]:
         folder = Path(folder_path)
         file_paths: list[str] = []
-        for pattern in self.config.supported_file_patterns:
+        for pattern in self.config.storage.supported_file_patterns:
             file_paths.extend(str(path) for path in folder.glob(pattern))
 
         filtered_paths: list[str] = []
         for file_path in sorted(file_paths):
             file_name = Path(file_path).name.lower()
-            if any(part in file_name for part in self.config.excluded_file_name_parts):
+            if any(part in file_name for part in self.config.storage.excluded_file_name_parts):
                 continue
             filtered_paths.append(file_path)
         return filtered_paths
@@ -1166,7 +1169,7 @@ class DocumentCorpus:
         doc_tokens = self._estimate_tokens(masked_text)
         scaled_max_output = self._scaled_summary_budget(doc_tokens)
 
-        input_budget = self.config.doc_summary_input_token_budget
+        input_budget = self.config.ingestion.doc_summary_input_token_budget
         if doc_tokens <= input_budget:
             try:
                 return self._summarize_document_text(masked_title, masked_text, max_output_tokens=scaled_max_output)
@@ -1175,7 +1178,7 @@ class DocumentCorpus:
 
         chunks = self._split_text_for_summary(masked_text, input_budget)
         if len(chunks) <= 1:
-            smaller_budget = max(self.config.min_recursive_summary_token_budget, input_budget // 2)
+            smaller_budget = max(self.config.ingestion.min_recursive_summary_token_budget, input_budget // 2)
             if smaller_budget < input_budget:
                 chunks = self._split_text_for_summary(masked_text, smaller_budget)
                 input_budget = smaller_budget
@@ -1202,7 +1205,7 @@ class DocumentCorpus:
 
         reduced_summary_input = self._reduce_summary_groups(
             summaries=partial_summaries,
-            token_budget=self.config.doc_summary_combine_token_budget,
+            token_budget=self.config.ingestion.doc_summary_combine_token_budget,
             combine_batch=lambda summary_batch: self._combine_document_summaries(masked_title, summary_batch),
             progress_callback=progress_callback,
             processed_files=processed_files,
@@ -1239,7 +1242,7 @@ class DocumentCorpus:
             purpose="document_summary",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=max_output_tokens or self.config.doc_summary_max_output_tokens,
+            max_output_tokens=max_output_tokens or self.config.output.doc_summary_max_output_tokens,
         )
 
     def _summarize_document_chunk_with_fallback(
@@ -1249,7 +1252,7 @@ class DocumentCorpus:
         chunk_label: str,
         token_budget: int,
     ) -> str:
-        effective_budget = max(token_budget, self.config.min_recursive_summary_token_budget)
+        effective_budget = max(token_budget, self.config.ingestion.min_recursive_summary_token_budget)
         if self._estimate_tokens(chunk_text) <= effective_budget:
             try:
                 return self._summarize_document_chunk(
@@ -1258,10 +1261,10 @@ class DocumentCorpus:
                     chunk_label=chunk_label,
                 )
             except AIRequestTooLargeError:
-                if effective_budget <= self.config.min_recursive_summary_token_budget:
+                if effective_budget <= self.config.ingestion.min_recursive_summary_token_budget:
                     raise
 
-        smaller_budget = max(self.config.min_recursive_summary_token_budget, effective_budget // 2)
+        smaller_budget = max(self.config.ingestion.min_recursive_summary_token_budget, effective_budget // 2)
         if smaller_budget >= effective_budget:
             raise RuntimeError("Document chunk is too large to summarize safely within the configured token budget.")
 
@@ -1284,7 +1287,7 @@ class DocumentCorpus:
 
         return self._reduce_summary_groups(
             summaries=nested_summaries,
-            token_budget=min(self.config.doc_summary_combine_token_budget, smaller_budget),
+            token_budget=min(self.config.ingestion.doc_summary_combine_token_budget, smaller_budget),
             combine_batch=lambda summary_batch: self._combine_document_summaries(masked_title, summary_batch),
         )
 
@@ -1312,7 +1315,7 @@ class DocumentCorpus:
             purpose="document_chunk_summary",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=self.config.doc_summary_chunk_max_output_tokens,
+            max_output_tokens=self.config.output.doc_summary_chunk_max_output_tokens,
         )
 
     def _combine_document_summaries(self, masked_title: str, summary_batch: str) -> str:
@@ -1333,7 +1336,7 @@ class DocumentCorpus:
             purpose="document_summary_combine",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=self.config.doc_summary_chunk_max_output_tokens,
+            max_output_tokens=self.config.output.doc_summary_chunk_max_output_tokens,
         )
 
     def _finalize_document_summary(self, masked_title: str, summary_input: str) -> str:
@@ -1354,7 +1357,7 @@ class DocumentCorpus:
             purpose="document_summary_finalize",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=self.config.doc_summary_max_output_tokens,
+            max_output_tokens=self.config.output.doc_summary_max_output_tokens,
         )
 
     def _create_section_summary(
@@ -1365,17 +1368,17 @@ class DocumentCorpus:
         token_budget: int | None = None,
     ) -> str:
         effective_budget = max(
-            token_budget or self.config.section_summary_input_token_budget,
-            self.config.min_recursive_summary_token_budget,
+            token_budget or self.config.ingestion.section_summary_input_token_budget,
+            self.config.ingestion.min_recursive_summary_token_budget,
         )
         if self._estimate_tokens(section_text) <= effective_budget:
             try:
                 return self._summarize_section_text(doc_title, section_title, section_text)
             except AIRequestTooLargeError:
-                if effective_budget <= self.config.min_recursive_summary_token_budget:
+                if effective_budget <= self.config.ingestion.min_recursive_summary_token_budget:
                     raise
 
-        smaller_budget = max(self.config.min_recursive_summary_token_budget, effective_budget // 2)
+        smaller_budget = max(self.config.ingestion.min_recursive_summary_token_budget, effective_budget // 2)
         if smaller_budget >= effective_budget:
             raise RuntimeError("Section is too large to summarize safely within the configured token budget.")
 
@@ -1398,7 +1401,7 @@ class DocumentCorpus:
 
         reduced_summary_input = self._reduce_summary_groups(
             summaries=chunk_summaries,
-            token_budget=min(self.config.doc_summary_combine_token_budget, smaller_budget),
+            token_budget=min(self.config.ingestion.doc_summary_combine_token_budget, smaller_budget),
             combine_batch=lambda summary_batch: self._combine_section_summaries(
                 doc_title,
                 section_title,
@@ -1442,7 +1445,7 @@ class DocumentCorpus:
             purpose="section_summary",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=self.config.section_summary_max_output_tokens,
+            max_output_tokens=self.config.output.section_summary_max_output_tokens,
         )
 
     def _combine_section_summaries(self, doc_title: str, section_title: str, summary_batch: str) -> str:
@@ -1464,7 +1467,7 @@ class DocumentCorpus:
             purpose="section_summary_combine",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=self.config.section_summary_max_output_tokens,
+            max_output_tokens=self.config.output.section_summary_max_output_tokens,
         )
 
     def _finalize_section_summary(self, doc_title: str, section_title: str, summary_input: str) -> str:
@@ -1487,7 +1490,7 @@ class DocumentCorpus:
             purpose="section_summary_finalize",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_output_tokens=self.config.section_summary_max_output_tokens,
+            max_output_tokens=self.config.output.section_summary_max_output_tokens,
         )
 
     def _embed_one(self, text: str) -> np.ndarray:
@@ -1556,7 +1559,7 @@ class DocumentCorpus:
         Falls back to in-memory scan when the vector store is unavailable or
         returns no result.
         """
-        if not self.config.faq_fastpath_enabled:
+        if not self.config.retrieval.faq_fastpath_enabled:
             return None
 
         # Delegate to OpenSearch (or other vector store) when available —
@@ -1647,10 +1650,10 @@ class DocumentCorpus:
         vector sits close to real user queries in embedding space, improving
         semantic retrieval significantly compared to embedding raw policy prose.
         """
-        n = max(1, self.config.faq_max_questions)
+        n = max(1, self.config.ingestion.faq_max_questions)
         # Feed as much document text as fits within half the doc-summary budget
         # so we don't crowd out other ingestion calls.
-        char_budget = max(1200, self.config.doc_summary_input_token_budget * 2)
+        char_budget = max(1200, self.config.ingestion.doc_summary_input_token_budget * 2)
         text_excerpt = masked_text[:char_budget].strip()
 
         dp = self.config.domain_profile
@@ -1696,10 +1699,10 @@ class DocumentCorpus:
             return self.ai.llm_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_output_tokens=self.config.faq_max_output_tokens,
+                max_output_tokens=self.config.ingestion.faq_max_output_tokens,
             ).strip()
         except Exception as exc:
-            if self.config.debug:
+            if self.config.storage.debug:
                 print(f"  FAQ generation failed: {type(exc).__name__}: {exc}")
             return ""
 
@@ -1707,7 +1710,7 @@ class DocumentCorpus:
         self, source_path: str, file_name: str, entity_map: DocumentEntityMap
     ) -> None:
         """Write extracted entities to metadata/entities/<stem>_entities.txt."""
-        debug_log_dir = (self.config.debug_log_dir or "").strip()
+        debug_log_dir = (self.config.storage.debug_log_dir or "").strip()
         if not debug_log_dir or not entity_map.entities:
             return
         entities_dir = Path(debug_log_dir) / "entities"
@@ -1739,7 +1742,7 @@ class DocumentCorpus:
 
     def _write_faq_file(self, source_path: str, file_name: str, faq_text: str) -> None:
         """Write the generated FAQ to metadata/faq/<stem>_faq.txt for inspection."""
-        debug_log_dir = (self.config.debug_log_dir or "").strip()
+        debug_log_dir = (self.config.storage.debug_log_dir or "").strip()
         if not debug_log_dir or not faq_text:
             return
         faq_dir = Path(debug_log_dir) / "faq"
@@ -1778,7 +1781,7 @@ class DocumentCorpus:
         5. Raw text excerpt — preserves verbatim terminology for lexical overlap
         """
         unmasked_summary = self.redactor.unmask_text(summary)
-        raw_excerpt = raw_text[:self.config.embedding_raw_excerpt_chars].strip() if raw_text else ""
+        raw_excerpt = raw_text[:self.config.retrieval.embedding_raw_excerpt_chars].strip() if raw_text else ""
         parts = [title, unmasked_summary]
         if entity_enrichment:
             parts.append(entity_enrichment)
@@ -1791,7 +1794,7 @@ class DocumentCorpus:
     def _build_fallback_section_summary(self, section_title: str, section_text: str) -> str:
         compact_text = re.sub(r"\s+", " ", (section_text or "").strip())
         compact_title = re.sub(r"\s+", " ", (section_title or "").strip())
-        char_limit = max(120, self.config.evidence_snippet_char_limit)
+        char_limit = max(120, self.config.retrieval.evidence_snippet_char_limit)
         if compact_text:
             summary_body = self._truncate_text(compact_text, char_limit)
             if compact_title and not summary_body.casefold().startswith(compact_title.casefold()):
@@ -1839,7 +1842,7 @@ class DocumentCorpus:
         if not working:
             return ""
 
-        effective_budget = max(token_budget, self.config.min_recursive_summary_token_budget)
+        effective_budget = max(token_budget, self.config.ingestion.min_recursive_summary_token_budget)
         round_no = 1
 
         while len(working) > 1:
@@ -1850,7 +1853,7 @@ class DocumentCorpus:
                 except AIRequestTooLargeError:
                     pass
 
-            batch_budget = max(self.config.min_recursive_summary_token_budget, effective_budget // 2)
+            batch_budget = max(self.config.ingestion.min_recursive_summary_token_budget, effective_budget // 2)
             summary_batches = self._split_summary_batches(working, batch_budget)
             if len(summary_batches) <= 1 and len(working) > 1:
                 summary_batches = [[summary] for summary in working]
@@ -1873,7 +1876,7 @@ class DocumentCorpus:
                 try:
                     reduced_summaries.append(combine_batch(batch_text))
                 except AIRequestTooLargeError:
-                    next_budget = max(self.config.min_recursive_summary_token_budget, batch_budget // 2)
+                    next_budget = max(self.config.ingestion.min_recursive_summary_token_budget, batch_budget // 2)
                     if next_budget >= batch_budget:
                         reduced_summaries.extend(summary_batch)
                     else:
@@ -2031,16 +2034,16 @@ class DocumentCorpus:
     def _estimate_tokens(self, text: str) -> int:
         return self._estimate_tokens_static(
             text,
-            chars_per_token=self.config.token_estimate_chars_per_token,
-            tokens_per_word=self.config.token_estimate_tokens_per_word,
+            chars_per_token=self.config.ingestion.token_estimate_chars_per_token,
+            tokens_per_word=self.config.ingestion.token_estimate_tokens_per_word,
         )
 
     def _scaled_summary_budget(self, doc_tokens: int) -> int:
         """Scale summary output budget with document size.  Small docs
         (<3000 tokens) use the base budget; larger docs get proportionally
         more up to a cap."""
-        base = self.config.doc_summary_max_output_tokens
-        cap = self.config.doc_summary_max_output_tokens_cap
+        base = self.config.output.doc_summary_max_output_tokens
+        cap = self.config.output.doc_summary_max_output_tokens_cap
         if doc_tokens <= 3000:
             return base
         scale_factor = min(doc_tokens / 3000, cap / base)
@@ -2228,8 +2231,8 @@ class DocumentCorpus:
         write_llm_debug_log_pair(
             log_root=self._resolve_debug_log_dir(),
             redactor=self.redactor,
-            provider=self.config.ai_provider,
-            model_name=self.config.chat_model,
+            provider=self.config.ai.ai_provider,
+            model_name=self.config.ai.chat_model,
             purpose=purpose,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -2239,12 +2242,12 @@ class DocumentCorpus:
         )
 
     def _resolve_debug_log_dir(self) -> Path | None:
-        if not self.config.debug:
+        if not self.config.storage.debug:
             return None
-        raw_path = (self.config.debug_log_dir or "").strip()
+        raw_path = (self.config.storage.debug_log_dir or "").strip()
         if not raw_path:
             return None
-        base_path = Path(self.config.document_folder)
+        base_path = Path(self.config.storage.document_folder)
         candidate = Path(raw_path)
         if not candidate.is_absolute():
             candidate = base_path / candidate

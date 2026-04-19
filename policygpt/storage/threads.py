@@ -58,19 +58,19 @@ class ThreadRepository:
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._index = f"{config.opensearch_index_prefix}_threads"
+        self._index = f"{config.search.opensearch_index_prefix}_threads"
         self._client = None  # lazy
 
     @property
     def client(self):
         if self._client is None:
             self._client = create_client(
-                host=self._config.opensearch_host,
-                port=self._config.opensearch_port,
-                username=self._config.opensearch_username,
-                password=self._config.opensearch_password,
-                use_ssl=self._config.opensearch_use_ssl,
-                verify_certs=self._config.opensearch_verify_certs,
+                host=self._config.search.opensearch_host,
+                port=self._config.search.opensearch_port,
+                username=self._config.search.opensearch_username,
+                password=self._config.search.opensearch_password,
+                use_ssl=self._config.search.opensearch_use_ssl,
+                verify_certs=self._config.search.opensearch_verify_certs,
             )
         return self._client
 

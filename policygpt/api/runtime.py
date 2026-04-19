@@ -14,13 +14,13 @@ class ServerRuntime:
         self.lock = RLock()
         self.bot: PolicyGPTBot | None = None
         self.usage_tracker = LLMUsageTracker(
-            config.chat_model,
-            usd_to_inr_exchange_rate=config.usd_to_inr_exchange_rate,
+            config.ai.chat_model,
+            usd_to_inr_exchange_rate=config.storage.usd_to_inr_exchange_rate,
         )
         self.pricing_loader = ModelPricingLoader()
         self.status = "starting"
         self.error: str | None = None
-        self.document_folder = config.document_folder
+        self.storage.document_folder = config.storage.document_folder
         self.worker: Thread | None = None
         # Ingestion progress
         self.indexing_processed_files = 0
@@ -38,8 +38,8 @@ class ServerRuntime:
 
             self.bot = None
             self.usage_tracker.reset(
-                self.config.chat_model,
-                usd_to_inr_exchange_rate=self.config.usd_to_inr_exchange_rate,
+                self.config.ai.chat_model,
+                usd_to_inr_exchange_rate=self.config.storage.usd_to_inr_exchange_rate,
             )
             self.usage_tracker.set_pricing_snapshot(self.pricing_loader.load_snapshot(self.config))
             self.status = "in_progress"
@@ -110,7 +110,7 @@ class ServerRuntime:
         """
         try:
             # ── Phase 1: create the bot ───────────────────────────────────────
-            print(f"[Policy GPT] Starting up — document folder: {self.document_folder}", flush=True)
+            print(f"[Policy GPT] Starting up — document folder: {self.storage.document_folder}", flush=True)
 
             from policygpt.factory import _build_thread_repo
             thread_repo = _build_thread_repo(self.config)
@@ -132,7 +132,7 @@ class ServerRuntime:
             from policygpt.ingestion import IngestionPipeline
             from policygpt.ingestion.readers import FolderReader
 
-            user_ids = list(self.config.ingestion_user_ids)
+            user_ids = list(self.config.ingestion.ingestion_user_ids)
             domain = self.config.domain_type
 
             with self.lock:
@@ -140,7 +140,7 @@ class ServerRuntime:
                 self.status = "ingesting"
 
             reader = FolderReader(
-                folder_path=self.document_folder,
+                folder_path=self.storage.document_folder,
                 user_ids=user_ids,
                 domain=domain,
             )

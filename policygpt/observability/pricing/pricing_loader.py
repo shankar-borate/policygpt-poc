@@ -69,7 +69,7 @@ FALLBACK_PRICING_BY_MODEL: dict[str, dict[str, Any]] = {
 
 class ModelPricingLoader:
     def load_snapshot(self, config: Config) -> ModelPricingSnapshot:
-        model_name = config.chat_model
+        model_name = config.ai.chat_model
         try:
             if model_name in OPENAI_MODEL_PRICING_URLS:
                 return self._load_openai_model_snapshot(model_name)
@@ -121,12 +121,12 @@ class ModelPricingLoader:
         offer_index = self._fetch_json(AWS_BEDROCK_PRICING_URL)
         input_price = self._extract_bedrock_offer_price(
             offer_index=offer_index,
-            region_code=config.bedrock_region,
+            region_code=config.ai.bedrock_region,
             matcher=lambda attrs: attrs.get("model") == model_slug and self._is_standard_input_tokens(attrs),
         )
         output_price = self._extract_bedrock_offer_price(
             offer_index=offer_index,
-            region_code=config.bedrock_region,
+            region_code=config.ai.bedrock_region,
             matcher=lambda attrs: attrs.get("model") == model_slug and self._is_standard_output_tokens(attrs),
         )
         display_name = (
@@ -155,12 +155,12 @@ class ModelPricingLoader:
         is_global = model_name.startswith("global.")
         input_price = self._extract_bedrock_offer_price(
             offer_index=offer_index,
-            region_code=config.bedrock_region,
+            region_code=config.ai.bedrock_region,
             matcher=lambda attrs: self._matches_anthropic_usage(attrs, service_name=service_name, global_expected=is_global, usage_kind="input"),
         )
         output_price = self._extract_bedrock_offer_price(
             offer_index=offer_index,
-            region_code=config.bedrock_region,
+            region_code=config.ai.bedrock_region,
             matcher=lambda attrs: self._matches_anthropic_usage(attrs, service_name=service_name, global_expected=is_global, usage_kind="output"),
         )
         return ModelPricingSnapshot(
