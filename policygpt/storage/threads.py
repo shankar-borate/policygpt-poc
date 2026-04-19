@@ -113,6 +113,70 @@ class ThreadRepository:
         except Exception as exc:
             logger.warning("ThreadRepository.save failed [%s]: %s", thread.thread_id, exc)
 
+    def append_and_save(self, thread: ThreadState) -> None:
+        """Atomically append new display_messages and update all other fields.
+
+        Uses a single Painless script update so the append is atomic — no
+        read-modify-write race condition between concurrent app servers.
+        The 'upsert' block handles the first save for a brand-new thread.
+        """
+        new_display = [{"role": m.role, "content": m.content} for m in thread.display_messages]
+        recent = [{"role": m.role, "content": m.content} for m in thread.recent_messages]
+        sources = [_serialize_source(s) for s in thread.last_answer_sources]
+        try:
+            self.client.update(
+                index=self._index,
+                id=thread.thread_id,
+                body={
+                    "script": {
+                        "lang": "painless",
+                        "source": """
+                            if (ctx._source.display_messages == null) {
+                                ctx._source.display_messages = params.new_display;
+                            } else {
+                                ctx._source.display_messages.addAll(params.new_display);
+                            }
+                            ctx._source.recent_messages      = params.recent_messages;
+                            ctx._source.active_doc_ids       = params.active_doc_ids;
+                            ctx._source.active_section_ids   = params.active_section_ids;
+                            ctx._source.last_answer_sources  = params.last_answer_sources;
+                            ctx._source.conversation_summary = params.conversation_summary;
+                            ctx._source.current_topic        = params.current_topic;
+                            ctx._source.title                = params.title;
+                            ctx._source.updated_at           = params.updated_at;
+                        """,
+                        "params": {
+                            "new_display":          new_display,
+                            "recent_messages":      recent,
+                            "active_doc_ids":       thread.active_doc_ids,
+                            "active_section_ids":   thread.active_section_ids,
+                            "last_answer_sources":  sources,
+                            "conversation_summary": thread.conversation_summary,
+                            "current_topic":        thread.current_topic,
+                            "title":                thread.title,
+                            "updated_at":           thread.updated_at,
+                        },
+                    },
+                    # Full document for the case where the thread doesn't exist yet.
+                    "upsert": {
+                        "thread_id":            thread.thread_id,
+                        "user_id":              thread.user_id,
+                        "title":                thread.title,
+                        "created_at":           thread.created_at,
+                        "updated_at":           thread.updated_at,
+                        "current_topic":        thread.current_topic,
+                        "active_doc_ids":       thread.active_doc_ids,
+                        "active_section_ids":   thread.active_section_ids,
+                        "conversation_summary": thread.conversation_summary,
+                        "display_messages":     new_display,
+                        "recent_messages":      recent,
+                        "last_answer_sources":  sources,
+                    },
+                },
+            )
+        except Exception as exc:
+            logger.warning("ThreadRepository.append_and_save failed [%s]: %s", thread.thread_id, exc)
+
     def delete(self, thread_id: str) -> None:
         try:
             self.client.delete(index=self._index, id=thread_id, ignore=[404])

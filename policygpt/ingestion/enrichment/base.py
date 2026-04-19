@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from policygpt.extraction.entity_extractor import DocumentEntityMap
-from policygpt.ingestion.extractors.base import ExtractedDocument
+from policygpt.ingestion.extraction.entity_extractor import DocumentEntityMap
+from policygpt.ingestion.pipeline_extractors.base import ExtractedDocument
 from policygpt.ingestion.readers.base import IngestMessage
 
 

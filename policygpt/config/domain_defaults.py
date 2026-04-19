@@ -35,9 +35,9 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         # Hybrid search weights for policy domain.
         # Policy queries tend to use exact defined terms (clause numbers, names)
         # so keyword search gets a stronger share than the default.
-        "hybrid_keyword_weight": 0.35,
+        "hybrid_keyword_weight": 0.50,
         "hybrid_similarity_weight": 0.15,
-        "hybrid_vector_weight": 0.50,
+        "hybrid_vector_weight": 0.35,
     },
     "contest": {
         # Contest answers are focused and concise — thresholds, reward amounts,
@@ -64,9 +64,9 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
 
         # Contest queries are often vague ("what do I win") so semantic vector
         # search should dominate.
-        "hybrid_keyword_weight": 0.20,
+        "hybrid_keyword_weight": 0.30,
         "hybrid_similarity_weight": 0.15,
-        "hybrid_vector_weight": 0.65,
+        "hybrid_vector_weight": 0.55,
     },
     "product_technical": {
         # Technical answers often include multi-step procedures, architecture
@@ -96,8 +96,8 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
         # Technical queries use precise terminology (service names, config keys,
         # CLI flags) — keyword search gets a strong weight to match exact terms
         # while vector search covers paraphrased or high-level questions.
-        "hybrid_keyword_weight": 0.40,
+        "hybrid_keyword_weight": 0.60,
         "hybrid_similarity_weight": 0.10,
-        "hybrid_vector_weight": 0.50,
+        "hybrid_vector_weight": 0.30,
     },
 }

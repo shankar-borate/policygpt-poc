@@ -85,7 +85,25 @@ class VectorStore(ABC):
 
     @abstractmethod
     def delete_document(self, doc_id: str) -> None:
-        """Remove a document, all its sections, and all its FAQ pairs."""
+        """Remove a document, all its sections, FAQ pairs, and access grants."""
+
+    # ── ACL ───────────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def grant_access(self, user_ids: list[str | int], doc_id: str) -> None:
+        """Assign a document to a list of users (idempotent bulk upsert)."""
+
+    @abstractmethod
+    def revoke_access(self, user_id: str | int, doc_id: str) -> None:
+        """Remove a single user → document assignment."""
+
+    @abstractmethod
+    def grant_admin_access(self, user_id: str | int) -> None:
+        """Grant unrestricted access — user bypasses all doc_id filters."""
+
+    @abstractmethod
+    def get_accessible_doc_ids(self, user_id: str | int) -> list[str] | None:
+        """Return doc_ids this user can access, or None for unrestricted access."""
 
     @abstractmethod
     def index_faq_pairs(

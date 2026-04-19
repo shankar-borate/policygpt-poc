@@ -4,7 +4,77 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a9095f87-da5f-4aa6-9bab-38457c3a9ec7" name="Changes" comment="" />
+    <list default="true" id="a9095f87-da5f-4aa6-9bab-38457c3a9ec7" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/ARCHITECTURE.md" beforeDir="false" afterPath="$PROJECT_DIR$/ARCHITECTURE.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ARCHITECTURE.pdf" beforeDir="false" afterPath="$PROJECT_DIR$/ARCHITECTURE.pdf" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/api/routes/chat.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/api/routes/chat.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/bot.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/common/metadata_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/common/redaction.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/common/taxonomy.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/config/domain_defaults.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/config/domain_defaults.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/config/settings.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/config/settings.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/constants/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/constants/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/conversations.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/core/bot.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/core/bot.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/core/conversations.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/core/conversations.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/core/corpus.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/core/corpus.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/core/retrieval/query_analyzer.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/core/retrieval/query_analyzer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/corpus.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/document_links.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/domain/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/domain/base.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/domain/contest.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/domain/policy.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/extraction/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/extraction/entity_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/extraction/file_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/extraction/metadata_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/extraction/ocr.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/extraction/redaction.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/extraction/taxonomy.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/ingestion/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/converters/excel_html_converter.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/ingestion/converters/excel_html_converter.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/enrichment/base.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/ingestion/enrichment/base.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/base.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/html_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/image_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/pdf_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/ppt_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/registry.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/extractors/text_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/ingestion/pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/ingestion/readers/folder_reader.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/ingestion/readers/folder_reader.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/models/documents.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/models/documents.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/observability/debug_logging.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/observability/debug_logging.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/search/base.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/search/base.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/search/providers/opensearch/mappings.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/search/providers/opensearch/mappings.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/search/providers/opensearch/store.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/search/providers/opensearch/store.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/search/retriever.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/search/retriever.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/server/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/server/api.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/server/document_viewer.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/server/runtime.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/server/ui.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/__init__.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/base.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/bedrock_service.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/debug_logging.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/entity_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/file_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/metadata_extractor.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/openai_service.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/pricing_loader.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/query_analyzer.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/redaction.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/taxonomy.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/services/usage_metrics.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/policygpt/storage/threads.py" beforeDir="false" afterPath="$PROJECT_DIR$/policygpt/storage/threads.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/web/app.js" beforeDir="false" afterPath="$PROJECT_DIR$/web/app.js" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/web/styles.css" beforeDir="false" afterPath="$PROJECT_DIR$/web/styles.css" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -16,9 +86,9 @@
   <component name="MarkdownSettingsMigration">
     <option name="stateVersion" value="1" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 4
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 4
+}</component>
   <component name="ProjectId" id="3BnCHCJXD5KCEGSYnncn3q80yU9" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
@@ -28,7 +98,8 @@
   "keyToString": {
     "RunOnceActivity.OpenProjectViewOnStart": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "main"
+    "git-widget-placeholder": "main",
+    "last_opened_file_path": "C:/Users/ShankarBorate"
   }
 }]]></component>
   <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />

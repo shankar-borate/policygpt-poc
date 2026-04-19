@@ -22,6 +22,9 @@ class SectionRecord:
     title_terms: list[str] = field(default_factory=list)
     token_counts: dict[str, int] = field(default_factory=dict)
     token_length: int = 0
+    # Base64 data URIs for images found in this section (e.g. "<img>" tags in
+    # converted HTML).  Used for inline display in the chat UI.
+    images: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -29,12 +32,12 @@ class DocumentRecord:
     doc_id: str
     title: str
     source_path: str
-    original_source_path: str = ""   # pre-conversion path (e.g. .xlsx/.pdf) when to_html_enabled
     raw_text: str
     masked_text: str
     summary: str
     summary_embedding: np.ndarray
     sections: list[SectionRecord] = field(default_factory=list)
+    original_source_path: str = ""   # pre-conversion path (e.g. .xlsx/.pdf) when to_html_enabled
     normalized_title: str = ""
     canonical_title: str = ""
     document_type: str = "document"

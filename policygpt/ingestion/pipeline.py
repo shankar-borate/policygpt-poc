@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
 from policygpt.ingestion.converters.registry import HtmlConverterRegistry
-from policygpt.ingestion.extractors.registry import ExtractorRegistry
+from policygpt.ingestion.pipeline_extractors.registry import ExtractorRegistry
 from policygpt.ingestion.readers.base import IngestMessage, Reader
 from policygpt.ingestion.rewriter.policy_rewriter import PolicyRewriter
 

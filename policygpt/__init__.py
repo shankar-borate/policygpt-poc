@@ -1,4 +1,4 @@
-from policygpt.bot import PolicyGPTBot
+from policygpt.core.bot import PolicyGPTBot
 from policygpt.config import Config
 from policygpt.factory import create_ready_bot
 

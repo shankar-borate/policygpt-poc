@@ -300,7 +300,28 @@ function renderSources(sources) {
         return `<a class="source-chip" href="${escapeHtml(src.document_url)}" target="_blank" rel="noreferrer noopener" data-tooltip="${escapeHtml(tooltip)}">${escapeHtml(label)}</a>`;
     });
 
-    return `<div class="source-refs"><span class="source-refs-label">Sources</span><div class="source-chips">${chips.join("")}</div></div>`;
+    // Collect all images across sources, deduped by data URI identity.
+    const seenImages = new Set();
+    const allImages = [];
+    for (const src of sources) {
+        for (const dataUri of (src.images || [])) {
+            if (dataUri && !seenImages.has(dataUri)) {
+                seenImages.add(dataUri);
+                allImages.push({ dataUri, title: src.document_title || src.file_name || "" });
+            }
+        }
+    }
+
+    const imagesHtml = allImages.length === 0 ? "" : `
+        <div class="source-images">
+            ${allImages.map(img => `
+                <button class="source-image-link" data-img-uri="${escapeHtml(img.dataUri)}" title="Click to view full size — ${escapeHtml(img.title)}" type="button">
+                    <img class="source-image-thumb" src="${img.dataUri}" alt="${escapeHtml(img.title)}" loading="lazy" />
+                </button>
+            `).join("")}
+        </div>`;
+
+    return `<div class="source-refs"><span class="source-refs-label">Sources</span><div class="source-chips">${chips.join("")}</div>${imagesHtml}</div>`;
 }
 
 function renderMessages() {
@@ -784,6 +805,34 @@ elements.resetChatButton.addEventListener("click", resetActiveThread);
 
 window.addEventListener("beforeunload", () => {
     window.clearTimeout(state.pollHandle);
+});
+
+// ── Image lightbox ────────────────────────────────────────────────────────────
+// Clicking a .source-image-link button opens the image full-size.
+// Chrome blocks <a href="data:..."> navigation, so we convert the data URI
+// to a blob URL and open that instead (works in all browsers).
+
+function openImageBlob(dataUri) {
+    try {
+        const [meta, b64] = dataUri.split(",");
+        const mime = meta.split(":")[1].split(";")[0];
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const blob = new Blob([bytes], { type: mime });
+        const url = URL.createObjectURL(blob);
+        const win = window.open(url, "_blank");
+        // Revoke after a short delay so the new tab has time to load it.
+        if (win) setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch {
+        // Fallback: open data URI directly (works in Firefox)
+        window.open(dataUri, "_blank");
+    }
+}
+
+document.addEventListener("click", (e) => {
+    const btn = e.target.closest(".source-image-link");
+    if (!btn) return;
+    const dataUri = btn.dataset.imgUri;
+    if (dataUri) openImageBlob(dataUri);
 });
 
 autosizeComposer();

@@ -75,18 +75,23 @@ class OpenSearchRetriever:
 
     # ── Filter builder ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _build_filters(user_id: str | int) -> dict:
-        """Build OpenSearch pre-filter from the request user_id.
+    def _build_filters(self, user_id: str | int) -> dict:
+        """Resolve ACL and build an OpenSearch doc_id pre-filter.
 
-        user_ids is a keyword array on every section. The filter requires the
-        requesting user's id to be present in that array — enforced at the DB
-        level before any scoring so no unauthorised sections ever surface.
+        Calls get_accessible_doc_ids once per retrieve() call.  The returned
+        list is used as a terms filter on the doc_id field — enforced at the
+        DB level before scoring so unauthorised sections never surface.
 
-        user_id is always required. Callers must supply it explicitly —
-        there is no bypass path.
+        Returns {} for admin users (None from ACL → no filter → unrestricted).
+        Returns {"doc_id": ["__no_access__"]} when the user has no assignments
+        — the impossible value ensures zero results rather than all results.
         """
-        return {"user_ids": str(user_id)}
+        doc_ids = self.store.get_accessible_doc_ids(user_id)
+        if doc_ids is None:
+            return {}  # admin — unrestricted
+        if not doc_ids:
+            return {"doc_id": ["__no_access__"]}
+        return {"doc_id": doc_ids}
 
 
 # ── Section reconstruction ─────────────────────────────────────────────────

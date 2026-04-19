@@ -14,7 +14,11 @@ Switching domains, models, or accuracy/cost trade-offs is a one-line change:
 import os
 from dataclasses import dataclass, field
 
+from policygpt.constants import FileExtension, OCRProvider
 from policygpt.config.domain_defaults import DOMAIN_CONFIG_OVERRIDES
+
+# Derive glob patterns from the single source of truth for file extensions.
+_SUPPORTED_FILE_PATTERNS: tuple[str, ...] = tuple(f"*{ext.value}" for ext in FileExtension)
 from policygpt.config.env_loader import _env_bool, _env_float, _env_int
 from policygpt.config.presets import (
     ACCURACY_PROFILE_PRESETS,
@@ -29,14 +33,7 @@ class Config:
     # Change this ONE path to relocate all derived paths (debug_log_dir,
     # supplementary_facts_file) — they are derived automatically in __post_init__.
     document_folder: str = r"D:\policy-mgmt\data\product"
-    supported_file_patterns: tuple[str, ...] = (
-        "*.html", "*.htm", "*.txt",
-        "*.pdf",
-        "*.pptx", "*.ppt",
-        "*.docx", "*.doc",
-        "*.xlsx", "*.xls",
-        "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.tif", "*.webp",
-    )
+    supported_file_patterns: tuple[str, ...] = _SUPPORTED_FILE_PATTERNS
     excluded_file_name_parts: tuple[str, ...] = ("_summary",)
 
     # ── AI model selection ────────────────────────────────────────────────────
@@ -95,7 +92,7 @@ class Config:
     # documents are queryable by those users through OpenSearch.
     # Leave empty (default) only when hybrid_search_enabled=False, because an
     # empty list means the OpenSearch user_id filter never matches anything.
-    ingestion_user_ids: tuple[str, ...] = ()
+    ingestion_user_ids: tuple[str, ...] = ("100", "101", "102", "103", "104", "105", "106", "107", "108", "109")
 
     # ── Redaction ─────────────────────────────────────────────────────────────
     redaction_rules: dict[str, str] = field(
@@ -111,8 +108,14 @@ class Config:
     # and the extracted text is indexed alongside the surrounding content.
     # Configured per-domain in config/domain_defaults.py.
     ocr_enabled: bool = False
-    ocr_provider: str = "textract"   # only "textract" supported today
+    ocr_provider: OCRProvider = OCRProvider.TEXTRACT
     ocr_min_confidence: float = 80.0  # Textract LINE block confidence threshold (0–100)
+
+    # ── Image fetching ────────────────────────────────────────────────────────
+    # Maximum size (bytes) of a single image that will be resolved, stored, and
+    # optionally OCR'd.  Images exceeding this cap are silently skipped.
+    # Default: 1 MB.  Set via POLICY_GPT_IMAGE_MAX_BYTES env var.
+    image_max_bytes: int = 1 * 1024 * 1024
 
     # ── Ingestion: document → HTML conversion ────────────────────────────────
     # Master switch — when True, non-HTML documents are converted to HTML before
@@ -140,7 +143,7 @@ class Config:
     # ── Ingestion: FAQ generation ─────────────────────────────────────────────
     generate_faq: bool = True
     faq_max_questions: int = 30
-    faq_max_output_tokens: int = 2700
+    faq_max_output_tokens: int = 6000  # increased to accommodate paragraph-style answers (10–30 lines each)
 
     # ── Ingestion: entity extraction ──────────────────────────────────────────
     generate_entity_map: bool = True
@@ -239,7 +242,7 @@ class Config:
     opensearch_password: str = ""
     opensearch_use_ssl: bool = True
     opensearch_verify_certs: bool = False
-    opensearch_index_prefix: str = "product"
+    opensearch_index_prefix: str = "product6"
 
     # ── Hybrid search weights ─────────────────────────────────────────────────
     # Controls the blend of the three complementary retrieval mechanisms.
@@ -280,6 +283,51 @@ class Config:
     # factual claim is supported by the evidence. Flags the answer if not.
     grounding_guard_enabled: bool = True
     grounding_guard_max_output_tokens: int = 20
+
+    # ── Answer confidence classification ─────────────────────────────────────
+    confidence_high_score: float = 0.55
+    confidence_medium_score: float = 0.38
+
+    # ── Source filtering ──────────────────────────────────────────────────────
+    # After retrieval, sources whose score falls below
+    # best_score * source_score_min_scaling are dropped from the citation list.
+    source_score_min_scaling: float = 0.45
+
+    # ── Related-question suggestions ─────────────────────────────────────────
+    related_questions_min_score: float = 0.55
+
+    # ── Clarification trigger ─────────────────────────────────────────────────
+    # Questions shorter than this (chars) are treated as potentially ambiguous.
+    ambiguous_query_min_length: int = 35
+    # When confidence is LOW, append a follow-up nudge to the answer.
+    followup_on_low_confidence: bool = True
+
+    # ── Dual-answer (close-confidence disambiguation) ─────────────────────────
+    # When the second-best document scores >= this fraction of the best document,
+    # present both answers and ask the user to choose.
+    dual_answer_enabled: bool = True
+    dual_answer_score_ratio: float = 0.88
+
+    # ── Preferred-document score boost ───────────────────────────────────────
+    # Added to a document/section score when its ID is in the preferred set
+    # (i.e. it was referenced in the previous turn of the conversation).
+    preferred_doc_score_boost: float = 0.08
+
+    # ── Document-lookup answerability threshold ───────────────────────────────
+    document_lookup_score_threshold: float = 0.55
+
+    # ── Topic-alignment threshold ─────────────────────────────────────────────
+    topic_alignment_threshold: float = 0.55
+
+    # ── Exact-match score floor ────────────────────────────────────────────────
+    # When filtering sections for exact-match queries, the score floor is:
+    #   max(best_score * exact_score_floor_scale, exact_score_floor_min)
+    exact_score_floor_min: float = 0.55
+    exact_score_floor_scale: float = 0.65
+
+    # ── Intent classification LLM ─────────────────────────────────────────────
+    intent_classification_max_tokens: int = 10
+    clarifying_question_max_tokens: int = 60
 
     # ── Domain profile (computed properties) ──────────────────────────────────
 
@@ -465,4 +513,5 @@ class Config:
                 for uid in os.getenv("POLICY_GPT_INGESTION_USER_IDS", "").split(",")
                 if uid.strip()
             ),
+            image_max_bytes=_env_int("POLICY_GPT_IMAGE_MAX_BYTES", base.image_max_bytes),
         )

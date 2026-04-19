@@ -70,12 +70,12 @@ def sections_mapping(embedding_dim: int) -> dict:
                 "audiences":      {"type": "keyword"},
                 "source_path":    {"type": "keyword"},
                 "order_index":    {"type": "integer"},
-                # ── Permission fields ─────────────────────────────────────────
-                # user_ids: list of user IDs who can access this section.
-                # Inherited from the parent document at index time.
-                # Filtered at query time using the user_id from the request cookie.
-                "user_ids":       {"type": "keyword"},
                 "domain":         {"type": "keyword"},
+
+                # ── Images ────────────────────────────────────────────────────
+                # Base64 data URIs for images found in this section.
+                # Stored verbatim for retrieval but never indexed/searched.
+                "images":         {"type": "object", "enabled": False},
 
                 # ── Dense vector (vector search) ──────────────────────────────
                 "embedding": {
@@ -141,9 +141,31 @@ def faqs_mapping(embedding_dim: int) -> dict:
                         "parameters": {"ef_construction": 128, "m": 16},
                     },
                 },
-                # Permission fields — inherited from parent document
-                "user_ids":        {"type": "keyword"},
                 "domain":          {"type": "keyword"},
+            }
+        },
+    }
+
+
+def recipient_mapping() -> dict:
+    """Mapping for the recipient index — one record per (user_id, doc_id) pair.
+
+    Kept deliberately thin: no text analysis, no vectors — only keyword lookups
+    and aggregations.  Shard count is higher than other indexes because with
+    200k users × N documents the record count can be large.
+    """
+    return {
+        "settings": {
+            "index": {
+                "number_of_shards": 2,
+                "number_of_replicas": 0,
+            }
+        },
+        "mappings": {
+            "properties": {
+                "user_id":    {"type": "keyword"},
+                "doc_id":     {"type": "keyword"},
+                "granted_at": {"type": "date"},
             }
         },
     }
@@ -172,8 +194,8 @@ def documents_mapping() -> dict:
                 "audiences":      {"type": "keyword"},
                 "keywords":       {"type": "keyword"},
                 "source_path":    {"type": "keyword"},
+                "original_source_path": {"type": "keyword"},
                 "summary":        {"type": "text", "analyzer": "standard"},
-                "user_ids":       {"type": "keyword"},
                 "domain":         {"type": "keyword"},
             }
         },

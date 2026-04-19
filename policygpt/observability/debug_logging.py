@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from policygpt.extraction.redaction import Redactor
+from policygpt.ingestion.extraction.redaction import Redactor
 
 
 def write_llm_debug_log_pair(

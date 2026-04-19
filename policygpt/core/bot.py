@@ -8,6 +8,13 @@ from pathlib import Path
 import numpy as np
 
 from policygpt.config import Config
+from policygpt.constants.enums import (
+    AIProvider,
+    BedRockModelSize,
+    ConfidenceLevel,
+    ConversationalIntent,
+    QueryIntent,
+)
 from policygpt.core.conversations import ConversationManager
 from policygpt.core.corpus import DocumentCorpus, ProgressCallback
 from policygpt.core.document_links import build_document_open_url
@@ -16,12 +23,13 @@ from policygpt.models import utc_now_iso
 from policygpt.core.ai.base import AIService
 from policygpt.core.ai.providers.bedrock_provider import BedrockService
 from policygpt.observability.debug_logging import write_llm_debug_log_pair
-from policygpt.extraction.file_extractor import FileExtractor
+from policygpt.ingestion.extraction.file_extractor import FileExtractor
 from policygpt.core.ai.providers.openai_provider import OpenAIService
 from policygpt.core.retrieval.query_analyzer import QueryAnalysis, QueryAnalyzer, detect_conversational_intent
-from policygpt.extraction.redaction import Redactor
-from policygpt.extraction.taxonomy import unique_preserving_order
+from policygpt.ingestion.extraction.redaction import Redactor
+from policygpt.ingestion.extraction.taxonomy import unique_preserving_order
 from policygpt.observability.usage_metrics import LLMUsageTracker
+from policygpt.config.user_profiles import UserProfile
 
 
 class PolicyGPTBot:
@@ -132,7 +140,13 @@ class PolicyGPTBot:
     def list_threads(self, user_id: str = ""):
         return self.conversations.list_threads(user_id=user_id)
 
-    def chat(self, thread_id: str, user_question: str, user_id: str | int | None = None) -> ChatResult:
+    def chat(
+        self,
+        thread_id: str,
+        user_question: str,
+        user_id: str | int | None = None,
+        user_profile: UserProfile | None = None,
+    ) -> ChatResult:
         thread = None
         query_analysis = None
         retrieval_query = ""
@@ -148,7 +162,10 @@ class PolicyGPTBot:
 
             conversational_intent = detect_conversational_intent(user_question)
             if conversational_intent:
-                reply = self._conversational_reply(conversational_intent, user_question)
+                if conversational_intent == ConversationalIntent.SELF_REFERENTIAL:
+                    reply = self._self_referential_reply(thread, user_question)
+                else:
+                    reply = self._conversational_reply(conversational_intent, user_question)
                 thread.display_messages.append(Message(role="user", content=user_question))
                 thread.display_messages.append(Message(role="assistant", content=reply))
                 thread.updated_at = utc_now_iso()
@@ -167,6 +184,7 @@ class PolicyGPTBot:
                 active_document_titles=active_document_titles,
                 candidate_documents=list(self.documents.values()),
                 entity_lookup=self.corpus.entity_lookup,
+                user_profile=user_profile,
             )
 
             retrieval_query = self._build_retrieval_query(thread, query_analysis)
@@ -238,25 +256,24 @@ class PolicyGPTBot:
                     preferred_doc_ids=preferred_doc_ids,
                     preferred_section_ids=preferred_section_ids,
                     user_id=user_id,
+                    user_profile=user_profile,
                 )
                 top_docs = []
                 top_sections = []
                 is_answerable = True
                 prompt_payload = ""
             else:
-                top_docs = self.corpus.retrieve_top_docs(
-                    query_vec,
-                    query_analysis=query_analysis,
-                    preferred_doc_ids=preferred_doc_ids,
-                )
                 top_sections = self.corpus.retrieve_top_sections(
                     query_vec,
                     query_analysis,
-                    top_docs,
                     preferred_section_ids=preferred_section_ids,
                     user_id=user_id,
+                    user_profile=user_profile,
                 )
-                top_docs = self._merge_retrieved_documents(top_docs, top_sections)
+                top_docs = self._merge_retrieved_documents(
+                    self._docs_from_sections(top_sections, preferred_doc_ids),
+                    top_sections,
+                )
 
                 # One SourceReference per document (highest-scoring section wins).
                 # top_sections is already sorted by score descending so the first
@@ -280,37 +297,103 @@ class PolicyGPTBot:
                 # the reference list focused on genuinely relevant sections.
                 if len(sources) > 1:
                     best_src_score = sources[0].score
-                    min_src = max(self.config.answerability_min_section_score, best_src_score * 0.45)
+                    min_src = max(self.config.answerability_min_section_score, best_src_score * self.config.source_score_min_scaling)
                     sources = [s for s in sources if s.score >= min_src] or sources[:1]
 
                 is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
+
+                # ── Layer 1: keyword-title fallback ───────────────────────────
+                # When semantic search fails, retry using focus-term matching
+                # against section/document titles and keywords.  This catches
+                # cases where the section title ("Deployment Diagram") doesn't
+                # embed close to the query ("which ports are used") even though
+                # the content is exactly what was asked.
+                if not is_answerable:
+                    fallback_sections = self._keyword_title_fallback_sections(query_analysis)
+                    if fallback_sections:
+                        top_sections = fallback_sections
+                        top_docs = self._merge_retrieved_documents(
+                            self._docs_from_sections(top_sections, preferred_doc_ids),
+                            top_sections,
+                        )
+                        is_answerable = self._is_answerable(query_analysis, top_docs, top_sections)
+                        if is_answerable:
+                            # Rebuild sources from the fallback sections
+                            _seen_doc_paths_fb: set[str] = set()
+                            sources = []
+                            for section, score in top_sections:
+                                _key = section.source_path.lower().replace("\\", "/")
+                                if _key in _seen_doc_paths_fb:
+                                    continue
+                                _seen_doc_paths_fb.add(_key)
+                                sources.append(SourceReference(
+                                    document_title=self._get_doc_title_for_section(section),
+                                    section_title=section.title,
+                                    source_path=section.source_path,
+                                    score=score,
+                                    section_order_index=section.order_index,
+                                    original_source_path=self._get_original_source_path_for_section(section),
+                                ))
+
                 if not is_answerable:
                     sources = []
                 if is_answerable:
-                    prompt_payload = self._build_answer_context(
-                        thread=thread,
-                        query_analysis=query_analysis,
-                        top_docs=top_docs,
-                        top_sections=top_sections,
-                        query_vec=query_vec,
-                        user_id=user_id,
-                    )
-                    masked_answer = self._llm_text_with_debug_log(
-                        purpose="chat_answer",
-                        system_prompt=self.redactor.mask_text(self._system_prompt()),
-                        user_prompt=self.redactor.mask_text(prompt_payload),
-                        max_output_tokens=self.config.chat_max_output_tokens,
-                    )
-                    answer_text = self._normalize_answer_markdown(self.redactor.unmask_text(masked_answer))
-                    if not self._check_answer_grounding(answer_text, prompt_payload):
-                        answer_text += (
-                            "\n\n_Note: some details in this answer could not be fully verified "
-                            "against the retrieved evidence. Please cross-check with the source document._"
+                    # ── Feature 2: dual answer when two docs have close scores ─
+                    if self._is_dual_answer_candidate(top_docs, top_sections, query_analysis):
+                        dual = self._build_dual_answer(
+                            thread=thread,
+                            query_analysis=query_analysis,
+                            top_docs=top_docs,
+                            top_sections=top_sections,
+                            query_vec=query_vec,
+                            user_id=user_id,
+                            user_profile=user_profile,
                         )
-                    # Confidence indicator — show only when not high confidence
+                        if dual:
+                            answer_text = dual
+                            # Keep sources from both docs
+                        else:
+                            # Dual generation failed — fall through to single answer
+                            pass
+
+                    if not answer_text:
+                        prompt_payload = self._build_answer_context(
+                            thread=thread,
+                            query_analysis=query_analysis,
+                            top_docs=top_docs,
+                            top_sections=top_sections,
+                            query_vec=query_vec,
+                            user_id=user_id,
+                        )
+                        masked_answer = self._llm_text_with_debug_log(
+                            purpose="chat_answer",
+                            system_prompt=self.redactor.mask_text(self._system_prompt(user_profile)),
+                            user_prompt=self.redactor.mask_text(prompt_payload),
+                            max_output_tokens=self.config.chat_max_output_tokens,
+                        )
+                        answer_text = self._normalize_answer_markdown(self.redactor.unmask_text(masked_answer))
+                        if not self._check_answer_grounding(answer_text, prompt_payload):
+                            answer_text += (
+                                "\n\n_Note: some details in this answer could not be fully verified "
+                                "against the retrieved evidence. Please cross-check with the source document._"
+                            )
+
                     confidence = self._compute_confidence(top_sections)
-                    if confidence != "High":
+                    if confidence != ConfidenceLevel.HIGH:
                         answer_text += f"\n\n_Confidence: {confidence}_"
+
+                    # ── Feature 1b: follow-up nudge on LOW confidence ──────────
+                    if (
+                        confidence == ConfidenceLevel.LOW
+                        and self.config.followup_on_low_confidence
+                        and not self._is_dual_answer_candidate(top_docs, top_sections, query_analysis)
+                    ):
+                        followup = self._generate_low_confidence_followup(
+                            user_question, answer_text, query_analysis
+                        )
+                        if followup:
+                            answer_text += f"\n\n{followup}"
+
                     # Suggest related questions from the FAQ corpus
                     related = self._find_related_questions(query_vec, user_question, user_id=user_id)
                     if related:
@@ -321,13 +404,18 @@ class PolicyGPTBot:
                     # failure — cheap single call, avoids confusing non-policy
                     # messages with "I couldn't find a clear statement".
                     llm_intent = self._llm_classify_intent(user_question)
-                    if llm_intent != "policy":
+                    if llm_intent == ConversationalIntent.SELF_REFERENTIAL:
+                        answer_text = self._self_referential_reply(thread, user_question)
+                    elif llm_intent != ConversationalIntent.POLICY:
                         answer_text = self._conversational_reply(llm_intent, user_question)
                     else:
-                        # Try a clarifying question before giving up — useful for
-                        # ambiguous or overly-broad queries where more context helps.
+                        # ── Feature 1a: always ask a clarifying question before
+                        # giving up — the bot has docs nearby, ask the user to
+                        # narrow down rather than showing a dead-end message.
                         clarifying = self._generate_clarifying_question(user_question, query_analysis, top_docs)
-                        answer_text = clarifying if clarifying else self._build_unanswerable_response(query_analysis, top_docs)
+                        answer_text = clarifying if clarifying else self._build_unanswerable_response(
+                            query_analysis, top_docs, query_vec=query_vec, user_id=user_id
+                        )
 
             final_answer = self._sanitize_answer_for_user(answer_text.strip())
             # Populate cache for eligible queries (non-context-dependent + answerable)
@@ -399,7 +487,7 @@ class PolicyGPTBot:
         return self.corpus.embed_text(text)
 
     def _build_ai_service(self) -> AIService:
-        if self.config.ai_provider == "bedrock":
+        if self.config.ai_provider == AIProvider.BEDROCK:
             return BedrockService(
                 chat_model=self.config.chat_model,
                 embedding_model=self.config.embedding_model,
@@ -409,7 +497,7 @@ class PolicyGPTBot:
                 usage_tracker=self.usage_tracker,
             )
 
-        if self.config.ai_provider == "openai":
+        if self.config.ai_provider == AIProvider.OPENAI:
             return OpenAIService(
                 self.config.chat_model,
                 self.config.embedding_model,
@@ -449,18 +537,77 @@ class PolicyGPTBot:
 
         # Canned fallback in case the LLM call fails
         _fallback: dict[str, str] = {
-            "greeting": self.config.domain_profile.greeting_reply,
-            "farewell": "Goodbye! Come back anytime.",
-            "thanks": "You're welcome!",
-            "identity": self.config.domain_profile.identity_reply,
+            ConversationalIntent.GREETING: self.config.domain_profile.greeting_reply,
+            ConversationalIntent.FAREWELL: "Goodbye! Come back anytime.",
+            ConversationalIntent.THANKS:   "You're welcome!",
+            ConversationalIntent.IDENTITY: self.config.domain_profile.identity_reply,
         }
         return _fallback.get(intent, "Happy to help — just ask!")
+
+    def _self_referential_reply(self, thread: object, user_question: str) -> str:
+        """Handle meta-questions about the bot's own previous answer.
+
+        Looks at the last assistant reply and the user question before it, then
+        uses the LLM to explain what was (or wasn't) covered and why, without
+        triggering a fresh RAG search that would wrongly say "the documents
+        don't explain why I missed something".
+        """
+        # Extract the most recent Q-A pair from conversation history
+        recent = getattr(thread, "recent_messages", [])
+        prev_user_q = ""
+        prev_bot_answer = ""
+        for msg in reversed(recent):
+            if not prev_bot_answer and msg.role == "assistant":
+                prev_bot_answer = msg.content or ""
+            elif prev_bot_answer and not prev_user_q and msg.role == "user":
+                prev_user_q = msg.content or ""
+                break
+
+        if not prev_bot_answer:
+            # No prior context — treat as a clarification request
+            return (
+                "I don't have a previous answer to refer back to in this conversation. "
+                "Could you re-ask the original question so I can give you a complete answer?"
+            )
+
+        system_prompt = (
+            f"You are a helpful policy assistant for {self.config.domain_profile.persona_description}. "
+            "The user is asking a follow-up question about your PREVIOUS answer — they feel you "
+            "missed something or didn't cover a point they expected. "
+            "Your job is to:\n"
+            "1. Acknowledge the gap honestly (don't be defensive).\n"
+            "2. If the missing detail can be inferred from your previous answer, explain it now.\n"
+            "3. If the detail is simply not in the policy documents you have, say so clearly.\n"
+            "4. Keep the response concise (3-5 sentences max).\n"
+            "Do NOT say 'the provided documents do not explain why I missed it' — that is unhelpful. "
+            "Respond directly to what the user is asking."
+        )
+        context_block = ""
+        if prev_user_q:
+            context_block += f"Original question: {prev_user_q}\n\n"
+        context_block += f"Your previous answer:\n{prev_bot_answer}\n\nFollow-up: {user_question}"
+
+        try:
+            reply = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=context_block,
+                max_output_tokens=300,
+            ).strip()
+            if reply:
+                return reply
+        except Exception:
+            pass
+
+        return (
+            "I apologise for missing that. Could you tell me specifically what you were "
+            "expecting, and I'll look it up properly?"
+        )
 
     def _llm_classify_intent(self, text: str) -> str:
         """Use a cheap LLM call to classify intent when the pattern pre-filter misses.
 
         Returns one of: "policy" | "greeting" | "farewell" | "thanks" |
-        "identity" | "chitchat".
+        "identity" | "chitchat" | "self_referential".
 
         Defaults to "policy" on any failure so real questions are never
         suppressed by a classification error.
@@ -468,12 +615,13 @@ class PolicyGPTBot:
         system_prompt = (
             f"You are an intent classifier for a policy Q&A assistant used by {self.config.domain_profile.intent_user_description}. "
             "Classify the user message into exactly one of these categories:\n"
-            f"  policy    — a genuine question about {self.config.domain_profile.intent_policy_description}\n"
-            "  greeting  — hello, hi, good morning, good evening, etc.\n"
-            "  farewell  — bye, goodbye, see you, take care, etc.\n"
-            "  thanks    — thank you, thanks, great, nice, looks good, cheers, etc.\n"
-            "  identity  — who are you, what can you do, what is this bot, etc.\n"
-            "  chitchat  — any other off-topic or social message that is not a policy question\n\n"
+            f"  {ConversationalIntent.POLICY}           — a genuine question about {self.config.domain_profile.intent_policy_description}\n"
+            f"  {ConversationalIntent.GREETING}         — hello, hi, good morning, good evening, etc.\n"
+            f"  {ConversationalIntent.FAREWELL}         — bye, goodbye, see you, take care, etc.\n"
+            f"  {ConversationalIntent.THANKS}           — thank you, thanks, great, nice, looks good, cheers, etc.\n"
+            f"  {ConversationalIntent.IDENTITY}         — who are you, what can you do, what is this bot, etc.\n"
+            f"  {ConversationalIntent.CHITCHAT}         — any other off-topic or social message that is not a policy question\n"
+            f"  {ConversationalIntent.SELF_REFERENTIAL} — asking why the bot missed/forgot/omitted something in its previous answer\n\n"
             "Reply with ONLY the single category word. No punctuation, no explanation."
         )
         user_prompt = f"Message: {text.strip()}"
@@ -481,13 +629,13 @@ class PolicyGPTBot:
             raw = self.ai.llm_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                max_output_tokens=10,
+                max_output_tokens=self.config.intent_classification_max_tokens,
             )
-            category = raw.strip().lower().split()[0] if raw.strip() else "policy"
-            valid = {"policy", "greeting", "farewell", "thanks", "identity", "chitchat"}
-            return category if category in valid else "policy"
+            category = raw.strip().lower().split()[0] if raw.strip() else ConversationalIntent.POLICY
+            valid = {i.value for i in ConversationalIntent}
+            return category if category in valid else ConversationalIntent.POLICY
         except Exception:
-            return "policy"
+            return ConversationalIntent.POLICY
 
     def _check_answer_grounding(self, answer: str, evidence_context: str) -> bool:
         """Return True if the answer appears grounded in the evidence.
@@ -561,6 +709,100 @@ class PolicyGPTBot:
 
         return [text]
 
+    def _is_dual_answer_candidate(
+        self,
+        top_docs: list,
+        top_sections: list,
+        query_analysis: QueryAnalysis,
+    ) -> bool:
+        """Return True when two distinct documents have close enough scores to
+        warrant showing both answers and letting the user choose.
+
+        Skipped for: multi-doc queries (already expects many sources), exact-match
+        queries (single clear answer expected), context-dependent follow-ups.
+        """
+        if not self.config.dual_answer_enabled:
+            return False
+        if query_analysis.multi_doc_expected or query_analysis.context_dependent:
+            return False
+        if query_analysis.exact_match_expected:
+            return False
+        if len(top_docs) < 2:
+            return False
+
+        score_a = top_docs[0][1]
+        score_b = top_docs[1][1]
+        if score_a <= 0:
+            return False
+        # Only trigger when both docs are genuinely good (not just both mediocre)
+        if score_a < self.config.confidence_medium_score:
+            return False
+        return (score_b / score_a) >= self.config.dual_answer_score_ratio
+
+    def _build_dual_answer(
+        self,
+        thread,
+        query_analysis: QueryAnalysis,
+        top_docs: list,
+        top_sections: list,
+        query_vec,
+        user_id,
+        user_profile: "UserProfile | None" = None,
+    ) -> str:
+        """Generate two answers from the top two documents and present them for
+        the user to choose the more relevant one.
+
+        Each answer is generated from the sections belonging to its document only.
+        """
+        doc_a, _ = top_docs[0]
+        doc_b, _ = top_docs[1]
+
+        def _sections_for_doc(doc_id: str) -> list[tuple]:
+            return [(s, sc) for s, sc in top_sections if s.doc_id == doc_id]
+
+        sections_a = _sections_for_doc(doc_a.doc_id) or top_sections[:3]
+        sections_b = _sections_for_doc(doc_b.doc_id) or top_sections[3:6]
+
+        def _answer_from_sections(doc, secs) -> str:
+            if not secs:
+                return ""
+            docs_for_context = [(doc, 1.0)]
+            payload = self._build_answer_context(
+                thread=thread,
+                query_analysis=query_analysis,
+                top_docs=docs_for_context,
+                top_sections=secs,
+                query_vec=query_vec,
+                user_id=user_id,
+            )
+            try:
+                raw = self._llm_text_with_debug_log(
+                    purpose="dual_answer",
+                    system_prompt=self.redactor.mask_text(self._system_prompt(user_profile)),
+                    user_prompt=self.redactor.mask_text(payload),
+                    max_output_tokens=self.config.chat_max_output_tokens,
+                )
+                return self._normalize_answer_markdown(self.redactor.unmask_text(raw))
+            except Exception:
+                return ""
+
+        answer_a = _answer_from_sections(doc_a, sections_a)
+        answer_b = _answer_from_sections(doc_b, sections_b)
+
+        if not answer_a and not answer_b:
+            return ""
+        if not answer_b:
+            return answer_a
+        if not answer_a:
+            return answer_b
+
+        return (
+            "I found relevant information in two different documents. "
+            "Which of these better answers your question?\n\n"
+            f"**Option A — {doc_a.title}:**\n{answer_a}\n\n"
+            f"**Option B — {doc_b.title}:**\n{answer_b}"
+        )
+
     def _answer_compound_question(
         self,
         thread,
@@ -570,6 +812,7 @@ class PolicyGPTBot:
         preferred_doc_ids: list[str],
         preferred_section_ids: list[str],
         user_id: str | int | None = None,
+        user_profile=None,
     ) -> tuple[str, list[SourceReference]]:
         """Retrieve evidence for each sub-question separately and answer together.
 
@@ -588,18 +831,14 @@ class PolicyGPTBot:
                 entity_lookup=self.corpus.entity_lookup,
             )
             sub_vec = self._embed_one(sub_q)
-            sub_docs = self.corpus.retrieve_top_docs(
-                sub_vec,
-                query_analysis=sub_analysis,
-                preferred_doc_ids=preferred_doc_ids,
-            )
             sub_sections = self.corpus.retrieve_top_sections(
                 sub_vec,
                 sub_analysis,
-                sub_docs,
                 preferred_section_ids=preferred_section_ids,
                 user_id=user_id,
+                user_profile=user_profile,
             )
+            sub_docs = self._docs_from_sections(sub_sections, preferred_doc_ids)
             for section, score in sub_sections:
                 if section.section_id in seen_section_ids:
                     continue
@@ -639,17 +878,16 @@ class PolicyGPTBot:
         answer = self._normalize_answer_markdown(self.redactor.unmask_text(masked))
         return answer, all_sources
 
-    @staticmethod
-    def _compute_confidence(top_sections: list[tuple]) -> str:
-        """Return 'High', 'Medium', or 'Low' based on the best section retrieval score."""
+    def _compute_confidence(self, top_sections: list[tuple]) -> ConfidenceLevel:
+        """Return HIGH / MEDIUM / LOW based on the best section retrieval score."""
         if not top_sections:
-            return "Low"
+            return ConfidenceLevel.LOW
         best_score = top_sections[0][1]
-        if best_score >= 0.55:
-            return "High"
-        if best_score >= 0.38:
-            return "Medium"
-        return "Low"
+        if best_score >= self.config.confidence_high_score:
+            return ConfidenceLevel.HIGH
+        if best_score >= self.config.confidence_medium_score:
+            return ConfidenceLevel.MEDIUM
+        return ConfidenceLevel.LOW
 
     def _find_related_questions(
         self,
@@ -669,7 +907,7 @@ class PolicyGPTBot:
         seen: set[str] = set()
         related: list[str] = []
         for score, q, _, _ in candidates:
-            if score < 0.55:
+            if score < self.config.related_questions_min_score:
                 break  # Results are sorted descending — stop when score drops off
             q_lower = q.strip().casefold()
             if q_lower == asked_lower or q_lower in seen:
@@ -686,31 +924,70 @@ class PolicyGPTBot:
         query_analysis: QueryAnalysis,
         top_docs: list,
     ) -> str:
-        """Ask the user one clarifying question when retrieval fails for ambiguous queries.
+        """Ask ONE clarifying question when retrieval fails to find an answer.
 
-        Returns the clarifying question string, or empty string when the query
-        is specific enough that clarification wouldn't help.
+        Always attempts a clarifying question when there are candidate documents
+        nearby — the question is the most conversational response to a failed
+        lookup.  Falls back to the unanswerable response only when no documents
+        exist to reference.
+
+        Returns the clarifying question string, or empty string when no docs
+        are available to anchor the question.
         """
-        # Only ask for clarification when the query is genuinely ambiguous:
-        # very short, multi-intent, or multi-doc expected but unclear scope.
-        is_ambiguous = (
-            len(user_question.strip()) < 35
-            or len(query_analysis.intents) > 2
-            or (query_analysis.multi_doc_expected and len(query_analysis.topic_hints) == 0)
-        )
-        if not is_ambiguous or not top_docs:
+        if not top_docs:
             return ""
         doc_titles = [doc.title for doc, _ in top_docs[:3]]
         system_prompt = (
-            "You are a helpful policy assistant. The user asked a question but retrieval "
-            "did not return a clear answer. Ask ONE short, specific clarifying question "
-            "that would help you give a better answer. Reference the available documents if helpful. "
-            "Do not explain why you are asking — just ask the question naturally."
+            "You are a helpful policy assistant. The user asked a question but the "
+            "answer was not found clearly in the available documents. "
+            "Ask ONE short, specific clarifying question that would help narrow down "
+            "the answer — for example, asking which document, which role, which scenario, "
+            "or which specific aspect they mean. "
+            "Reference the available documents by name if that helps focus the question. "
+            "Do not explain why you are asking — just ask naturally."
         )
         user_prompt = (
             f"User question: {user_question}\n"
             f"Documents available: {', '.join(doc_titles)}\n\n"
             "Ask one clarifying question."
+        )
+        try:
+            reply = self.ai.llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=self.config.clarifying_question_max_tokens,
+            ).strip()
+            return reply if reply else ""
+        except Exception:
+            return ""
+
+    def _generate_low_confidence_followup(
+        self,
+        user_question: str,
+        answer_text: str,
+        query_analysis: QueryAnalysis,
+    ) -> str:
+        """Generate a short follow-up nudge appended to a LOW-confidence answer.
+
+        Invites the user to add context that would help produce a sharper answer.
+        Returns empty string on failure so the caller can skip it silently.
+        """
+        system_prompt = (
+            "You are a helpful policy assistant. You have just given an answer but "
+            "you are not fully confident it covers what the user needs. "
+            "Write ONE short follow-up question (one sentence) that invites the user "
+            "to provide more context — for example: which department, which role, "
+            "which scenario, or whether a specific document is in scope. "
+            "Do NOT repeat the answer. Do NOT explain. Just ask the question naturally."
+        )
+        topic_hint = (
+            f"Topic area: {', '.join(query_analysis.topic_hints)}\n" if query_analysis.topic_hints else ""
+        )
+        user_prompt = (
+            f"User question: {user_question}\n"
+            f"{topic_hint}"
+            f"Answer given: {answer_text[:400]}\n\n"
+            "Write one follow-up question."
         )
         try:
             reply = self.ai.llm_text(
@@ -747,11 +1024,21 @@ class PolicyGPTBot:
         """
         self._supplementary_facts = self._load_supplementary_facts()
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, user_profile: "UserProfile | None" = None) -> str:
         domain = self.config.domain_context
+        profile_line = ""
+        if user_profile and not user_profile.is_empty():
+            ctx = user_profile.context_line()
+            profile_line = (
+                f"\nUser context: {ctx}\n"
+                "When the retrieved evidence contains role-specific or grade-specific rules, "
+                "prioritise the rules that apply to this user's role and context. "
+                "If a rule applies to all users, state it normally."
+            )
         if self._uses_open_weight_prompt_profile():
             return (
                 f"Domain: {domain}\n"
+                f"{profile_line}\n"
                 "You are a conversational assistant helping users in this domain "
                 f"find answers from their {self.config.domain_profile.doc_type_label}.\n"
                 "Rules:\n"
@@ -763,10 +1050,10 @@ class PolicyGPTBot:
                 "6. Mention section titles and file names when useful.\n"
                 "7. Do not hallucinate.\n"
                 "8. Format the answer in clean Markdown with short sections or bullets when helpful.\n"
-                "9. Default to a sharp, concise answer that gets to the point quickly.\n"
-                "10. Give more detail only when the user explicitly asks for it, such as 'in detail', 'detailed', 'step by step', or similar.\n"
-                "11. Do not add unnecessary background, repetition, or long caveats.\n"
-                "12. For direct questions, lead with the answer in the first line.\n"
+                "9. Give a complete, descriptive answer that covers all relevant points found in the evidence. Do not truncate or summarise away useful detail.\n"
+                "10. Open with the answer itself in the first sentence — no label, no preamble — then elaborate with supporting detail, context, and steps from the evidence.\n"
+                "11. Do not add unnecessary background, repetition, or long caveats that are not in the evidence.\n"
+                "12. Never prefix a sentence with labels like 'Direct answer:', 'Summary:', 'Answer:' or similar headings.\n"
                 "13. Ignore retrieved text that is about a different policy or a different topic than the user's question, even if it appears semantically similar.\n"
                 "14. If the evidence does not explicitly support the asked point, say it is not clearly stated instead of inferring.\n"
                 "15. Rewrite policy language into plain, user-friendly business English. Do not paste long policy wording back to the user.\n"
@@ -776,6 +1063,7 @@ class PolicyGPTBot:
                 "19. Treat the question analysis as a retrieval aid, but only state things that are clearly supported by the evidence snippets.\n"
                 "20. If the evidence covers only part of the answer, answer only that part and say what is not clearly stated.\n"
                 "21. Prefer evidence snippets over broad summaries when they conflict.\n"
+                "21a. Never introduce specific named entities, numbers, dates, versions, technology names, product names, or vendor names that do not appear in the evidence — even if you believe them to be true from your training data. You may freely elaborate, explain, and synthesise what IS in the evidence using your own words, but every concrete claim must be traceable to the evidence.\n"
                 "22. When the user asks for a checklist, process, approval path, or timeline, present it in a scannable format.\n"
                 "23. If recent chat suggests one document but the current retrieved evidence explicitly defines the asked term in another document, follow the current evidence and briefly note the difference if needed.\n"
                 "24. Treat raw policy evidence blocks as the source of truth. Use summaries only for orientation. If a raw evidence block and a summary differ, trust the raw evidence.\n"
@@ -784,14 +1072,16 @@ class PolicyGPTBot:
             )
         return (
             f"Domain: {domain}\n"
+            f"{profile_line}\n"
             "You are a document assistant helping users in this domain find answers from their policy documents.\n"
             "Answer only from the provided evidence; if unclear, say it is not clearly stated.\n"
+            "Never introduce specific named entities, numbers, dates, versions, technology names, product names, or vendor names that do not appear in the evidence — even if you believe them to be true from training. You may elaborate and explain using your own words, but every concrete claim must be traceable to the evidence.\n"
+            "Give a complete, descriptive answer covering all relevant points in the evidence. Open with the answer itself in the first sentence, then elaborate with supporting detail and context. Do not add labels like 'Direct answer:' or 'Summary:'.\n"
             "Use recent chat only for referential follow-ups.\n"
             "Prefer raw evidence blocks over summaries; summaries are orientation only.\n"
             "Ignore off-topic retrieved text.\n"
             "When multiple documents apply, combine them and note differences.\n"
-            "State only supported points.\n"
-            "Reply in concise Markdown. Lead with the answer. Use short bullets for list, eligibility, process, approval, comparison, and timeline questions.\n"
+            "Reply in clear Markdown. Lead with the answer. Use bullets for list, eligibility, process, approval, comparison, and timeline questions.\n"
             "Use plain English. Avoid long quotes and repetition.\n"
             "No Evidence:, Source:, or Reference: lines in the answer body.\n"
             "Never show internal IDs or evidence labels. Sources are shown separately.\n"
@@ -802,7 +1092,10 @@ class PolicyGPTBot:
         config = getattr(self, "config", None)
         if config is None:
             return False
-        return config.ai_provider == "bedrock" and config.bedrock_gpt_model_size in {"20b", "120b"}
+        return (
+            config.ai_provider == AIProvider.BEDROCK
+            and config.bedrock_gpt_model_size in {BedRockModelSize.SMALL, BedRockModelSize.LARGE}
+        )
 
     # Keywords that signal the user wants output as a table.
     _TABLE_REQUEST_PHRASES: tuple[str, ...] = (
@@ -837,7 +1130,7 @@ class PolicyGPTBot:
             return (
                 "The user has asked for a detailed explanation. "
                 "Structure your answer as follows (skip any section that has no relevant content): "
-                "1. **Summary** — one or two sentences with the direct answer. "
+                "1. **Summary** — one or two sentences answering the question directly. "
                 "2. **Details** — bullet points with exact values, thresholds, role names, and conditions from the evidence. "
                 "3. **Exceptions / Conditions** — any exclusions, disqualifications, or special rules if stated in the evidence. "
                 "Keep each section tight. Lead with facts, not preamble."
@@ -856,7 +1149,7 @@ class PolicyGPTBot:
                 + detail_suffix
             )
 
-        if "comparison" in query_analysis.intents:
+        if QueryIntent.COMPARISON in query_analysis.intents:
             return (
                 "Start with the direct difference, then use short bullets for each item being compared. "
                 "Call out document-specific differences explicitly when the evidence comes from different sources."
@@ -869,45 +1162,45 @@ class PolicyGPTBot:
                 "If the exact wording is not clearly supported, say so instead of generalizing."
                 + detail_suffix
             )
-        if "aggregate" in query_analysis.intents:
+        if QueryIntent.AGGREGATE in query_analysis.intents:
             return (
-                "Start with the direct answer, then list each relevant item in short bullets. "
+                "Open with the answer itself, then list each relevant item in short bullets. "
                 "For every bullet, use 'Name - short description' and keep the description to one concise phrase based on the evidence. "
                 + self.config.domain_profile.aggregate_response_hint
                 + detail_suffix
             )
         if query_analysis.multi_doc_expected:
             return (
-                "Start with the direct answer, then cover the relevant documents in short bullets. "
+                "Open with the answer itself, then cover the relevant documents in short bullets. "
                 "Call out differences or gaps across documents explicitly."
                 + detail_suffix
             )
-        if "document_lookup" in query_analysis.intents:
+        if QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents:
             return (
                 "Start by naming the closest matching document. Then give a short, user-friendly summary of what it covers. "
                 "If the user appears to be asking only to locate the policy, keep the summary brief and point them to the reference."
                 + detail_suffix
             )
-        if "approval" in query_analysis.intents:
+        if QueryIntent.APPROVAL in query_analysis.intents:
             return (
                 "Start with who approves, then use short bullets with bold labels for each approval path or threshold."
                 + detail_suffix
             )
-        if "eligibility" in query_analysis.intents:
+        if QueryIntent.ELIGIBILITY in query_analysis.intents:
             return "Start with who is eligible, then list conditions, exclusions, or exceptions in bullets." + detail_suffix
-        if "documents_required" in query_analysis.intents:
+        if QueryIntent.DOCUMENTS_REQUIRED in query_analysis.intents:
             return (
                 "Start with the required documents, then use short bullets. Include timing only if clearly stated."
                 + detail_suffix
             )
-        if "checklist" in query_analysis.intents or "process" in query_analysis.intents:
+        if QueryIntent.CHECKLIST in query_analysis.intents or QueryIntent.PROCESS in query_analysis.intents:
             return (
                 "Start with a one-line answer, then use short action bullets in the order the user should follow."
                 + detail_suffix
             )
-        if "timeline" in query_analysis.intents:
+        if QueryIntent.TIMELINE in query_analysis.intents:
             return "Lead with the timing or deadline, then list supporting conditions in bullets." + detail_suffix
-        return "Start with a direct answer. Use short bullets only when they make the answer clearer." + detail_suffix
+        return "Open with the answer itself in the first sentence. Use short bullets only when they make the answer clearer." + detail_suffix
 
     def _is_answerable(
         self,
@@ -915,9 +1208,9 @@ class PolicyGPTBot:
         top_docs: list[tuple],
         top_sections: list[tuple],
     ) -> bool:
-        if "document_lookup" in query_analysis.intents and top_docs:
+        if QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents and top_docs:
             best_document = top_docs[0][0]
-            if self.corpus.document_lookup_score(query_analysis, best_document) >= 0.55:
+            if self.corpus.document_lookup_score(query_analysis, best_document) >= self.config.document_lookup_score_threshold:
                 return True
 
         if not top_sections:
@@ -938,7 +1231,7 @@ class PolicyGPTBot:
         # to exact term match in evidence blocks.
         section_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_section.metadata_tags)
         document_topic_alignment = self.corpus.topic_alignment_score(query_analysis.topic_hints, best_document.metadata_tags) if best_document else 0.0
-        if max(section_topic_alignment, document_topic_alignment) >= 0.55:
+        if max(section_topic_alignment, document_topic_alignment) >= self.config.topic_alignment_threshold:
             return True
 
         support_match_count = 0
@@ -977,21 +1270,149 @@ class PolicyGPTBot:
 
         return True
 
-    def _build_unanswerable_response(self, query_analysis: QueryAnalysis, top_docs) -> str:
-        if top_docs:
-            suggested_title = top_docs[0][0].title
-            if query_analysis.topic_hints:
-                topic_text = ", ".join(topic.replace("_", " ") for topic in query_analysis.topic_hints)
-                return (
-                    f"I couldn't find a clear statement for this in the indexed evidence. "
-                    f"The closest policy area I found was {topic_text}, but the retrieved text does not clearly answer it. "
-                    f"The nearest document was: {suggested_title}."
-                )
-            return (
-                "I couldn't find a clear statement for this in the indexed evidence. "
-                f"The nearest document was: {suggested_title}."
+    def _keyword_title_fallback_sections(
+        self,
+        query_analysis: QueryAnalysis,
+        top_k: int = 12,
+    ) -> list[tuple]:
+        """Second-pass retrieval by keyword matching against section/document titles.
+
+        Used when semantic search returns nothing answerable — catches cases
+        where the query ("which ports are used") doesn't embed close to the
+        section title ("Deployment Diagram") even though the content is relevant.
+
+        Scores each section by how many focus/expanded terms appear in its
+        title_terms, keywords, and metadata_tags.  Returns the top_k sections
+        sorted by score descending, or an empty list when no matches found.
+        """
+        query_terms: set[str] = set(query_analysis.focus_terms + query_analysis.expanded_terms)
+        if not query_terms:
+            return []
+
+        scored: list[tuple] = []
+        for section in self.sections.values():
+            section_signals: set[str] = set(
+                section.title_terms
+                + section.keywords
+                + section.metadata_tags
             )
-        return "I couldn't find a clear statement for this in the indexed evidence."
+            # Also tokenize the raw title for short titles like "Deployment Diagram"
+            # that may not have title_terms populated
+            for word in re.findall(r"[a-z0-9]+", section.normalized_title or section.title.lower()):
+                section_signals.add(word)
+
+            doc = self.documents.get(section.doc_id)
+            if doc:
+                section_signals.update(doc.title_terms + doc.keywords + doc.metadata_tags)
+                for word in re.findall(r"[a-z0-9]+", doc.normalized_title or doc.title.lower()):
+                    section_signals.add(word)
+
+            hits = len(query_terms.intersection(section_signals))
+            if hits > 0:
+                # Normalise: hits relative to query length so shorter queries
+                # don't get an unfair advantage over longer ones.
+                score = hits / max(len(query_terms), 1)
+                scored.append((section, score))
+
+        if not scored:
+            return []
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
+
+    def _build_unanswerable_response(
+        self,
+        query_analysis: QueryAnalysis,
+        top_docs: list,
+        query_vec=None,
+        user_id: str | int | None = None,
+    ) -> str:
+        """Build a helpful 'not found' response.
+
+        Instead of a dead-end message, the response:
+        1. States what couldn't be found.
+        2. Lists specific sections/documents that are topically related and
+           might contain the answer (so the user doesn't have to guess).
+        3. Suggests follow-up questions drawn from the FAQ corpus.
+        """
+        # ── 1. Find topically-related sections via title keyword match ─────────
+        hint_lines: list[str] = []
+        seen_doc_titles: set[str] = set()
+        query_terms: set[str] = set(query_analysis.focus_terms + query_analysis.expanded_terms)
+
+        if query_terms:
+            candidate_hits: list[tuple[float, str, str]] = []  # (score, section_title, doc_title)
+            for section in self.sections.values():
+                section_signals: set[str] = set(
+                    section.title_terms + section.keywords + section.metadata_tags
+                )
+                for word in re.findall(r"[a-z0-9]+", section.normalized_title or section.title.lower()):
+                    section_signals.add(word)
+                doc = self.documents.get(section.doc_id)
+                doc_title = doc.title if doc else ""
+                if doc:
+                    section_signals.update(doc.title_terms + doc.keywords + doc.metadata_tags)
+
+                hits = len(query_terms.intersection(section_signals))
+                if hits > 0:
+                    score = hits / max(len(query_terms), 1)
+                    candidate_hits.append((score, section.title, doc_title))
+
+            candidate_hits.sort(key=lambda x: x[0], reverse=True)
+            for score, sec_title, doc_title in candidate_hits[:5]:
+                if score < 0.1:
+                    break
+                label = f"**{sec_title}**"
+                if doc_title and doc_title not in seen_doc_titles:
+                    label += f" (in {doc_title})"
+                    seen_doc_titles.add(doc_title)
+                if label not in hint_lines:
+                    hint_lines.append(label)
+
+        # ── 2. Related questions from FAQ corpus ───────────────────────────────
+        suggested_questions: list[str] = []
+        if query_vec is not None:
+            try:
+                candidates = self.corpus.search_faq_questions(
+                    query_vec, top_k=8, user_id=user_id
+                )
+                asked_lower = query_analysis.original_question.strip().casefold()
+                for score, q, _, _ in candidates:
+                    if score < self.config.related_questions_min_score * 0.85:
+                        break
+                    if q.strip().casefold() == asked_lower:
+                        continue
+                    suggested_questions.append(q)
+                    if len(suggested_questions) >= 3:
+                        break
+            except Exception:
+                pass
+
+        # ── 3. Compose the response ────────────────────────────────────────────
+        parts: list[str] = []
+
+        if query_analysis.topic_hints:
+            topic_text = ", ".join(t.replace("_", " ") for t in query_analysis.topic_hints)
+            parts.append(
+                f"I couldn't find a clear answer to this in the indexed documents "
+                f"(closest topic area: {topic_text})."
+            )
+        else:
+            parts.append("I couldn't find a clear answer to this in the indexed documents.")
+
+        if hint_lines:
+            parts.append(
+                "These sections may have what you're looking for:\n"
+                + "\n".join(f"- {h}" for h in hint_lines)
+            )
+
+        if suggested_questions:
+            parts.append(
+                "**You might also try asking:**\n"
+                + "\n".join(f"- {q}" for q in suggested_questions)
+            )
+
+        return "\n\n".join(parts)
 
     def _append_reference_file_names(self, answer: str, sources: list[SourceReference]) -> str:
         reference_links: list[str] = []
@@ -1161,7 +1582,7 @@ class PolicyGPTBot:
             modes.append("follow-up")
         if query_analysis.multi_doc_expected:
             modes.append("multi-doc")
-        if "document_lookup" in query_analysis.intents:
+        if QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents:
             modes.append("lookup")
         if modes:
             lines.append(f"Mode: {', '.join(modes)}")
@@ -1241,7 +1662,7 @@ class PolicyGPTBot:
         # Always inject the date for eligibility, timeline, and aggregate queries.
         # Aggregate queries (list all X, active contests, ongoing rewards) depend
         # on the date to determine what is currently active vs expired.
-        if {"eligibility", "timeline", "aggregate"} & set(query_analysis.intents):
+        if {QueryIntent.ELIGIBILITY, QueryIntent.TIMELINE, QueryIntent.AGGREGATE} & set(query_analysis.intents):
             return True
 
         normalized_question = query_analysis.normalized_question.casefold()
@@ -1335,7 +1756,7 @@ class PolicyGPTBot:
     ) -> list[tuple]:
         if query_analysis.exact_match_expected:
             best_score = top_sections[0][1] if top_sections else 0.0
-            score_floor = max(best_score * 0.65, 0.55) if best_score else 0.0
+            score_floor = max(best_score * self.config.exact_score_floor_scale, self.config.exact_score_floor_min) if best_score else 0.0
             filtered_sections: list[tuple] = []
             noisy_markers = (
                 "requiring verification",
@@ -1433,15 +1854,15 @@ class PolicyGPTBot:
 
     def _document_context_limit(self, query_analysis: QueryAnalysis) -> int:
         if self._uses_open_weight_prompt_profile():
-            if "document_lookup" in query_analysis.intents:
+            if QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents:
                 return 2
-            if query_analysis.multi_doc_expected or "aggregate" in query_analysis.intents:
+            if query_analysis.multi_doc_expected or QueryIntent.AGGREGATE in query_analysis.intents:
                 return 3
             return 1
 
         if query_analysis.exact_match_expected or query_analysis.context_dependent:
             return 0
-        if "document_lookup" in query_analysis.intents:
+        if QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents:
             return 2
         if query_analysis.multi_doc_expected:
             return 3
@@ -1490,6 +1911,29 @@ class PolicyGPTBot:
             parts.append(f"Expanded terms: {', '.join(query_analysis.expanded_terms[:24])}")
         parts.append(query_analysis.canonical_question)
         return "\n".join(parts)
+
+    def _docs_from_sections(
+        self,
+        top_sections: list[tuple],
+        preferred_doc_ids: list[str] | None = None,
+    ) -> list[tuple]:
+        """Derive (document, score) pairs from retrieved sections.
+
+        Groups sections by doc_id, taking the max section score per document.
+        Preferred docs get a small boost so context-dependent follow-ups surface
+        the same documents as the previous turn.
+        """
+        doc_scores: dict[str, float] = {}
+        preferred_set = set(preferred_doc_ids or [])
+        for section, score in top_sections:
+            if section.doc_id not in self.documents:
+                continue
+            doc_scores[section.doc_id] = max(doc_scores.get(section.doc_id, 0.0), score)
+        for doc_id in preferred_set:
+            if doc_id in doc_scores:
+                doc_scores[doc_id] += self.config.preferred_doc_score_boost
+        ranked = sorted(doc_scores, key=lambda d: doc_scores[d], reverse=True)
+        return [(self.documents[doc_id], doc_scores[doc_id]) for doc_id in ranked]
 
     def _merge_retrieved_documents(self, top_docs: list[tuple], top_sections: list[tuple]) -> list[tuple]:
         doc_scores: dict[str, float] = {
@@ -1565,7 +2009,7 @@ class PolicyGPTBot:
         # pre-generated FAQ as evidence instead of sections.  FAQs are already
         # high-level Q&A distillations — they give complete cross-document
         # coverage for listing questions.  Sections are better for detail queries.
-        is_aggregate = "aggregate" in query_analysis.intents
+        is_aggregate = QueryIntent.AGGREGATE in query_analysis.intents
         section_context_parts = []
 
         if is_aggregate:
@@ -1668,7 +2112,7 @@ class PolicyGPTBot:
         if doc_index_lines:
             prompt_parts.append(f"Docs:\n{chr(10).join(doc_index_lines)}")
         prompt_parts.append(f"Evidence:\n{chr(10).join(section_context_parts)}")
-        if doc_context_parts and ("document_lookup" in query_analysis.intents or self._uses_open_weight_prompt_profile()):
+        if doc_context_parts and (QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents or self._uses_open_weight_prompt_profile()):
             prompt_parts.append(f"Doc notes:\n{chr(10).join(doc_context_parts)}")
         if self._supplementary_facts:
             prompt_parts.append(
@@ -1734,15 +2178,18 @@ class PolicyGPTBot:
         else:
             lines.append("(none)")
 
-        lines.extend(["", "=== Top Sections ==="])
+        score_details: dict = getattr(self.corpus, "last_retrieval_score_details", {})
+
+        lines.extend(["", "=== Top Sections (final selection) ==="])
         if top_sections:
             for index, (section, score) in enumerate(top_sections, start=1):
                 document = self._get_doc_for_section(section)
                 doc_title = document.title if document else self._get_doc_title_for_section(section)
                 snippets = self.corpus.extract_evidence_snippets(section, query_analysis)
+                sd = score_details.get(section.section_id, {})
                 lines.extend(
                     [
-                        f"{index}. {doc_title} :: {section.title} | score={score:.4f} | file={section.source_path}",
+                        f"{index}. {doc_title} :: {section.title} | final={score:.4f} | file={section.source_path}",
                         f"   type={section.section_type or 'general'} | tags={', '.join(section.metadata_tags) or 'none'}",
                         f"   summary={self.redactor.unmask_text(section.summary).strip() or '(empty)'}",
                         "   snippets:",
@@ -1752,8 +2199,56 @@ class PolicyGPTBot:
                     lines.extend([f"   - {snippet}" for snippet in snippets])
                 else:
                     lines.append("   - (none)")
+                if sd:
+                    llm_part = (
+                        f"llm={sd['llm_score']:.4f}"
+                        if sd.get("llm_score") is not None
+                        else ("llm=skipped" if sd.get("llm_skipped") else "llm=n/a")
+                    )
+                    lines.append(
+                        f"   scores: os_hybrid={sd.get('os_hybrid_score','?'):.4f}"
+                        f" | snippet_overlap={sd.get('snippet_overlap','?'):.4f}"
+                        f" | focus_match={sd.get('focus_match','?'):.4f}"
+                        f" | precise_match={sd.get('precise_match','?'):.4f}"
+                        f" | section_type_boost={sd.get('section_type_boost','?'):.4f}"
+                        f" | tag_boost={sd.get('tag_boost','?'):.4f}"
+                        f" | role_alignment={sd.get('role_alignment','?'):.4f}"
+                        f" | title_align={sd.get('title_alignment','?'):.4f}"
+                        f" | h_score={sd.get('h_score','?'):.4f}"
+                        f" | {llm_part}"
+                        f" | final={sd.get('final_score','?'):.4f}"
+                    )
         else:
             lines.append("(none)")
+
+        # All candidates that went through reranking (not just the final selection)
+        lines.extend(["", "=== All Reranked Candidates ==="])
+        if score_details:
+            # Sort by final_score descending for easy scanning
+            all_candidates = sorted(
+                score_details.items(),
+                key=lambda kv: kv[1].get("final_score", 0.0),
+                reverse=True,
+            )
+            for sid, sd in all_candidates:
+                sec = self.sections.get(sid)
+                sec_label = f"{sec.title} ({sec.source_path})" if sec else sid
+                doc = self.documents.get(sec.doc_id) if sec else None
+                doc_label = doc.title if doc else "?"
+                llm_part = (
+                    f"llm={sd['llm_score']:.4f}"
+                    if sd.get("llm_score") is not None
+                    else ("llm=skipped" if sd.get("llm_skipped") else "llm=n/a")
+                )
+                lines.append(
+                    f"  [{doc_label}] {sec_label}"
+                    f" | os_hybrid={sd.get('os_hybrid_score','?'):.4f}"
+                    f" | h={sd.get('h_score','?'):.4f}"
+                    f" | {llm_part}"
+                    f" | final={sd.get('final_score','?'):.4f}"
+                )
+        else:
+            lines.append("(no score details available)")
 
         lines.extend(
             [

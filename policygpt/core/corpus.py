@@ -3,23 +3,22 @@ import logging
 import re
 import traceback
 import uuid
-from collections import Counter
-from math import log
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
 
 from policygpt.config import Config
+from policygpt.constants import FileExtension
 from policygpt.models import DocumentRecord, SectionRecord, utc_now_iso
 from policygpt.core.ai.base import AIRequestTooLargeError, AIService
 from policygpt.observability.debug_logging import write_llm_debug_log_pair
-from policygpt.extraction.entity_extractor import DocumentEntityMap, EntityExtractor, ExtractedEntity
-from policygpt.extraction.file_extractor import FileExtractor
-from policygpt.extraction.metadata_extractor import MetadataExtractor
+from policygpt.ingestion.extraction.entity_extractor import DocumentEntityMap, EntityExtractor, ExtractedEntity
+from policygpt.ingestion.extraction.file_extractor import FileExtractor
+from policygpt.ingestion.extraction.metadata_extractor import MetadataExtractor
 from policygpt.core.retrieval.query_analyzer import QueryAnalysis
-from policygpt.extraction.redaction import Redactor
-from policygpt.extraction.taxonomy import keywordize_text, normalize_text, tokenize_text, unique_preserving_order
+from policygpt.ingestion.extraction.redaction import Redactor
+from policygpt.ingestion.extraction.taxonomy import keywordize_text, normalize_text, tokenize_text, unique_preserving_order
 from policygpt.search import VectorStore, OpenSearchRetriever, create_vector_store
 
 
@@ -35,8 +34,13 @@ def l2_normalize(vector: np.ndarray) -> np.ndarray:
     return vector / denominator
 
 
-def cosine_similarity(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    return np.dot(matrix, query)
+def cosine_similarity(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Return cosine similarity scores between query_vec and each row of matrix."""
+    dots = matrix @ query_vec
+    norms = np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_vec)
+    norms = np.where(norms == 0, 1e-9, norms)
+    return dots / norms
+
 
 
 class DocumentCorpus:
@@ -56,15 +60,9 @@ class DocumentCorpus:
 
         self.documents: dict[str, DocumentRecord] = {}
         self.sections: dict[str, SectionRecord] = {}
-        self.doc_ids: list[str] = []
-        self.doc_embedding_matrix: np.ndarray | None = None
-        self.section_ids: list[str] = []
-        self.section_embedding_matrix: np.ndarray | None = None
-        self.doc_term_doc_freq: dict[str, int] = {}
-        self.section_term_doc_freq: dict[str, int] = {}
-        self.avg_doc_token_length = 0.0
-        self.avg_section_token_length = 0.0
         self._active_ingestion_run_id: str | None = None
+        # Populated by retrieve_top_sections after each query for retrieval logging.
+        self.last_retrieval_score_details: dict[str, dict] = {}
         # Flat lookup built from all document entity maps during rebuild_indexes.
         # Maps lowercased entity name / synonym → ExtractedEntity.
         # Used at query time to expand user terms with contextual meaning.
@@ -107,12 +105,13 @@ class DocumentCorpus:
     ) -> None:
         file_paths = self.list_supported_policy_files(folder_path)
         if not file_paths:
+            _exts = "/".join(str(e) for e in (FileExtension.HTML, FileExtension.HTM, FileExtension.TXT, FileExtension.PDF))
             self._write_ingestion_failure_log(
                 source_path=folder_path,
                 stage="scan",
-                reason="No .html/.htm/.txt/.pdf files found in folder.",
+                reason=f"No {_exts} files found in folder.",
             )
-            raise FileNotFoundError(f"No .html/.htm/.txt/.pdf files found in folder: {folder_path}")
+            raise FileNotFoundError(f"No {_exts} files found in folder: {folder_path}")
 
         total_files = len(file_paths)
         self._emit_progress(progress_callback, 0, total_files, "Scanning policy files")
@@ -209,7 +208,7 @@ class DocumentCorpus:
             f"{file_name} - extracting sections",
         )
 
-        if extension not in {".html", ".htm", ".txt", ".pdf"}:
+        if extension not in {FileExtension.HTML, FileExtension.HTM, FileExtension.TXT, FileExtension.PDF}:
             return ("skipped", f"unsupported file extension: {extension or 'none'}")
 
         # If already indexed in OpenSearch, reconstruct in-memory structures from
@@ -257,6 +256,7 @@ class DocumentCorpus:
                         section_type=sec["section_type"],
                         metadata_tags=sec["metadata_tags"],
                         keywords=sec["keywords"],
+                        images=sec.get("images", []),
                     )
                     _cached_doc.sections.append(_sec)
                     self.sections[sec["section_id"]] = _sec
@@ -268,14 +268,14 @@ class DocumentCorpus:
         _t0 = _time.perf_counter()
         print(f"    [corpus] {file_name} — extracting sections …", flush=True)
         title, sections = self.extractor.extract(path)
-        full_text = "\n\n".join(text for _, text in sections).strip()
+        full_text = "\n\n".join(s.text for s in sections).strip()
         print(
             f"    [corpus] {file_name} — {len(sections)} section(s) extracted, "
             f"{len(full_text):,} chars ({_time.perf_counter()-_t0:.1f}s)",
             flush=True,
         )
         if not full_text:
-            skip_reason = "no extractable text found" if extension == ".pdf" else "skipped empty document"
+            skip_reason = "no extractable text found" if extension == FileExtension.PDF else "skipped empty document"
             self._emit_progress(
                 progress_callback,
                 processed_files,
@@ -398,11 +398,13 @@ class DocumentCorpus:
         if document_entity_map.entities:
             self._write_entity_file(path, file_name, document_entity_map)
 
-        valid_sections = [(section_title, section_text) for section_title, section_text in sections if section_text.strip()]
+        valid_sections = [s for s in sections if s.text.strip()]
         total_sections = len(valid_sections)
 
         print(f"    [corpus] {file_name} — processing {total_sections} section(s) …", flush=True)
-        for index, (section_title, section_text) in enumerate(valid_sections, start=1):
+        for index, sec in enumerate(valid_sections, start=1):
+            section_title = sec.title
+            section_text  = sec.text
             section_label = self._format_progress_label(section_title)
             print(
                 f"    [corpus] {file_name} — section [{index}/{total_sections}]: {section_label[:60]} …",
@@ -478,6 +480,7 @@ class DocumentCorpus:
                 title_terms=section_metadata.title_terms,
                 token_counts=section_metadata.token_counts,
                 token_length=section_metadata.token_length,
+                images=sec.images,
             )
             document.sections.append(section)
             self.sections[section_id] = section
@@ -568,244 +571,67 @@ class DocumentCorpus:
                 pass
 
     def rebuild_indexes(self) -> None:
-        self.doc_ids = []
-        doc_vectors: list[np.ndarray] = []
-        doc_token_lengths: list[int] = []
-        self.doc_term_doc_freq = {}
-        for doc_id, document in self.documents.items():
-            doc_token_lengths.append(document.token_length)
-            for term in document.token_counts:
-                self.doc_term_doc_freq[term] = self.doc_term_doc_freq.get(term, 0) + 1
-            # Only include docs with a real embedding in the kNN matrix.
-            # Cached docs (restored from OpenSearch) have an empty placeholder
-            # embedding — they use OS retrieval instead of in-memory kNN.
-            if document.summary_embedding.size > 0:
-                self.doc_ids.append(doc_id)
-                doc_vectors.append(document.summary_embedding)
+        """Rebuild the entity lookup from all ingested documents.
 
-        self.section_ids = []
-        section_vectors: list[np.ndarray] = []
-        section_token_lengths: list[int] = []
-        self.section_term_doc_freq = {}
-        for section_id, section in self.sections.items():
-            section_token_lengths.append(section.token_length)
-            for term in section.token_counts:
-                self.section_term_doc_freq[term] = self.section_term_doc_freq.get(term, 0) + 1
-            # Same guard for sections.
-            if section.summary_embedding.size > 0:
-                self.section_ids.append(section_id)
-                section_vectors.append(section.summary_embedding)
-
-        self.doc_embedding_matrix = np.vstack(doc_vectors) if doc_vectors else None
-        self.section_embedding_matrix = np.vstack(section_vectors) if section_vectors else None
-
-        # Rebuild the flat entity lookup from all document entity maps.
+        In-memory BM25/kNN indexes are removed — retrieval is handled entirely
+        by OpenSearch.  Only the entity lookup (used for query expansion) needs
+        to be rebuilt from the lightweight in-memory document records.
+        """
         self.entity_lookup = {}
         for document in self.documents.values():
             if document.entity_map and document.entity_map.entities:
                 for key, entity in document.entity_map.to_lookup().items():
                     if key not in self.entity_lookup:
                         self.entity_lookup[key] = entity
-        self.avg_doc_token_length = float(sum(doc_token_lengths) / len(doc_token_lengths)) if doc_token_lengths else 0.0
-        self.avg_section_token_length = (
-            float(sum(section_token_lengths) / len(section_token_lengths))
-            if section_token_lengths
-            else 0.0
-        )
-
-    def retrieve_top_docs(
-        self,
-        query_vec: np.ndarray,
-        query_analysis: QueryAnalysis,
-        preferred_doc_ids: list[str] | None = None,
-    ) -> list[tuple[DocumentRecord, float]]:
-        if self.doc_embedding_matrix is None or not self.doc_ids:
-            return []
-
-        semantic_scores = {
-            doc_id: float(score)
-            for doc_id, score in zip(self.doc_ids, cosine_similarity(query_vec, self.doc_embedding_matrix))
-        }
-        lexical_scores = {
-            doc_id: self._bm25_score(
-                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
-                token_counts=self.documents[doc_id].token_counts,
-                token_length=self.documents[doc_id].token_length,
-                doc_freq=self.doc_term_doc_freq,
-                total_items=len(self.doc_ids),
-                average_length=self.avg_doc_token_length,
-            )
-            for doc_id in self.doc_ids
-        }
-        title_scores = {
-            doc_id: self._term_overlap_score(
-                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
-                candidate_terms=self.documents[doc_id].title_terms + self.documents[doc_id].keywords,
-            )
-            for doc_id in self.doc_ids
-        }
-        metadata_scores = {
-            doc_id: self._document_metadata_score(query_analysis, self.documents[doc_id])
-            for doc_id in self.doc_ids
-        }
-        lookup_scores = {
-            doc_id: self._document_lookup_score(query_analysis, self.documents[doc_id])
-            for doc_id in self.doc_ids
-        }
-
-        semantic_norm = self._normalize_score_map(semantic_scores)
-        lexical_norm = self._normalize_score_map(lexical_scores)
-        title_norm = self._normalize_score_map(title_scores)
-        preferred_set = set(preferred_doc_ids or [])
-        rescored: list[tuple[str, float]] = []
-
-        for doc_id in self.doc_ids:
-            score = (
-                self.config.doc_semantic_weight * semantic_norm.get(doc_id, 0.0)
-                + self.config.doc_lexical_weight * lexical_norm.get(doc_id, 0.0)
-                + self.config.doc_title_weight * title_norm.get(doc_id, 0.0)
-                + self.config.doc_metadata_weight * metadata_scores.get(doc_id, 0.0)
-            )
-            if "document_lookup" in query_analysis.intents:
-                score += 0.22 * lookup_scores.get(doc_id, 0.0)
-            if doc_id in preferred_set:
-                score += 0.08
-            rescored.append((doc_id, score))
-
-        rescored.sort(key=lambda item: item[1], reverse=True)
-        doc_limit = self._doc_limit_for_query(query_analysis)
-        results = [(self.documents[doc_id], score) for doc_id, score in rescored[:doc_limit]]
-
-        if self.config.debug:
-            print("\nTop documents:")
-            for document, score in results:
-                print(f"  {score:.4f} | {document.title}")
-
-        return results
 
     def retrieve_top_sections(
         self,
         query_vec: np.ndarray,
         query_analysis: QueryAnalysis,
-        top_docs: list[tuple[DocumentRecord, float]],
         preferred_section_ids: list[str] | None = None,
         user_id: str | int | None = None,
+        user_profile=None,
     ) -> list[tuple[SectionRecord, float]]:
-        # ── External vector store path ─────────────────────────────────────
-        if self._os_retriever is not None:
-            if user_id is None:
-                raise ValueError(
-                    "user_id is required when hybrid search is enabled. "
-                    "Pass the user_id from the request cookie."
-                )
-            rerank_limit = self._rerank_limit_for_query(query_analysis)
-            result_limit = self._section_result_limit_for_query(query_analysis)
-            # Over-fetch so the reranker has enough candidates, then apply the
-            # same heuristic+LLM reranker and diversity selection as the
-            # in-memory path.  Without this the OS path returns raw blended
-            # scores which are significantly worse than reranked results.
-            candidates = self._os_retriever.retrieve(
-                query_text=query_analysis.original_question,
-                query_embedding=query_vec,
-                top_k=rerank_limit,
-                query_analysis=query_analysis,
-                section_lookup=self.sections,
-                user_id=user_id,
+        if self._os_retriever is None:
+            raise RuntimeError(
+                "No OpenSearch retriever configured. "
+                "Set opensearch_host in config or OPENSEARCH_HOST env var."
             )
-            # Apply the same preferred_section_ids bonus as the in-memory path so
-            # thread context (sections from prior turns) is boosted before reranking.
-            preferred_set = set(preferred_section_ids or [])
-            if preferred_set:
-                candidates = [
-                    (sec, score + 0.08 if sec.section_id in preferred_set else score)
-                    for sec, score in candidates
-                ]
-            reranked = self._rerank_sections(
-                query_analysis=query_analysis,
-                candidate_sections=candidates,
+        if user_id is None:
+            raise ValueError(
+                "user_id is required for retrieval. "
+                "Pass the user_id from the request context."
             )
-            reranked.sort(key=lambda item: item[1], reverse=True)
-            return self._select_diverse_sections(
-                query_analysis=query_analysis,
-                scored_sections=reranked,
-                limit=result_limit,
-            )
-
-        # ── In-memory path (unchanged) ─────────────────────────────────────
-        if self.section_embedding_matrix is None or not self.section_ids:
-            return []
-
-        preferred_set = set(preferred_section_ids or [])
-        doc_score_lookup = {document.doc_id: score for document, score in top_docs}
-        candidate_scores: dict[str, float] = {}
-
-        per_doc_candidate_limit = self._per_doc_section_limit_for_query(query_analysis)
-        for document, _ in top_docs:
-            local_pairs = self._score_sections(
-                query_vec=query_vec,
-                query_analysis=query_analysis,
-                section_ids=[section.section_id for section in document.sections],
-                preferred_section_ids=preferred_set,
-                doc_score_lookup=doc_score_lookup,
-            )
-            for section, score in local_pairs[:per_doc_candidate_limit]:
-                candidate_scores[section.section_id] = max(candidate_scores.get(section.section_id, score), score)
-
         rerank_limit = self._rerank_limit_for_query(query_analysis)
         result_limit = self._section_result_limit_for_query(query_analysis)
-        global_candidate_limit = max(
-            rerank_limit * 2,
-            result_limit * 4,
-        )
-        global_pairs = self._score_sections(
-            query_vec=query_vec,
+        candidates = self._os_retriever.retrieve(
+            query_text=query_analysis.original_question,
+            query_embedding=query_vec,
+            top_k=rerank_limit,
             query_analysis=query_analysis,
-            section_ids=self.section_ids,
-            preferred_section_ids=preferred_set,
-            doc_score_lookup=doc_score_lookup,
+            section_lookup=self.sections,
+            user_id=user_id,
         )
-        for section, score in global_pairs[:global_candidate_limit]:
-            candidate_scores[section.section_id] = max(candidate_scores.get(section.section_id, score), score)
+        preferred_set = set(preferred_section_ids or [])
+        if preferred_set:
+            candidates = [
+                (sec, score + 0.08 if sec.section_id in preferred_set else score)
+                for sec, score in candidates
+            ]
+        reranked, score_details = self._rerank_sections(
+            query_analysis=query_analysis,
+            candidate_sections=candidates,
+            user_profile=user_profile,
+        )
+        # Expose per-section score breakdown for retrieval logging
+        self.last_retrieval_score_details: dict[str, dict] = score_details
 
-        candidate_sections = [
-            (self.sections[section_id], score)
-            for section_id, score in candidate_scores.items()
-            if section_id in self.sections
-        ]
-        candidate_sections.sort(key=lambda item: item[1], reverse=True)
-        reranked_sections = self._rerank_sections(
+        reranked.sort(key=lambda item: item[1], reverse=True)
+        return self._select_diverse_sections(
             query_analysis=query_analysis,
-            candidate_sections=candidate_sections[:rerank_limit],
-        )
-        reranked_sections.sort(key=lambda item: item[1], reverse=True)
-        results = self._select_diverse_sections(
-            query_analysis=query_analysis,
-            scored_sections=reranked_sections,
+            scored_sections=reranked,
             limit=result_limit,
         )
-
-        if self.config.debug:
-            print("\nTop sections:")
-            for section, score in results:
-                _doc_title = self.documents[section.doc_id].title if section.doc_id in self.documents else section.source_path
-                print(f"  {score:.4f} | {_doc_title} :: {section.title}")
-
-        return results
-
-    def _doc_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
-        if query_analysis.multi_doc_expected:
-            return max(self.config.broad_top_docs, self.config.top_docs)
-        if query_analysis.exact_match_expected:
-            return max(1, min(self.config.exact_top_docs, self.config.top_docs))
-        return self.config.top_docs
-
-    def _per_doc_section_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
-        base_limit = max(self.config.top_sections_per_doc, self.config.rerank_section_candidates)
-        if query_analysis.multi_doc_expected:
-            return max(base_limit, self.config.broad_top_sections_per_doc)
-        if query_analysis.exact_match_expected:
-            return max(self.config.exact_top_sections_per_doc, self.config.exact_max_sections_to_llm)
-        return base_limit
 
     def _rerank_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
         if query_analysis.multi_doc_expected:
@@ -824,88 +650,6 @@ class DocumentCorpus:
         if query_analysis.exact_match_expected:
             return max(1, min(self.config.exact_max_sections_to_llm, self.config.max_sections_to_llm))
         return self.config.max_sections_to_llm
-
-    def _score_sections(
-        self,
-        query_vec: np.ndarray,
-        query_analysis: QueryAnalysis,
-        section_ids: list[str],
-        preferred_section_ids: set[str],
-        doc_score_lookup: dict[str, float],
-    ) -> list[tuple[SectionRecord, float]]:
-        valid_section_ids = [section_id for section_id in section_ids if section_id in self.sections]
-        if not valid_section_ids:
-            return []
-
-        if valid_section_ids == self.section_ids and self.section_embedding_matrix is not None:
-            section_vectors = self.section_embedding_matrix
-        else:
-            section_vectors = np.vstack([self.sections[section_id].summary_embedding for section_id in valid_section_ids])
-
-        semantic_scores = {
-            section_id: float(score)
-            for section_id, score in zip(valid_section_ids, cosine_similarity(query_vec, section_vectors))
-        }
-        lexical_scores = {
-            section_id: self._bm25_score(
-                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
-                token_counts=self.sections[section_id].token_counts,
-                token_length=self.sections[section_id].token_length,
-                doc_freq=self.section_term_doc_freq,
-                total_items=len(self.section_ids),
-                average_length=self.avg_section_token_length,
-            )
-            for section_id in valid_section_ids
-        }
-        title_scores = {
-            section_id: self._term_overlap_score(
-                query_terms=query_analysis.expanded_terms or query_analysis.focus_terms,
-                candidate_terms=self.sections[section_id].title_terms + self.sections[section_id].keywords,
-            )
-            for section_id in valid_section_ids
-        }
-        metadata_scores = {
-            section_id: self._section_metadata_score(
-                query_analysis,
-                self.sections[section_id],
-                self.documents[self.sections[section_id].doc_id],
-            )
-            for section_id in valid_section_ids
-        }
-
-        semantic_norm = self._normalize_score_map(semantic_scores)
-        lexical_norm = self._normalize_score_map(lexical_scores)
-        title_norm = self._normalize_score_map(title_scores)
-
-        scored_sections: list[tuple[SectionRecord, float]] = []
-        for section_id in valid_section_ids:
-            section = self.sections[section_id]
-            focus_match_score = self._focus_term_match_score(
-                query_analysis.focus_terms,
-                [section.title, section.summary, section.raw_text],
-            )
-            precise_match_score = self._precise_focus_match_score(
-                query_analysis.focus_terms,
-                [section.title, section.raw_text],
-            )
-            parent_weight = self.config.section_parent_weight
-            if query_analysis.exact_match_expected:
-                parent_weight *= self.config.exact_query_section_parent_weight_scale
-            score = (
-                self.config.section_semantic_weight * semantic_norm.get(section_id, 0.0)
-                + self.config.section_lexical_weight * lexical_norm.get(section_id, 0.0)
-                + parent_weight * doc_score_lookup.get(section.doc_id, 0.0)
-                + self.config.section_title_weight * title_norm.get(section_id, 0.0)
-                + self.config.section_metadata_weight * metadata_scores.get(section_id, 0.0)
-                + (0.08 * focus_match_score)
-                + (0.12 * precise_match_score)
-            )
-            if section_id in preferred_section_ids:
-                score += 0.08
-            scored_sections.append((section, score))
-
-        scored_sections.sort(key=lambda item: item[1], reverse=True)
-        return scored_sections
 
     def _select_diverse_sections(
         self,
@@ -1118,7 +862,15 @@ class DocumentCorpus:
         self,
         query_analysis: QueryAnalysis,
         candidate_sections: list[tuple[SectionRecord, float]],
-    ) -> list[tuple[SectionRecord, float]]:
+        user_profile=None,
+    ) -> tuple[list[tuple[SectionRecord, float]], dict[str, dict]]:
+        """Rerank candidate sections and return (ranked_list, score_details).
+
+        score_details maps section_id → dict with every intermediate score so
+        callers can log the full scoring breakdown without re-computing anything.
+        """
+        score_details: dict[str, dict] = {}
+
         # Step 1: heuristic re-score (fast, zero cost)
         heuristic: list[tuple[SectionRecord, float]] = []
         for section, base_score in candidate_sections:
@@ -1144,22 +896,55 @@ class DocumentCorpus:
                 query_terms=query_analysis.focus_terms + query_analysis.topic_hints,
                 candidate_terms=section.title_terms + doc_title_terms,
             )
+            # Boost sections whose audience/metadata aligns with the user's role.
+            role_alignment = 0.0
+            if user_profile and not user_profile.is_empty():
+                profile_tags = set(user_profile.tags)
+                doc_audiences: list[str] = []
+                if document is not None and hasattr(document, "audiences"):
+                    doc_audiences = [t.lower() for t in (document.audiences or [])]
+                candidate_signals = (
+                    list(section.metadata_tags or [])
+                    + list(section.keywords or [])
+                    + doc_audiences
+                )
+                signal_set = {s.lower() for s in candidate_signals if s}
+                hits = sum(1 for t in profile_tags if t in signal_set)
+                role_alignment = min(1.0, hits / max(len(profile_tags), 1))
+
             h_score = (
                 (0.72 * base_score)
                 + (0.14 * snippet_overlap)
                 + (0.08 * section_type_boost)
                 + (0.04 * tag_boost)
+                + (0.04 * role_alignment)
                 + (0.02 * title_alignment)
                 + (0.06 * focus_match_score)
                 + (0.08 * precise_match_score)
             )
             heuristic.append((section, h_score))
+            score_details[section.section_id] = {
+                "os_hybrid_score":    round(base_score, 4),
+                "snippet_overlap":    round(snippet_overlap, 4),
+                "focus_match":        round(focus_match_score, 4),
+                "precise_match":      round(precise_match_score, 4),
+                "section_type_boost": round(section_type_boost, 4),
+                "tag_boost":          round(tag_boost, 4),
+                "role_alignment":     round(role_alignment, 4),
+                "title_alignment":    round(title_alignment, 4),
+                "h_score":            round(h_score, 4),
+                "llm_score":          None,   # filled below if LLM ran
+                "final_score":        round(h_score, 4),
+                "llm_skipped":        False,
+            }
 
         # Skip LLM re-rank when heuristic is already highly confident — saves
         # one LLM call per query when retrieval is unambiguous.
         top_h_score = max((score for _, score in heuristic), default=0.0)
         if top_h_score >= 0.82:
-            return heuristic
+            for section, _ in heuristic:
+                score_details[section.section_id]["llm_skipped"] = True
+            return heuristic, score_details
 
         # Step 2: LLM relevance scoring — one call for all candidates
         llm_scores = self._llm_rerank_sections(query_analysis, heuristic)
@@ -1171,7 +956,9 @@ class DocumentCorpus:
             llm_score = llm_scores.get(section.section_id, h_score)
             blended = 0.70 * h_score + 0.30 * llm_score
             reranked.append((section, blended))
-        return reranked
+            score_details[section.section_id]["llm_score"]  = round(llm_score, 4)
+            score_details[section.section_id]["final_score"] = round(blended, 4)
+        return reranked, score_details
 
     # Maximum candidates to pass to LLM re-ranker in one call.
     _LLM_RERANK_CANDIDATE_LIMIT: int = 12
@@ -1236,34 +1023,6 @@ class DocumentCorpus:
             return result
         except Exception:
             return {}
-
-    def _document_metadata_score(self, query_analysis: QueryAnalysis, document: DocumentRecord) -> float:
-        score = 0.0
-        score += 0.55 * self.topic_alignment_score(query_analysis.topic_hints, document.metadata_tags)
-        if set(document.audiences).intersection(query_analysis.focus_terms):
-            score += 0.15
-        if query_analysis.intents:
-            intent_set = set(query_analysis.intents)
-            if "approval" in intent_set and document.document_type in {"policy", "matrix"}:
-                score += 0.15
-            if intent_set.intersection({"checklist", "process"}) and document.document_type in {"policy", "process", "checklist"}:
-                score += 0.15
-        return min(score, 1.0)
-
-    def _section_metadata_score(
-        self,
-        query_analysis: QueryAnalysis,
-        section: SectionRecord,
-        document: DocumentRecord,
-    ) -> float:
-        score = 0.0
-        if section.section_type in query_analysis.expected_section_types:
-            score += 0.45
-        score += 0.25 * self.topic_alignment_score(query_analysis.topic_hints, section.metadata_tags)
-        score += 0.15 * self.topic_alignment_score(query_analysis.topic_hints, document.metadata_tags)
-        if set(document.audiences).intersection(query_analysis.focus_terms):
-            score += 0.15
-        return min(score, 1.0)
 
     def document_lookup_score(self, query_analysis: QueryAnalysis, document: DocumentRecord) -> float:
         return self._document_lookup_score(query_analysis, document)
@@ -1367,32 +1126,6 @@ class DocumentCorpus:
             if token not in cls.TOPIC_ALIGNMENT_IGNORED_TOKENS
         }
 
-    def _bm25_score(
-        self,
-        query_terms: list[str],
-        token_counts: dict[str, int],
-        token_length: int,
-        doc_freq: dict[str, int],
-        total_items: int,
-        average_length: float,
-        k1: float = 1.2,
-        b: float = 0.75,
-    ) -> float:
-        if not query_terms or not token_counts or total_items <= 0:
-            return 0.0
-
-        average_length = average_length or max(float(token_length), 1.0)
-        score = 0.0
-        for term in unique_preserving_order(query_terms):
-            frequency = token_counts.get(term, 0)
-            if frequency <= 0:
-                continue
-            df = doc_freq.get(term, 0)
-            idf = log(1 + ((total_items - df + 0.5) / (df + 0.5))) if df >= 0 else 0.0
-            denominator = frequency + k1 * (1 - b + b * (token_length / average_length))
-            score += idf * ((frequency * (k1 + 1)) / denominator)
-        return score
-
     @staticmethod
     def _term_overlap_score(query_terms: list[str], candidate_terms: list[str]) -> float:
         if not query_terms or not candidate_terms:
@@ -1404,21 +1137,6 @@ class DocumentCorpus:
         if not query_set:
             return 0.0
         return len(query_set.intersection(candidate_set)) / len(query_set)
-
-    @staticmethod
-    def _normalize_score_map(score_map: dict[str, float]) -> dict[str, float]:
-        if not score_map:
-            return {}
-        values = list(score_map.values())
-        min_value = min(values)
-        max_value = max(values)
-        if abs(max_value - min_value) < 1e-9:
-            normalized_value = 1.0 if max_value > 0 else 0.0
-            return {key: normalized_value for key in score_map}
-        return {
-            key: (value - min_value) / (max_value - min_value)
-            for key, value in score_map.items()
-        }
 
     def list_supported_policy_files(self, folder_path: str) -> list[str]:
         folder = Path(folder_path)
@@ -1782,27 +1500,47 @@ class DocumentCorpus:
     def _parse_faq_qa_pairs(faq_text: str) -> list[tuple[str, str]]:
         """Parse Q/A pairs from FAQ text generated by _generate_document_faq.
 
-        Expected format (one pair per two lines):
+        Handles both single-line answers and multi-line paragraph answers:
+
             Q: <question>
-            A: <answer>
-        Returns a list of (question, answer) tuples.
+            A: <first line of answer>
+               <continuation line>
+               <continuation line>
+
+        An answer block ends when the next ``Q:`` line is encountered or the
+        text ends.  Blank lines within an answer block are preserved so that
+        bullet lists and paragraphs in the stored answer remain readable.
         """
         pairs: list[tuple[str, str]] = []
-        lines = [line.strip() for line in faq_text.splitlines() if line.strip()]
-        i = 0
-        while i < len(lines):
-            if lines[i].startswith("Q:"):
-                q = lines[i][2:].strip()
-                a = ""
-                if i + 1 < len(lines) and lines[i + 1].startswith("A:"):
-                    a = lines[i + 1][2:].strip()
-                    i += 2
-                else:
-                    i += 1
-                if q and a:
-                    pairs.append((q, a))
-            else:
-                i += 1
+        # Keep blank lines — they matter inside multi-line answers.
+        lines = [line.rstrip() for line in faq_text.splitlines()]
+
+        current_q: str = ""
+        answer_lines: list[str] = []
+        in_answer = False
+
+        def _flush() -> None:
+            if current_q and answer_lines:
+                answer = "\n".join(answer_lines).strip()
+                if answer:
+                    pairs.append((current_q, answer))
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("Q:"):
+                _flush()
+                current_q = stripped[2:].strip()
+                answer_lines = []
+                in_answer = False
+            elif stripped.startswith("A:") and current_q:
+                answer_lines = [stripped[2:].strip()]
+                in_answer = True
+            elif in_answer:
+                # Continuation of the current answer — keep the line as-is
+                # (indented bullet points, blank separator lines, etc.)
+                answer_lines.append(line)
+
+        _flush()
         return pairs
 
     def faq_fastpath_lookup(
@@ -1924,6 +1662,7 @@ class DocumentCorpus:
         user_prompt = (
             f"Document: {masked_title}\n\n"
             f"{text_excerpt}\n\n"
+            "## PART 1 — Concise FAQs\n"
             f"Generate up to {n} question-and-answer pairs that a user in this domain would realistically ask.\n"
             "Only include questions that are clearly and directly answerable from the document above — "
             "do not pad with vague or repetitive questions just to reach the limit.\n"
@@ -1935,11 +1674,23 @@ class DocumentCorpus:
             "- For eligibility, reward, or process questions, write 2–4 sentences covering the key conditions, "
             "amounts, and any exceptions. Use short bullets if there are 3 or more distinct conditions.\n"
             "- Never add caveats like 'as per the document' or 'subject to terms' — just state the facts.\n"
-            "Answers must be grounded strictly in the document above.\n"
-            "Format each pair exactly as:\n"
+            "Answers must be grounded strictly in the document above.\n\n"
+            "## PART 2 — Detailed paragraph FAQs\n"
+            "After the concise pairs above, add detailed paragraph-style Q&A pairs for topics that genuinely "
+            "benefit from a thorough explanation — for example: multi-step processes, policies with several "
+            "eligibility conditions, exception frameworks, approval hierarchies, or anything a user would "
+            "need a complete picture of to act correctly.\n"
+            "Rules:\n"
+            "- Only add these where the document has enough substance to justify a detailed answer. "
+            "If the document is short or simple, skip this section entirely — do not pad.\n"
+            "- Do not repeat questions already covered in Part 1.\n"
+            "- Answers can be as long as needed (10–30 lines) — use plain paragraphs, numbered steps, "
+            "or bullet lists as the content warrants. Never truncate to keep it short.\n"
+            "- Same grounding rule: every statement must be supported by the document above.\n\n"
+            "Format ALL pairs (both parts) exactly as:\n"
             "Q: <question>\n"
             "A: <answer>\n\n"
-            "Output only the Q&A pairs — no intro, no numbering, no commentary."
+            "Output only the Q&A pairs — no section headers, no intro, no numbering, no commentary."
         )
         try:
             return self.ai.llm_text(

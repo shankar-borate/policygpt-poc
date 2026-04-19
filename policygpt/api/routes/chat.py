@@ -7,6 +7,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from policygpt.config import Config
+from policygpt.config.user_profiles import resolve_user_profile
+from policygpt.constants import FileExtension
 from policygpt.core.document_links import build_document_open_url
 from policygpt.api.renderers.document_viewer import DocumentViewerRenderer
 from policygpt.api.runtime import ServerRuntime
@@ -210,7 +212,16 @@ class PolicyApiServer:
         with self.runtime.lock:
             bot = self.runtime.require_bot()
             thread_id = request.thread_id or bot.new_thread(user_id=user_id or "")
-            result = bot.chat(thread_id=thread_id, user_question=message, user_id=user_id)
+            user_profile = resolve_user_profile(
+                domain_type=self.config.domain_type,
+                user_id=user_id,
+            )
+            result = bot.chat(
+                thread_id=thread_id,
+                user_question=message,
+                user_id=user_id,
+                user_profile=user_profile,
+            )
             # Persist to OS (if configured) and clear display_messages from memory.
             in_memory_thread = bot.get_thread(result.thread_id)
             bot.conversations.save_thread(in_memory_thread)
@@ -246,7 +257,7 @@ class PolicyApiServer:
         # For HTML files, use a text fragment so the browser scrolls to and
         # highlights the matched section text inside the original document.
         iframe_url = open_url
-        if requested_path.suffix.lower() in {".html", ".htm"} and section_title.strip():
+        if requested_path.suffix.lower() in {FileExtension.HTML, FileExtension.HTM} and section_title.strip():
             from urllib.parse import quote as _quote
             fragment = _quote(section_title.strip()[:120], safe="")
             iframe_url = f"{open_url}#:~:text={fragment}"
@@ -277,7 +288,7 @@ class PolicyApiServer:
         }
 
     @staticmethod
-    def serialize_source(source) -> dict:
+    def serialize_source(source, images: list[str] | None = None) -> dict:
         if hasattr(source, "source_path"):
             title = source.document_title
             path = source.source_path
@@ -297,6 +308,7 @@ class PolicyApiServer:
             "source_path": norm_path,
             "file_name": Path(open_path).name if open_path else "",
             "document_url": build_document_open_url("", open_path) if open_path else "",
+            "images": images or [],
         }
 
     def serialize_thread_summary(self, thread) -> dict:
@@ -323,9 +335,25 @@ class PolicyApiServer:
         return {
             **self.serialize_thread_summary(thread),
             "messages": [self.serialize_message(message) for message in thread.display_messages],
-            "sources": [self.serialize_source(s) for s in unique_sources],
+            "sources": [self.serialize_source(s, self._gather_source_images(s)) for s in unique_sources],
             "conversation_summary": thread.conversation_summary,
         }
+
+    def _gather_source_images(self, source) -> list[str]:
+        """Collect images from all in-memory sections belonging to this source document."""
+        path = source.source_path if hasattr(source, "source_path") else source.get("source_path", "")
+        if not path:
+            return []
+        norm = path.lower().replace("\\", "/")
+        images: list[str] = []
+        with self.runtime.lock:
+            bot = self.runtime.bot
+            if bot is None:
+                return []
+            for section in bot.corpus.sections.values():
+                if section.source_path.lower().replace("\\", "/") == norm:
+                    images.extend(section.images)
+        return images
 
     def _resolve_document_path(self, path: str) -> Path:
         requested_path = Path(path).resolve()

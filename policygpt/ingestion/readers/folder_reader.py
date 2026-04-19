@@ -20,33 +20,33 @@ import logging
 from pathlib import Path
 from typing import Iterator
 
+from policygpt.constants import ContentType, FileExtension
 from policygpt.ingestion.readers.base import IngestMessage, Reader
 
 logger = logging.getLogger(__name__)
 
-# Maps lowercase suffix → content_type string understood by ExtractorRegistry
-# and HtmlConverterRegistry.  Non-HTML formats that can be converted to HTML
-# are listed with their own content_type so the converter registry can select
-# the right converter; after conversion the content_type becomes "html".
-_EXTENSION_MAP: dict[str, str] = {
-    ".html": "html",
-    ".htm":  "html",
-    ".txt":  "text",
-    ".pdf":  "pdf",
-    ".pptx": "pptx",
-    ".ppt":  "ppt",
-    ".docx": "docx",
-    ".doc":  "doc",
-    ".xlsx": "xlsx",
-    ".xls":  "xls",
-    ".jpg":  "jpg",
-    ".jpeg": "jpeg",
-    ".png":  "png",
-    ".gif":  "gif",
-    ".bmp":  "bmp",
-    ".tiff": "tiff",
-    ".tif":  "tif",
-    ".webp": "webp",
+# Maps file extension → logical content_type used by ExtractorRegistry and
+# HtmlConverterRegistry.  Non-HTML formats that can be converted to HTML are
+# listed with their own content_type; after conversion the type becomes "html".
+_EXTENSION_MAP: dict[FileExtension, ContentType] = {
+    FileExtension.HTML: ContentType.HTML,
+    FileExtension.HTM:  ContentType.HTML,
+    FileExtension.TXT:  ContentType.TEXT,
+    FileExtension.PDF:  ContentType.PDF,
+    FileExtension.PPTX: ContentType.PPTX,
+    FileExtension.PPT:  ContentType.PPT,
+    FileExtension.DOCX: ContentType.DOCX,
+    FileExtension.DOC:  ContentType.DOC,
+    FileExtension.XLSX: ContentType.XLSX,
+    FileExtension.XLS:  ContentType.XLS,
+    FileExtension.JPG:  ContentType.JPG,
+    FileExtension.JPEG: ContentType.JPEG,
+    FileExtension.PNG:  ContentType.PNG,
+    FileExtension.GIF:  ContentType.GIF,
+    FileExtension.BMP:  ContentType.BMP,
+    FileExtension.TIFF: ContentType.TIFF,
+    FileExtension.TIF:  ContentType.TIF,
+    FileExtension.WEBP: ContentType.WEBP,
 }
 
 # File-name substrings that mark generated artefacts — skip them so the
@@ -91,7 +91,7 @@ class FolderReader(Reader):
             return
 
         for path in files:
-            content_type = _EXTENSION_MAP[path.suffix.lower()]
+            content_type = _EXTENSION_MAP[FileExtension(path.suffix.lower())]
             try:
                 content = self._read_file(path, content_type)
             except Exception as exc:
@@ -128,9 +128,9 @@ class FolderReader(Reader):
         return result
 
     @staticmethod
-    def _read_file(path: Path, content_type: str) -> bytes | str:
+    def _read_file(path: Path, content_type: ContentType) -> bytes | str:
         """Read file bytes for binary types, decoded text for text types."""
-        if content_type in {"html", "text"}:
+        if content_type in {ContentType.HTML, ContentType.TEXT}:
             return path.read_text(encoding="utf-8", errors="ignore")
         # All other formats (pdf, pptx, docx, xlsx, images …) are binary.
         # The converter pipeline reads from source_path directly, so the

@@ -257,7 +257,7 @@ class ExcelToHtmlConverter(HtmlConverter):
         if not rows:
             return ""
 
-        sheet_name = _html_lib.escape(sheet.title or "Sheet")
+        sheet_name = _html_lib.escape(sheet_name or "Sheet")
         data_rows = len(rows) - 1   # excluding header
         col_count = len(rows[0]) if rows else 0
         summary = f"{data_rows} row{'s' if data_rows != 1 else ''} × {col_count} column{'s' if col_count != 1 else ''}"

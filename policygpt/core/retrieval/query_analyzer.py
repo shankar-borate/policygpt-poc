@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from policygpt.models import DocumentRecord
-from policygpt.extraction.taxonomy import (
+from policygpt.ingestion.extraction.taxonomy import (
     DOMAIN_TOPIC_SYNONYMS,
     INTENT_PATTERNS,
     STOPWORDS,
@@ -56,6 +56,55 @@ _CHITCHAT: frozenset[str] = frozenset({
     "ok", "okay", "k", "cool", "nice", "alright", "sure",
     "lol", "haha", "hehe",
 })
+
+# Patterns for meta-questions about the bot's own previous answer —
+# "why did you miss X", "you forgot it", "first question", etc.
+# These should NOT be routed to RAG; the bot should reflect on what it said.
+_SELF_REFERENTIAL_SUBSTRINGS: tuple[str, ...] = (
+    # "why did/didn't you …"
+    "why did you",
+    "why didn't you",
+    "why didnt you",
+    "why did not you",
+    # "you missed / you forgot / you skipped"
+    "you missed",
+    "you forgot",
+    "you skipped",
+    "you left out",
+    "you omitted",
+    "you didn't mention",
+    "you didnt mention",
+    "you did not mention",
+    "you didn't include",
+    "you didnt include",
+    "you did not include",
+    # "why it missed / why it was missed"
+    "why it missed",
+    "why was it missed",
+    "why was it not",
+    "why was this not",
+    "why was that not",
+    # "first/previous/last question/answer/response"
+    "first question",
+    "previous question",
+    "previous answer",
+    "previous response",
+    "last question",
+    "last answer",
+    "last response",
+    "earlier answer",
+    "earlier response",
+    "your answer",
+    "your response",
+    "your previous",
+    "your last",
+    # "why not mentioned / why not included"
+    "why not mentioned",
+    "why not included",
+    "why not in your",
+    "why not in the answer",
+    "why not in previous",
+)
 
 
 def normalize_numeric_expressions(text: str) -> str:
@@ -123,6 +172,10 @@ def detect_conversational_intent(text: str) -> str | None:
     for phrase in _IDENTITY:
         if phrase in normalized:
             return "identity"
+
+    for substring in _SELF_REFERENTIAL_SUBSTRINGS:
+        if substring in normalized:
+            return "self_referential"
 
     return None
 
@@ -279,12 +332,16 @@ class QueryAnalyzer:
         active_document_titles: list[str] | None = None,
         candidate_documents: list[DocumentRecord] | None = None,
         entity_lookup: dict | None = None,
+        user_profile=None,  # UserProfile | None — avoids circular import
     ) -> QueryAnalysis:
+        # User profile is intentionally excluded from the cache key so the same
+        # question from different roles doesn't get a stale cached analysis.
+        # Profile tags are lightweight to re-inject and change per request.
         cache_key = (
             user_question.strip().casefold(),
             tuple(sorted(active_document_titles or [])),
         )
-        if cache_key in self._analysis_cache:
+        if cache_key in self._analysis_cache and user_profile is None:
             return self._analysis_cache[cache_key]
 
         numerically_normalized = normalize_numeric_expressions(user_question)
@@ -363,7 +420,15 @@ class QueryAnalyzer:
                 entity_expansions.extend(context_tokens[:6])
             expanded_terms.extend(entity_expansions)
 
+        # Inject user profile tags into expanded terms so retrieval scores
+        # sections whose metadata/keywords match the user's role/department.
+        if user_profile and not user_profile.is_empty():
+            profile_terms = [t for t in user_profile.tags if t not in expanded_terms]
+            expanded_terms.extend(profile_terms)
+
         canonical_lines = [f"User question: {user_question.strip()}"]
+        if user_profile and not user_profile.is_empty():
+            canonical_lines.append(f"User context: {user_profile.context_line()}")
         if topic_hints:
             canonical_lines.append(f"Inferred policy topics: {', '.join(topic_hints)}")
         if intents:

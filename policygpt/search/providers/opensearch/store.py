@@ -9,10 +9,20 @@ keyword_search    multi_match with field-level boosting + AUTO fuzziness
 similarity_search more_like_this across raw_text, summary, section_title
 vector_search     knn query on the "embedding" knn_vector field
 
-Metadata pre-filtering
+Access control
 ───────────────────────
-All three search methods apply query.filters as OpenSearch bool/filter terms
-before scoring, so permission-based document scoping happens at the DB level.
+Access is stored in a dedicated {prefix}_recipient index as flat
+(user_id, doc_id) pairs — one record per assignment.  This keeps the
+content indexes (sections, faqs, documents) lean regardless of how many
+users are assigned to a document.
+
+At query time the caller resolves a list of accessible doc_ids via
+get_accessible_doc_ids(user_id) and passes it as a doc_id filter — the
+same filter applies to all three section search types and to FAQ search.
+
+Admin users: grant_admin_access(user_id) stores a wildcard record
+(doc_id="*").  get_accessible_doc_ids returns None for these users,
+signalling the retriever to skip the filter entirely.
 """
 
 from __future__ import annotations
@@ -26,8 +36,9 @@ from policygpt.config import Config
 from policygpt.models.documents import DocumentRecord, SectionRecord
 from policygpt.search.base import VectorStore
 from policygpt.search.models import FaqResult, SearchQuery, SearchResult, SearchType
+from .acl import OpenSearchACL, ADMIN_WILDCARD as _ADMIN_WILDCARD
 from .client import create_client
-from .mappings import documents_mapping, faqs_mapping, sections_mapping
+from .mappings import recipient_mapping, documents_mapping, faqs_mapping, sections_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +51,10 @@ class OpenSearchVectorStore(VectorStore):
         self._sections_index  = f"{config.opensearch_index_prefix}_sections"
         self._documents_index = f"{config.opensearch_index_prefix}_documents"
         self._faqs_index      = f"{config.opensearch_index_prefix}_faqs"
+        self._recipient_index = f"{config.opensearch_index_prefix}_recipient"
         self._client = None  # lazy — created on first use
+        # ACL collaborator — wired up after the client is ready
+        self._acl: OpenSearchACL | None = None
 
     # ── Client (lazy) ─────────────────────────────────────────────────────────
 
@@ -55,7 +69,14 @@ class OpenSearchVectorStore(VectorStore):
                 use_ssl=self.config.opensearch_use_ssl,
                 verify_certs=self.config.opensearch_verify_certs,
             )
+            self._acl = OpenSearchACL(self._client, self._recipient_index)
         return self._client
+
+    @property
+    def acl(self) -> OpenSearchACL:
+        """Ensure the client (and ACL) is initialised before use."""
+        _ = self.client  # triggers lazy init
+        return self._acl  # type: ignore[return-value]
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -72,10 +93,28 @@ class OpenSearchVectorStore(VectorStore):
             (self._sections_index,  sections_mapping(embedding_dim)),
             (self._documents_index, documents_mapping()),
             (self._faqs_index,      faqs_mapping(embedding_dim)),
+            (self._recipient_index, recipient_mapping()),
         ]:
             if not self.client.indices.exists(index=index_name):
                 self.client.indices.create(index=index_name, body=mapping)
                 logger.info("Created OpenSearch index: %s", index_name)
+
+    # ── ACL — delegate to OpenSearchACL ──────────────────────────────────────
+
+    def grant_access(self, user_ids: list[str | int], doc_id: str) -> None:
+        self.acl.grant_access(user_ids, doc_id)
+
+    def grant_admin_access(self, user_id: str | int) -> None:
+        self.acl.grant_admin_access(user_id)
+
+    def revoke_access(self, user_id: str | int, doc_id: str) -> None:
+        self.acl.revoke_access(user_id, doc_id)
+
+    def revoke_all_access_for_doc(self, doc_id: str) -> None:
+        self.acl.revoke_all_access_for_doc(doc_id)
+
+    def get_accessible_doc_ids(self, user_id: str | int) -> list[str] | None:
+        return self.acl.get_accessible_doc_ids(user_id)
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
@@ -85,47 +124,47 @@ class OpenSearchVectorStore(VectorStore):
         user_ids: list[str | int],
         domain: str,
     ) -> None:
-        """Upsert document record and all its sections.
+        """Upsert document record, sections, and access grants.
 
-        user_ids and domain are stored on every document and section so that
-        retrieval can filter by user_id at query time.  They are passed in
-        by the caller — the store never derives them itself.
+        user_ids are written to the access index only — not embedded in the
+        document or section bodies — so adding/removing users never requires
+        re-indexing content.
         """
-        # Normalise user_ids to strings for consistent keyword matching in OS
-        str_user_ids = [str(uid) for uid in user_ids]
-
         self.client.index(
             index=self._documents_index,
             id=document.doc_id,
             body={
-                "doc_id":         document.doc_id,
-                "title":          document.title,
-                "document_type":  document.document_type,
-                "version":        document.version,
-                "effective_date": document.effective_date,
-                "metadata_tags":  document.metadata_tags,
-                "audiences":      document.audiences,
-                "keywords":       document.keywords,
-                "source_path":          document.source_path,
-                "original_source_path": document.original_source_path,
-                "summary":              document.summary,
-                "user_ids":             str_user_ids,
-                "domain":               domain,
+                "doc_id":                document.doc_id,
+                "title":                 document.title,
+                "document_type":         document.document_type,
+                "version":               document.version,
+                "effective_date":        document.effective_date,
+                "metadata_tags":         document.metadata_tags,
+                "audiences":             document.audiences,
+                "keywords":              document.keywords,
+                "source_path":           document.source_path,
+                "original_source_path":  document.original_source_path,
+                "summary":               document.summary,
+                "domain":                domain,
             },
         )
+
         for section in document.sections:
-            self._index_section(section, document, str_user_ids, domain)
+            self._index_section(section, document, domain)
+
+        # Grant access — separate from content, idempotent
+        str_user_ids = [str(uid) for uid in user_ids]
+        self.grant_access(str_user_ids, document.doc_id)
 
         logger.debug(
-            "Indexed document '%s' with %d sections (domain=%s, user_ids=%s)",
-            document.title, len(document.sections), domain, str_user_ids,
+            "Indexed document '%s' with %d sections (domain=%s, users=%d)",
+            document.title, len(document.sections), domain, len(user_ids),
         )
 
     def _index_section(
         self,
         section: SectionRecord,
         document: DocumentRecord,
-        user_ids: list[str],
         domain: str,
     ) -> None:
         body: dict[str, Any] = {
@@ -141,8 +180,8 @@ class OpenSearchVectorStore(VectorStore):
             "audiences":      document.audiences,
             "source_path":    section.source_path,
             "order_index":    section.order_index,
-            "user_ids":       user_ids,
             "domain":         domain,
+            "images":         section.images,
         }
         if section.summary_embedding is not None and section.summary_embedding.size > 0:
             body["embedding"] = section.summary_embedding.tolist()
@@ -156,7 +195,6 @@ class OpenSearchVectorStore(VectorStore):
     def get_cached_document(self, source_path: str) -> dict | None:
         """Fetch document + section metadata from OpenSearch for the given source_path."""
         try:
-            # 1. Fetch document record.
             doc_resp = self.client.search(
                 index=self._documents_index,
                 body={
@@ -170,7 +208,6 @@ class OpenSearchVectorStore(VectorStore):
             doc_src = doc_hits[0]["_source"]
             doc_id = doc_src.get("doc_id", doc_hits[0]["_id"])
 
-            # 2. Fetch all sections for this document.
             sec_resp = self.client.search(
                 index=self._sections_index,
                 body={
@@ -180,7 +217,7 @@ class OpenSearchVectorStore(VectorStore):
                     "_source": [
                         "section_id", "section_title", "source_path",
                         "order_index", "section_type", "metadata_tags",
-                        "keywords", "summary", "raw_text",
+                        "keywords", "summary", "raw_text", "images",
                     ],
                 },
             )
@@ -188,38 +225,38 @@ class OpenSearchVectorStore(VectorStore):
             for hit in sec_resp.get("hits", {}).get("hits", []):
                 s = hit["_source"]
                 sections.append({
-                    "section_id":   s.get("section_id", hit["_id"]),
-                    "title":        s.get("section_title", ""),
-                    "source_path":  s.get("source_path", source_path),
-                    "order_index":  int(s.get("order_index", 0)),
-                    "section_type": s.get("section_type", "general"),
+                    "section_id":    s.get("section_id", hit["_id"]),
+                    "title":         s.get("section_title", ""),
+                    "source_path":   s.get("source_path", source_path),
+                    "order_index":   int(s.get("order_index", 0)),
+                    "section_type":  s.get("section_type", "general"),
                     "metadata_tags": s.get("metadata_tags", []),
-                    "keywords":     s.get("keywords", []),
-                    "summary":      s.get("summary", ""),
-                    "raw_text":     s.get("raw_text", ""),
-                    "masked_text":  s.get("raw_text", ""),  # redaction not re-applied
+                    "keywords":      s.get("keywords", []),
+                    "summary":       s.get("summary", ""),
+                    "raw_text":      s.get("raw_text", ""),
+                    "images":        s.get("images", []),
+                    "masked_text":   s.get("raw_text", ""),
                 })
 
             return {
-                "doc_id":                doc_id,
-                "title":                 doc_src.get("title", ""),
-                "source_path":           doc_src.get("source_path", source_path),
-                "original_source_path":  doc_src.get("original_source_path", ""),
-                "summary":               doc_src.get("summary", ""),
-                "version":               doc_src.get("version", ""),
-                "effective_date":        doc_src.get("effective_date", ""),
-                "document_type":         doc_src.get("document_type", "document"),
-                "metadata_tags":         doc_src.get("metadata_tags", []),
-                "audiences":             doc_src.get("audiences", []),
-                "keywords":              doc_src.get("keywords", []),
-                "sections":              sections,
+                "doc_id":               doc_id,
+                "title":                doc_src.get("title", ""),
+                "source_path":          doc_src.get("source_path", source_path),
+                "original_source_path": doc_src.get("original_source_path", ""),
+                "summary":              doc_src.get("summary", ""),
+                "version":              doc_src.get("version", ""),
+                "effective_date":       doc_src.get("effective_date", ""),
+                "document_type":        doc_src.get("document_type", "document"),
+                "metadata_tags":        doc_src.get("metadata_tags", []),
+                "audiences":            doc_src.get("audiences", []),
+                "keywords":             doc_src.get("keywords", []),
+                "sections":             sections,
             }
         except Exception as exc:
             logger.warning("get_cached_document failed for '%s': %s", source_path, exc)
             return None
 
     def count_documents(self) -> int:
-        """Return total number of documents in the documents index."""
         try:
             resp = self.client.count(
                 index=self._documents_index,
@@ -230,7 +267,6 @@ class OpenSearchVectorStore(VectorStore):
             return 0
 
     def count_sections(self) -> int:
-        """Return total number of sections in the sections index."""
         try:
             resp = self.client.count(
                 index=self._sections_index,
@@ -241,7 +277,6 @@ class OpenSearchVectorStore(VectorStore):
             return 0
 
     def document_indexed_for_path(self, source_path: str) -> bool:
-        """Return True if a document with this source_path exists in the documents index."""
         try:
             body = {
                 "query": {"term": {"source_path": source_path}},
@@ -264,6 +299,8 @@ class OpenSearchVectorStore(VectorStore):
                 index=index,
                 body={"query": {"term": {"doc_id": doc_id}}},
             )
+        # Remove all user assignments for this document
+        self.revoke_all_access_for_doc(doc_id)
         logger.debug("Deleted document %s from OpenSearch", doc_id)
 
     def index_faq_pairs(
@@ -276,7 +313,11 @@ class OpenSearchVectorStore(VectorStore):
         user_ids: list[str],
         domain: str,
     ) -> None:
-        """Index each Q/A pair as its own document in the FAQ index."""
+        """Index each Q/A pair as its own document in the FAQ index.
+
+        user_ids is accepted for interface compatibility but not stored —
+        access is resolved via the access index at query time.
+        """
         if not qa_pairs:
             return
 
@@ -289,7 +330,6 @@ class OpenSearchVectorStore(VectorStore):
                 "question":       question,
                 "answer":         answer,
                 "source_path":    source_path,
-                "user_ids":       user_ids,
                 "domain":         domain,
             }
             if embedding is not None and embedding.size > 0:
@@ -306,17 +346,19 @@ class OpenSearchVectorStore(VectorStore):
             len(qa_pairs), document_title, domain,
         )
 
+    # ── FAQ search ────────────────────────────────────────────────────────────
+
     def faq_search(
         self,
         query_embedding: np.ndarray,
         user_id: str,
         min_score: float = 0.92,
     ) -> FaqResult | None:
-        """Return the top FAQ answer if its score meets min_score, else None."""
         if query_embedding is None or query_embedding.size == 0:
             return None
 
-        body = {
+        doc_filter = self._build_doc_id_filter(user_id)
+        body: dict[str, Any] = {
             "size": 1,
             "query": {
                 "bool": {
@@ -328,12 +370,11 @@ class OpenSearchVectorStore(VectorStore):
                             }
                         }
                     },
-                    "filter": [
-                        {"terms": {"user_ids": [user_id]}}
-                    ],
                 }
             },
         }
+        if doc_filter:
+            body["query"]["bool"]["filter"] = [doc_filter]
 
         response = self.client.search(index=self._faqs_index, body=body)
         hits = response.get("hits", {}).get("hits", [])
@@ -347,13 +388,13 @@ class OpenSearchVectorStore(VectorStore):
 
         src = hit["_source"]
         return FaqResult(
-            faq_id=        src.get("faq_id", hit["_id"]),
-            doc_id=        src.get("doc_id", ""),
-            document_title=src.get("document_title", ""),
-            question=      src.get("question", ""),
-            answer=        src.get("answer", ""),
-            source_path=   src.get("source_path", ""),
-            score=         score,
+            faq_id=         src.get("faq_id", hit["_id"]),
+            doc_id=         src.get("doc_id", ""),
+            document_title= src.get("document_title", ""),
+            question=       src.get("question", ""),
+            answer=         src.get("answer", ""),
+            source_path=    src.get("source_path", ""),
+            score=          score,
         )
 
     def search_faq_questions(
@@ -362,11 +403,11 @@ class OpenSearchVectorStore(VectorStore):
         user_id: str,
         top_k: int = 30,
     ) -> list[FaqResult]:
-        """Return top-k FAQ results closest to query_embedding, filtered by user_id."""
         if query_embedding is None or query_embedding.size == 0:
             return []
 
-        body = {
+        doc_filter = self._build_doc_id_filter(user_id)
+        body: dict[str, Any] = {
             "size": top_k,
             "query": {
                 "bool": {
@@ -378,29 +419,26 @@ class OpenSearchVectorStore(VectorStore):
                             }
                         }
                     },
-                    "filter": [
-                        {"terms": {"user_ids": [user_id]}}
-                    ],
                 }
             },
         }
+        if doc_filter:
+            body["query"]["bool"]["filter"] = [doc_filter]
 
         response = self.client.search(index=self._faqs_index, body=body)
         hits = response.get("hits", {}).get("hits", [])
         results: list[FaqResult] = []
         for hit in hits:
             src = hit["_source"]
-            results.append(
-                FaqResult(
-                    faq_id=        src.get("faq_id", hit["_id"]),
-                    doc_id=        src.get("doc_id", ""),
-                    document_title=src.get("document_title", ""),
-                    question=      src.get("question", ""),
-                    answer=        src.get("answer", ""),
-                    source_path=   src.get("source_path", ""),
-                    score=         float(hit.get("_score") or 0.0),
-                )
-            )
+            results.append(FaqResult(
+                faq_id=         src.get("faq_id", hit["_id"]),
+                doc_id=         src.get("doc_id", ""),
+                document_title= src.get("document_title", ""),
+                question=       src.get("question", ""),
+                answer=         src.get("answer", ""),
+                source_path=    src.get("source_path", ""),
+                score=          float(hit.get("_score") or 0.0),
+            ))
         return results
 
     # ── Document search (Google-style) ───────────────────────────────────────
@@ -412,13 +450,6 @@ class OpenSearchVectorStore(VectorStore):
         page: int = 1,
         size: int = 10,
     ) -> dict:
-        """Multi-field full-text search grouped by document.
-
-        Fetches the top N * 8 section hits, deduplicates by doc_id keeping the
-        highest-scoring section per document, then paginates the grouped list.
-        The summary field is preferred for the snippet (concise, clean); raw_text
-        is the fallback.
-        """
         fetch_size = min(size * 8, 200)
         must_clause: dict = {
             "multi_match": {
@@ -437,24 +468,22 @@ class OpenSearchVectorStore(VectorStore):
         }
         body: dict[str, Any] = {
             "size": fetch_size,
-            "query": must_clause,
             "_source": [
                 "doc_id", "document_title", "section_title",
                 "summary", "raw_text", "source_path", "order_index",
             ],
         }
-        if user_id:
+        doc_filter = self._build_doc_id_filter(user_id)
+        if doc_filter:
             body["query"] = {
-                "bool": {
-                    "must": must_clause,
-                    "filter": [{"terms": {"user_ids": [user_id]}}],
-                }
+                "bool": {"must": must_clause, "filter": [doc_filter]}
             }
+        else:
+            body["query"] = must_clause
 
         resp = self.client.search(index=self._sections_index, body=body)
         hits = resp.get("hits", {}).get("hits", [])
 
-        # One result per document — keep the highest-scoring section.
         seen: dict[str, dict] = {}
         for hit in hits:
             src = hit.get("_source", {})
@@ -482,10 +511,9 @@ class OpenSearchVectorStore(VectorStore):
             "results": all_results[from_offset: from_offset + size],
         }
 
-    # ── Search strategies ─────────────────────────────────────────────────────
+    # ── Section search strategies ─────────────────────────────────────────────
 
     def keyword_search(self, query: SearchQuery) -> list[SearchResult]:
-        """BM25 multi_match with field boosting and AUTO fuzziness."""
         body = {
             "size": query.top_k,
             "query": {
@@ -509,18 +537,17 @@ class OpenSearchVectorStore(VectorStore):
         return _parse_hits(response, SearchType.KEYWORD)
 
     def similarity_search(self, query: SearchQuery) -> list[SearchResult]:
-        """more_like_this — finds sections with similar vocabulary to the query."""
         body = {
             "size": query.top_k,
             "query": {
                 "more_like_this": {
-                    "fields":             ["raw_text", "summary", "section_title"],
-                    "like":               query.text,
-                    "min_term_freq":      1,
-                    "min_doc_freq":       1,
-                    "max_query_terms":    25,
+                    "fields":               ["raw_text", "summary", "section_title"],
+                    "like":                 query.text,
+                    "min_term_freq":        1,
+                    "min_doc_freq":         1,
+                    "max_query_terms":      25,
                     "minimum_should_match": "30%",
-                    "boost_terms":        1.0,
+                    "boost_terms":          1.0,
                 }
             },
         }
@@ -529,7 +556,6 @@ class OpenSearchVectorStore(VectorStore):
         return _parse_hits(response, SearchType.SIMILARITY)
 
     def vector_search(self, query: SearchQuery) -> list[SearchResult]:
-        """kNN approximate nearest-neighbour on the embedding field."""
         if query.embedding is None or query.embedding.size == 0:
             return []
         body = {
@@ -547,16 +573,18 @@ class OpenSearchVectorStore(VectorStore):
         response = self.client.search(index=self._sections_index, body=body)
         return _parse_hits(response, SearchType.VECTOR)
 
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _build_doc_id_filter(self, user_id: str | int) -> dict | None:
+        """Delegate to OpenSearchACL — resolves to an OS filter clause or None."""
+        return self.acl.build_doc_id_filter(user_id)
+
 
 # ── Module-level helpers ───────────────────────────────────────────────────
 
 
 def _apply_filters(body: dict, filters: dict) -> dict:
-    """Wrap the query in a bool/filter clause for metadata pre-filtering.
-
-    Filters are applied at the database level before scoring — essential for
-    document-level permission scoping.
-    """
+    """Wrap the query in a bool/filter clause for metadata pre-filtering."""
     if not filters:
         return body
     original_query = body.pop("query")
@@ -578,19 +606,19 @@ def _parse_hits(response: dict, search_type: SearchType) -> list[SearchResult]:
         src = hit.get("_source", {})
         results.append(
             SearchResult(
-                section_id=    src.get("section_id", hit["_id"]),
-                doc_id=        src.get("doc_id", ""),
-                score=         float(hit.get("_score") or 0.0),
-                document_title=src.get("document_title", ""),
-                section_title= src.get("section_title", ""),
-                source_path=   src.get("source_path", ""),
-                order_index=   int(src.get("order_index", 0)),
-                raw_text=      src.get("raw_text", ""),
-                summary=       src.get("summary", ""),
-                section_type=  src.get("section_type", "general"),
-                metadata_tags= src.get("metadata_tags", []),
-                keywords=      src.get("keywords", []),
-                matched_by=    (search_type,),
+                section_id=     src.get("section_id", hit["_id"]),
+                doc_id=         src.get("doc_id", ""),
+                score=          float(hit.get("_score") or 0.0),
+                document_title= src.get("document_title", ""),
+                section_title=  src.get("section_title", ""),
+                source_path=    src.get("source_path", ""),
+                order_index=    int(src.get("order_index", 0)),
+                raw_text=       src.get("raw_text", ""),
+                summary=        src.get("summary", ""),
+                section_type=   src.get("section_type", "general"),
+                metadata_tags=  src.get("metadata_tags", []),
+                keywords=       src.get("keywords", []),
+                matched_by=     (search_type,),
             )
         )
     return results
