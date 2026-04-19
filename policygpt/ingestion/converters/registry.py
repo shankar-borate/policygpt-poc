@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Type
+from typing import TYPE_CHECKING, Type
 
 from policygpt.ingestion.converters.base import HtmlConverter
 from policygpt.ingestion.converters.pdf_html_converter import PdfToHtmlConverter
@@ -25,6 +25,10 @@ from policygpt.ingestion.converters.ppt_html_converter import PptToHtmlConverter
 from policygpt.ingestion.converters.docx_html_converter import DocxToHtmlConverter
 from policygpt.ingestion.converters.excel_html_converter import ExcelToHtmlConverter
 from policygpt.ingestion.converters.image_html_converter import ImageToHtmlConverter
+
+if TYPE_CHECKING:
+    from policygpt.ingestion.converters.vision import VisionDescriber
+    from policygpt.ingestion.extraction.ocr import OcrExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,12 @@ class HtmlConverterRegistry:
         Set of content-type strings to exclude from this registry.
         Use this to disable individual format converters via config flags
         (e.g. ``{"xlsx", "xls"}`` to skip Excel).
+    vision_describer:
+        Optional vision model for images across all formats (PDF, PPT, DOCX, standalone).
+        Forwarded to PdfToHtmlConverter, PptToHtmlConverter, DocxToHtmlConverter,
+        and ImageToHtmlConverter.
+    ocr:
+        Optional OCR extractor fallback for image content in all supported formats.
     """
 
     def __init__(
@@ -64,10 +74,26 @@ class HtmlConverterRegistry:
         output_dir: str | Path,
         skip_if_cached: bool = True,
         skip_content_types: frozenset[str] = frozenset(),
+        vision_describer: "VisionDescriber | None" = None,
+        ocr: "OcrExtractor | None" = None,
     ) -> None:
         self._registry: dict[str, HtmlConverter] = {}
+        _vision_converters = (
+            PdfToHtmlConverter,
+            PptToHtmlConverter,
+            DocxToHtmlConverter,
+            ImageToHtmlConverter,
+        )
         for cls in _CONVERTER_CLASSES:
-            instance = cls(output_dir=output_dir, skip_if_cached=skip_if_cached)
+            if cls in _vision_converters:
+                instance: HtmlConverter = cls(
+                    output_dir=output_dir,
+                    skip_if_cached=skip_if_cached,
+                    vision_describer=vision_describer,
+                    ocr=ocr,
+                )
+            else:
+                instance = cls(output_dir=output_dir, skip_if_cached=skip_if_cached)
             for ct in instance.supported_content_types:
                 if ct in skip_content_types:
                     logger.info("HtmlConverterRegistry: skipping %r (disabled by config)", ct)

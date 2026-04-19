@@ -3,7 +3,8 @@
 Each slide becomes a <section class="slide"> element.
 Text frames (title, content, bullet lists) are emitted as headings/paragraphs.
 Tables are preserved as <table>/<tr>/<th>/<td>.
-Images are skipped at conversion time — the OCR pipeline handles them later.
+Images / diagrams are sent to the vision model (if configured) for a detailed
+HTML description, with OCR as fallback.
 
 Caching
 -------
@@ -16,14 +17,42 @@ from __future__ import annotations
 import html as _html_lib
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from policygpt.ingestion.converters.base import HtmlConverter
+
+if TYPE_CHECKING:
+    from policygpt.ingestion.converters.vision import VisionDescriber
+    from policygpt.ingestion.extraction.ocr import OcrExtractor
 
 logger = logging.getLogger(__name__)
 
 
 class PptToHtmlConverter(HtmlConverter):
-    """Converts PPTX/PPT files to HTML."""
+    """Converts PPTX/PPT files to HTML.
+
+    Parameters
+    ----------
+    output_dir:
+        Directory where converted HTML files are written.
+    skip_if_cached:
+        Reuse existing HTML when newer than the source file.
+    vision_describer:
+        Optional LLM vision model for image/diagram shapes.
+    ocr:
+        Optional OCR extractor fallback for image shapes.
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        skip_if_cached: bool = True,
+        vision_describer: "VisionDescriber | None" = None,
+        ocr: "OcrExtractor | None" = None,
+    ) -> None:
+        super().__init__(output_dir=output_dir, skip_if_cached=skip_if_cached)
+        self._vision = vision_describer
+        self._ocr = ocr
 
     @property
     def supported_content_types(self) -> frozenset[str]:
@@ -32,8 +61,6 @@ class PptToHtmlConverter(HtmlConverter):
     def _convert_to_html(self, path: Path) -> str:
         try:
             from pptx import Presentation
-            from pptx.util import Pt
-            from pptx.enum.shapes import MSO_SHAPE_TYPE
         except ImportError as exc:
             raise ImportError(
                 "PPTX-to-HTML conversion requires 'python-pptx'. "
@@ -42,14 +69,17 @@ class PptToHtmlConverter(HtmlConverter):
 
         title = self._title_from_stem(path.stem)
         prs = Presentation(str(path))
+        slide_count = len(prs.slides)
         slide_parts: list[str] = []
 
+        logger.info("PptToHtmlConverter: %s — %d slide(s)", path.name, slide_count)
+        print(f"    [PPT] {path.name} — {slide_count} slide(s)", flush=True)
+
         for slide_num, slide in enumerate(prs.slides, 1):
-            slide_html = self._convert_slide(slide, slide_num)
+            slide_html = self._convert_slide(slide, slide_num, path.name)
             if slide_html.strip():
                 slide_parts.append(slide_html)
 
-        slide_count = len(prs.slides)
         meta = (
             f'<dl class="doc-meta">'
             f"<dt>Source</dt><dd>{_html_lib.escape(path.name)}</dd>"
@@ -60,11 +90,11 @@ class PptToHtmlConverter(HtmlConverter):
         body = meta + "\n" + "\n".join(slide_parts)
         return self._wrap_html(title, body)
 
-    def _convert_slide(self, slide, slide_num: int) -> str:
+    def _convert_slide(self, slide, slide_num: int, filename: str) -> str:
         """Convert one slide to an HTML <section> fragment."""
-        parts: list[str] = []
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-        # Sort shapes top-to-bottom, left-to-right for reading order.
+        parts: list[str] = []
         shapes = sorted(slide.shapes, key=lambda s: (s.top or 0, s.left or 0))
 
         for shape in shapes:
@@ -74,16 +104,96 @@ class PptToHtmlConverter(HtmlConverter):
                 text_html = self._text_frame_to_html(shape)
                 if text_html:
                     parts.append(text_html)
-            # Images are intentionally skipped — the OCR pipeline handles them.
+            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                img_html = self._describe_image_shape(shape, slide_num, filename)
+                if img_html:
+                    parts.append(img_html)
 
         if not parts:
             return ""
         inner = "\n".join(parts)
         return f'<section class="slide" data-slide="{slide_num}">\n{inner}\n</section>'
 
+    def _describe_image_shape(self, shape, slide_num: int, filename: str) -> str:
+        """Send a picture shape through vision → OCR → skip chain."""
+        try:
+            image_bytes: bytes = shape.image.blob
+            mime_type: str = shape.image.content_type or "image/png"
+        except Exception as exc:
+            logger.warning(
+                "PptToHtmlConverter: slide %d — failed to read image blob: %s", slide_num, exc
+            )
+            return ""
+
+        size_kb = len(image_bytes) / 1024
+        logger.info(
+            "PptToHtmlConverter: slide %d image — %.1f KB (%s)", slide_num, size_kb, mime_type
+        )
+        print(
+            f"    [PPT] slide {slide_num} image — {size_kb:.1f} KB ({mime_type})", flush=True
+        )
+
+        # 1. Vision model
+        if self._vision is not None:
+            logger.info(
+                "PptToHtmlConverter: slide %d — vision [%s] …",
+                slide_num, self._vision.provider_name,
+            )
+            print(
+                f"    [PPT] slide {slide_num} — vision [{self._vision.provider_name}] …",
+                flush=True,
+            )
+            html_fragment = self._vision.describe_page(image_bytes, mime_type)
+            if html_fragment.strip():
+                logger.info(
+                    "PptToHtmlConverter: slide %d — vision OK (%d chars)", slide_num, len(html_fragment)
+                )
+                print(
+                    f"    [PPT] slide {slide_num} — vision OK ({len(html_fragment)} chars)",
+                    flush=True,
+                )
+                return (
+                    f'<div class="slide-image" '
+                    f'data-source="vision:{self._vision.provider_name}">\n'
+                    f"{html_fragment}\n"
+                    f"</div>"
+                )
+            logger.warning(
+                "PptToHtmlConverter: slide %d — vision empty, trying OCR", slide_num
+            )
+            print(f"    [PPT] slide {slide_num} — vision empty, trying OCR …", flush=True)
+
+        # 2. OCR fallback
+        if self._ocr is not None:
+            logger.info("PptToHtmlConverter: slide %d — OCR …", slide_num)
+            print(f"    [PPT] slide {slide_num} — OCR …", flush=True)
+            ocr_text = self._ocr.extract_from_bytes(image_bytes, mime_type)
+            if ocr_text.strip():
+                lines = [
+                    f"<p>{_html_lib.escape(line)}</p>"
+                    for line in ocr_text.splitlines()
+                    if line.strip()
+                ]
+                logger.info(
+                    "PptToHtmlConverter: slide %d — OCR OK (%d chars)", slide_num, len(ocr_text)
+                )
+                print(
+                    f"    [PPT] slide {slide_num} — OCR OK ({len(ocr_text)} chars)", flush=True
+                )
+                return (
+                    f'<div class="slide-image" data-source="ocr">\n'
+                    f'{chr(10).join(lines)}\n'
+                    f"</div>"
+                )
+
+        logger.warning(
+            "PptToHtmlConverter: slide %d — no vision/OCR output, image skipped", slide_num
+        )
+        print(f"    [PPT] slide {slide_num} — image skipped (no vision/OCR output)", flush=True)
+        return ""
+
     @staticmethod
     def _text_frame_to_html(shape) -> str:
-        """Convert a shape's text frame to HTML paragraphs/headings."""
         frame = shape.text_frame
         parts: list[str] = []
 
@@ -93,9 +203,7 @@ class PptToHtmlConverter(HtmlConverter):
                 continue
             escaped = _html_lib.escape(text)
 
-            # Heuristic: first paragraph in a title/subtitle placeholder → h2;
-            # bold run or large font → h3; everything else → p or li.
-            is_title_ph = shape.shape_type in (13, 14, 15)  # TITLE, CENTER_TITLE, SUBTITLE
+            is_title_ph = shape.shape_type in (13, 14, 15)
             if para_idx == 0 and is_title_ph:
                 parts.append(f"<h2>{escaped}</h2>")
             elif para.runs and any(
@@ -112,7 +220,6 @@ class PptToHtmlConverter(HtmlConverter):
 
     @staticmethod
     def _table_to_html(table) -> str:
-        """Convert a python-pptx Table to an HTML table with thead/tbody."""
         rows = list(table.rows)
         if not rows:
             return ""

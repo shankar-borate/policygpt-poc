@@ -64,7 +64,7 @@ class ImageExtractor(Extractor):
         title = _humanize_stem(Path(message.file_name).stem)
 
         if not self._config.ingestion.ocr_enabled:
-            logger.storage.debug(
+            logger.debug(
                 "OCR disabled — skipping image %s", message.source_path
             )
             return ExtractedDocument(title=title, sections=[])
@@ -72,7 +72,7 @@ class ImageExtractor(Extractor):
         ocr = self._get_ocr()
         ocr_text = ocr.extract_from_path(message.source_path)
         if not ocr_text.strip():
-            logger.storage.debug("No OCR text extracted from %s", message.source_path)
+            logger.debug("No OCR text extracted from %s", message.source_path)
             return ExtractedDocument(title=title, sections=[])
 
         return ExtractedDocument(

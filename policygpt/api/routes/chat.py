@@ -91,7 +91,7 @@ class PolicyApiServer:
             "status": display_status,
             "ingesting": status == "ingesting",
             "error": self.runtime.error,
-            "document_folder": self.runtime.storage.document_folder,
+            "document_folder": self.runtime.config.storage.document_folder,
             "document_count": self.runtime.get_document_count(),
             "section_count": self.runtime.get_section_count(),
             "thread_count": len(bot.threads) if bot else 0,
@@ -222,10 +222,11 @@ class PolicyApiServer:
                 user_id=user_id,
                 user_profile=user_profile,
             )
-            # Persist to OS (if configured) and clear display_messages from memory.
-            in_memory_thread = bot.get_thread(result.thread_id)
-            bot.conversations.save_thread(in_memory_thread)
-            # Load the display thread — from OS when persisted, from memory otherwise.
+            # result.thread is the live thread object with display_messages already
+            # appended — use it directly so we don't lose messages via a second OS load.
+            bot.conversations.save_thread(result.thread)
+            # After save_thread, display_messages are cleared from memory and live in OS.
+            # Reload from OS (or fall back to in-memory) for the API response.
             display_thread = (
                 bot.conversations.get_thread_for_display(result.thread_id)
                 or ThreadState(thread_id=result.thread_id)

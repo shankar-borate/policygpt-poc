@@ -1,8 +1,11 @@
 """OCR helpers for extracting text from images embedded in documents.
 
-Two OCR backends are supported:
+Three OCR backends are supported:
   - TextractOCR     — AWS Textract (``ocr_provider="textract"``)
   - ClaudeVisionOCR — Anthropic Claude vision (``ocr_provider="claude"``)
+
+Use ``build_ocr_extractor(provider, region, confidence)`` to instantiate
+the right one from config.  Returns None when OCR is disabled.
 
 Image resolution
 ----------------
@@ -24,6 +27,7 @@ import base64
 import logging
 import os
 import re
+from abc import ABC, abstractmethod
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -354,3 +358,60 @@ class ClaudeVisionOCR:
         if not image_bytes:
             return ""
         return self.extract_from_bytes(image_bytes, mime_type or "image/png")
+
+
+# ── OcrExtractor ABC ──────────────────────────────────────────────────────────
+
+class OcrExtractor(ABC):
+    """Provider-agnostic interface for OCR on raw image bytes.
+
+    Both TextractOCR and ClaudeVisionOCR satisfy this interface.
+    PdfToHtmlConverter depends on this type, not a concrete class.
+    """
+
+    @abstractmethod
+    def extract_from_bytes(self, image_bytes: bytes, mime_type: str = "image/png") -> str:
+        """Return OCR text for raw image bytes, or '' on any error."""
+
+
+# Register existing classes as virtual subclasses so isinstance() works
+OcrExtractor.register(TextractOCR)
+OcrExtractor.register(ClaudeVisionOCR)
+
+
+# ── Factory ───────────────────────────────────────────────────────────────────
+
+def build_ocr_extractor(
+    provider: str,
+    region: str = "",
+    min_confidence: float = 80.0,
+) -> OcrExtractor | None:
+    """Instantiate the correct OCR backend from config.
+
+    Parameters
+    ----------
+    provider:
+        ``"textract"`` | ``"claude"`` | ``""`` (disabled).
+    region:
+        AWS region — required for Textract.
+    min_confidence:
+        Textract confidence floor (0–100).
+
+    Returns
+    -------
+    An OcrExtractor instance, or None when OCR is disabled.
+    """
+    provider = (provider or "").strip().lower()
+    if not provider:
+        return None
+    if provider == "textract":
+        if not region:
+            raise ValueError("build_ocr_extractor: region is required for Textract OCR")
+        logger.info("OCR backend: Textract (region=%s, min_confidence=%.0f)", region, min_confidence)
+        return TextractOCR(region=region, min_confidence=min_confidence)
+    if provider == "claude":
+        logger.info("OCR backend: Claude Vision")
+        return ClaudeVisionOCR()
+    raise ValueError(
+        f"Unknown ocr_provider {provider!r}. Supported: 'textract', 'claude'."
+    )

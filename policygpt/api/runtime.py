@@ -20,7 +20,6 @@ class ServerRuntime:
         self.pricing_loader = ModelPricingLoader()
         self.status = "starting"
         self.error: str | None = None
-        self.storage.document_folder = config.storage.document_folder
         self.worker: Thread | None = None
         # Ingestion progress
         self.indexing_processed_files = 0
@@ -110,7 +109,7 @@ class ServerRuntime:
         """
         try:
             # ── Phase 1: create the bot ───────────────────────────────────────
-            print(f"[Policy GPT] Starting up — document folder: {self.storage.document_folder}", flush=True)
+            print(f"[Policy GPT] Starting up — document folder: {self.config.storage.document_folder}", flush=True)
 
             from policygpt.factory import _build_thread_repo
             thread_repo = _build_thread_repo(self.config)
@@ -140,7 +139,7 @@ class ServerRuntime:
                 self.status = "ingesting"
 
             reader = FolderReader(
-                folder_path=self.storage.document_folder,
+                folder_path=self.config.storage.document_folder,
                 user_ids=user_ids,
                 domain=domain,
             )

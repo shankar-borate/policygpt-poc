@@ -156,7 +156,7 @@ class OpenSearchVectorStore(VectorStore):
         str_user_ids = [str(uid) for uid in user_ids]
         self.grant_access(str_user_ids, document.doc_id)
 
-        logger.storage.debug(
+        logger.debug(
             "Indexed document '%s' with %d sections (domain=%s, users=%d)",
             document.title, len(document.sections), domain, len(user_ids),
         )
@@ -301,7 +301,7 @@ class OpenSearchVectorStore(VectorStore):
             )
         # Remove all user assignments for this document
         self.revoke_all_access_for_doc(doc_id)
-        logger.storage.debug("Deleted document %s from OpenSearch", doc_id)
+        logger.debug("Deleted document %s from OpenSearch", doc_id)
 
     def index_faq_pairs(
         self,
@@ -341,7 +341,7 @@ class OpenSearchVectorStore(VectorStore):
                 body=body,
             )
 
-        logger.storage.debug(
+        logger.debug(
             "Indexed %d FAQ pairs for document '%s' (domain=%s)",
             len(qa_pairs), document_title, domain,
         )

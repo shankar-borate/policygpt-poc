@@ -136,14 +136,45 @@ class IngestionPipeline:
                 if not cfg.ingestion.image_to_html_enabled:
                     skip_cts.update({"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp"})
 
+                # Build vision describer — LLM-based description of image-only pages.
+                from policygpt.ingestion.converters.vision import build_vision_describer
+                vision_describer = None
+                if cfg.ingestion.vision_provider:
+                    try:
+                        vision_describer = build_vision_describer(
+                            provider=cfg.ingestion.vision_provider,
+                            model=cfg.ingestion.vision_model,
+                        )
+                    except ValueError as exc:
+                        logger.warning("VisionDescriber not built: %s", exc)
+
+                # Build OCR extractor — text fallback for image-only pages.
+                from policygpt.ingestion.extraction.ocr import build_ocr_extractor
+                ocr = None
+                if cfg.ingestion.ocr_enabled:
+                    try:
+                        ocr = build_ocr_extractor(
+                            provider=cfg.ingestion.ocr_provider.value
+                            if hasattr(cfg.ingestion.ocr_provider, "value")
+                            else str(cfg.ingestion.ocr_provider),
+                            region=cfg.ai.bedrock_region,
+                            min_confidence=cfg.ingestion.ocr_min_confidence,
+                        )
+                    except ValueError as exc:
+                        logger.warning("OcrExtractor not built: %s", exc)
+
                 html_converter_registry = HtmlConverterRegistry(
                     output_dir=html_dir,
                     skip_content_types=frozenset(skip_cts),
+                    vision_describer=vision_describer,
+                    ocr=ocr,
                 )
                 logger.info(
-                    "HtmlConverterRegistry enabled — output=%s formats=%s",
+                    "HtmlConverterRegistry enabled — output=%s formats=%s vision=%s ocr=%s",
                     html_dir,
                     sorted(html_converter_registry.supported_content_types),
+                    cfg.ingestion.vision_provider or "disabled",
+                    cfg.ingestion.ocr_provider if cfg.ingestion.ocr_enabled else "disabled",
                 )
 
         return cls(
@@ -288,7 +319,7 @@ class IngestionPipeline:
             )
             # Use first result for this message; extras are handled via _extra_messages
             html_path, html_content = all_conversions[0]
-            logger.storage.debug(
+            logger.debug(
                 "HtmlConverterRegistry: converted %s (%s) → %s (%d part(s))",
                 message.file_name, message.content_type, html_path, len(all_conversions),
             )
@@ -316,7 +347,7 @@ class IngestionPipeline:
 
         if not self._registry.supports(message.content_type):
             reason = f"no extractor for content_type={message.content_type!r}"
-            logger.storage.debug("Skipping %s: %s", message.source_path, reason)
+            logger.debug("Skipping %s: %s", message.source_path, reason)
             return ("skipped", reason)
 
         # ── Step 2: Rewrite HTML for PolicyGPT optimisation ──────────────────
@@ -328,7 +359,7 @@ class IngestionPipeline:
             if improved_path != message.source_path:
                 message.source_path = improved_path
             print(f"  [Rewrite]  {message.file_name} — done in {_time.perf_counter()-_t:.1f}s", flush=True)
-            logger.storage.debug("PolicyRewriter: applied to %s", message.file_name)
+            logger.debug("PolicyRewriter: applied to %s", message.file_name)
 
         user_ids: list[str] = message.user_ids or self._default_user_ids
         domain: str = message.domain or self._default_domain

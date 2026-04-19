@@ -645,6 +645,8 @@ class DocumentCorpus:
                 self.config.retrieval.exact_top_sections_per_doc * 2,
                 self.config.retrieval.exact_max_sections_to_llm * 2,
             )
+        if "document_lookup" in query_analysis.intents:
+            return max(self.config.retrieval.broad_rerank_section_candidates, self.config.retrieval.rerank_section_candidates)
         return self.config.retrieval.rerank_section_candidates
 
     def _section_result_limit_for_query(self, query_analysis: QueryAnalysis) -> int:
@@ -652,6 +654,8 @@ class DocumentCorpus:
             return max(self.config.retrieval.broad_max_sections_to_llm, self.config.retrieval.max_sections_to_llm)
         if query_analysis.exact_match_expected:
             return max(1, min(self.config.retrieval.exact_max_sections_to_llm, self.config.retrieval.max_sections_to_llm))
+        if "document_lookup" in query_analysis.intents:
+            return max(self.config.retrieval.broad_max_sections_to_llm, self.config.retrieval.max_sections_to_llm)
         return self.config.retrieval.max_sections_to_llm
 
     def _select_diverse_sections(
@@ -1026,6 +1030,20 @@ class DocumentCorpus:
             return result
         except Exception:
             return {}
+
+    def get_all_sections_for_document(self, doc_id: str) -> list[tuple]:
+        """Return all in-memory sections for a document, sorted by order_index.
+
+        Used for full-document retrieval when a query explicitly asks to
+        describe or explain a specific named document.
+        Each item is (SectionRecord, score) with a fixed score of 1.0.
+        """
+        sections = [
+            sec for sec in self.sections.values()
+            if sec.doc_id == doc_id
+        ]
+        sections.sort(key=lambda s: s.order_index)
+        return [(sec, 1.0) for sec in sections]
 
     def document_lookup_score(self, query_analysis: QueryAnalysis, document: DocumentRecord) -> float:
         return self._document_lookup_score(query_analysis, document)

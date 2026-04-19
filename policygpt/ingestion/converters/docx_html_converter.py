@@ -20,8 +20,13 @@ from __future__ import annotations
 import html as _html_lib
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from policygpt.ingestion.converters.base import HtmlConverter
+
+if TYPE_CHECKING:
+    from policygpt.ingestion.converters.vision import VisionDescriber
+    from policygpt.ingestion.extraction.ocr import OcrExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +123,30 @@ def _wrap_lists(parts: list[str]) -> list[str]:
 # ── Converter class ────────────────────────────────────────────────────────────
 
 class DocxToHtmlConverter(HtmlConverter):
-    """Converts DOCX/DOC files to structured HTML."""
+    """Converts DOCX/DOC files to structured HTML.
+
+    Parameters
+    ----------
+    output_dir:
+        Directory where converted HTML files are written.
+    skip_if_cached:
+        Reuse existing HTML when newer than the source file.
+    vision_describer:
+        Optional LLM vision model for embedded images/diagrams.
+    ocr:
+        Optional OCR extractor fallback for embedded images.
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        skip_if_cached: bool = True,
+        vision_describer: "VisionDescriber | None" = None,
+        ocr: "OcrExtractor | None" = None,
+    ) -> None:
+        super().__init__(output_dir=output_dir, skip_if_cached=skip_if_cached)
+        self._vision = vision_describer
+        self._ocr = ocr
 
     @property
     def supported_content_types(self) -> frozenset[str]:
@@ -137,6 +165,9 @@ class DocxToHtmlConverter(HtmlConverter):
         document = docx.Document(str(path))
         parts: list[str] = []
 
+        logger.info("DocxToHtmlConverter: %s", path.name)
+        print(f"    [DOCX] {path.name}", flush=True)
+
         # Iterate document body elements in document order.
         for block in document.element.body:
             tag = block.tag.split("}")[-1] if "}" in block.tag else block.tag
@@ -152,6 +183,11 @@ class DocxToHtmlConverter(HtmlConverter):
                 from docx.table import Table as _Table
                 table = _Table(block, document)
                 parts.append(_table_to_html(table))
+
+        # Process embedded images via vision / OCR.
+        image_parts = self._process_images(document, path.name)
+        if image_parts:
+            parts.extend(image_parts)
 
         # Wrap consecutive list items.
         parts = _wrap_lists(parts)
@@ -175,3 +211,114 @@ class DocxToHtmlConverter(HtmlConverter):
 
         body = meta + "\n" + "\n".join(parts)
         return self._wrap_html(title, body)
+
+    def _process_images(self, document, filename: str) -> list[str]:
+        """Describe all embedded images in the document via vision → OCR → skip."""
+        parts: list[str] = []
+        seen: set[str] = set()
+
+        for rel in document.part.rels.values():
+            if "image" not in rel.reltype:
+                continue
+            rId = rel.rId
+            if rId in seen:
+                continue
+            seen.add(rId)
+
+            try:
+                image_part = rel.target_part
+                image_bytes: bytes = image_part.blob
+                mime_type: str = image_part.content_type or "image/png"
+            except Exception as exc:
+                logger.warning(
+                    "DocxToHtmlConverter: %s — failed to read image %s: %s",
+                    filename, rId, exc,
+                )
+                continue
+
+            size_kb = len(image_bytes) / 1024
+            logger.info(
+                "DocxToHtmlConverter: %s image %s — %.1f KB (%s)",
+                filename, rId, size_kb, mime_type,
+            )
+            print(
+                f"    [DOCX] {filename} image {rId} — {size_kb:.1f} KB ({mime_type})",
+                flush=True,
+            )
+
+            html_fragment = self._describe_image(image_bytes, mime_type, rId, filename)
+            if html_fragment:
+                parts.append(html_fragment)
+
+        return parts
+
+    def _describe_image(
+        self, image_bytes: bytes, mime_type: str, rId: str, filename: str
+    ) -> str:
+        # 1. Vision model
+        if self._vision is not None:
+            logger.info(
+                "DocxToHtmlConverter: %s image %s — vision [%s] …",
+                filename, rId, self._vision.provider_name,
+            )
+            print(
+                f"    [DOCX] {filename} image {rId} — vision [{self._vision.provider_name}] …",
+                flush=True,
+            )
+            html_fragment = self._vision.describe_page(image_bytes, mime_type)
+            if html_fragment.strip():
+                logger.info(
+                    "DocxToHtmlConverter: %s image %s — vision OK (%d chars)",
+                    filename, rId, len(html_fragment),
+                )
+                print(
+                    f"    [DOCX] {filename} image {rId} — vision OK ({len(html_fragment)} chars)",
+                    flush=True,
+                )
+                return (
+                    f'<div class="doc-image" '
+                    f'data-source="vision:{self._vision.provider_name}">\n'
+                    f"{html_fragment}\n"
+                    f"</div>"
+                )
+            logger.warning(
+                "DocxToHtmlConverter: %s image %s — vision empty, trying OCR", filename, rId
+            )
+            print(
+                f"    [DOCX] {filename} image {rId} — vision empty, trying OCR …", flush=True
+            )
+
+        # 2. OCR fallback
+        if self._ocr is not None:
+            logger.info(
+                "DocxToHtmlConverter: %s image %s — OCR …", filename, rId
+            )
+            print(f"    [DOCX] {filename} image {rId} — OCR …", flush=True)
+            ocr_text = self._ocr.extract_from_bytes(image_bytes, mime_type)
+            if ocr_text.strip():
+                lines = [
+                    f"<p>{_html_lib.escape(line)}</p>"
+                    for line in ocr_text.splitlines()
+                    if line.strip()
+                ]
+                logger.info(
+                    "DocxToHtmlConverter: %s image %s — OCR OK (%d chars)",
+                    filename, rId, len(ocr_text),
+                )
+                print(
+                    f"    [DOCX] {filename} image {rId} — OCR OK ({len(ocr_text)} chars)",
+                    flush=True,
+                )
+                return (
+                    f'<div class="doc-image" data-source="ocr">\n'
+                    f'{chr(10).join(lines)}\n'
+                    f"</div>"
+                )
+
+        logger.warning(
+            "DocxToHtmlConverter: %s image %s — no vision/OCR output, skipped", filename, rId
+        )
+        print(
+            f"    [DOCX] {filename} image {rId} — skipped (no vision/OCR output)", flush=True
+        )
+        return ""

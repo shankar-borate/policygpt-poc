@@ -261,6 +261,15 @@ INTENT_PATTERNS: dict[str, tuple[str, ...]] = {
         "when", "last day", "timeline", "how long", "notice period", "by when",
         "deadline", "how many days", "within how many", "time limit", "duration",
         "how soon",
+        # Status / open-closed queries
+        "closed", "is closed", "already closed", "contest closed", "scheme closed",
+        "open", "is open", "still open", "open now", "closing date", "close date",
+        "end date", "start date", "valid till", "valid until", "expires",
+        "expiry", "expired", "last date", "cut off", "cutoff",
+        "active", "inactive", "ongoing", "running", "ended", "over",
+        "is it still", "has it ended", "has it closed", "has it expired",
+        "is the contest", "is this contest", "when does it close", "when will it close",
+        "when did it close", "when does it end", "when will it end",
     ),
     "documents_required": (
         "documents", "document", "forms", "form", "submit", "paperwork",

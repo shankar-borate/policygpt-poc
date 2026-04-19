@@ -16,3 +16,4 @@ class ChatResult:
     thread_id: str
     answer: str
     sources: list[SourceReference]
+    thread: object = None  # ThreadState — set by bot.chat() so callers skip the extra OS load

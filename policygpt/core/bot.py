@@ -51,14 +51,7 @@ class PolicyGPTBot:
         self.redactor = redactor or Redactor(config.ingestion.redaction_rules)
         self.ai = ai or self._build_ai_service()
         self.extractor = extractor or FileExtractor(config)
-        self.query_analyzer = QueryAnalyzer()
-        self.corpus = corpus or DocumentCorpus(
-            config=config,
-            extractor=self.extractor,
-            ai=self.ai,
-            redactor=self.redactor,
-            cache=self.cache,
-        )
+        self.query_analyzer = QueryAnalyzer(ai=self.ai)
         self.cache = cache or CacheManager(
             backend=build_cache_backend(
                 provider=config.cache.cache_provider,
@@ -70,6 +63,13 @@ class PolicyGPTBot:
                 redis_ssl_ca_certs=config.cache.redis_ssl_ca_certs,
                 redis_key_prefix=config.cache.redis_key_prefix,
             )
+        )
+        self.corpus = corpus or DocumentCorpus(
+            config=config,
+            extractor=self.extractor,
+            ai=self.ai,
+            redactor=self.redactor,
+            cache=self.cache,
         )
         self.conversations = conversations or ConversationManager(repo=thread_repo)
         self._supplementary_facts: str = self._load_supplementary_facts()
@@ -181,7 +181,7 @@ class PolicyGPTBot:
                 thread.display_messages.append(Message(role="user", content=user_question))
                 thread.display_messages.append(Message(role="assistant", content=reply))
                 thread.updated_at = utc_now_iso()
-                return ChatResult(thread_id=thread_id, answer=reply, sources=[])
+                return ChatResult(thread_id=thread_id, answer=reply, sources=[], thread=thread)
 
             # Use recent_messages (always in memory) to detect first turn; display_messages
             # may be empty after OS save even when the thread already has history.
@@ -207,7 +207,11 @@ class PolicyGPTBot:
             # BM25/lexical channels via expanded_terms already; mixing it
             # into the embedding vector hurts cosine similarity against the
             # clean document embeddings.
-            query_vec = self._embed_one(query_analysis.original_question)
+            # Exception: short context-dependent timeline queries (e.g. "is this
+            # open") embed as generic phrases that don't semantically match date
+            # sections.  Augment with temporal keywords so the vector points at
+            # date/period content rather than unrelated sections.
+            query_vec = self._embed_one(self._build_embedding_text(query_analysis))
 
             # FAQ fast-path: if the question nearly exactly matches a stored
             # FAQ question (cosine ≥ faq_fastpath_min_score), return the FAQ
@@ -226,7 +230,7 @@ class PolicyGPTBot:
                 if first_user_message:
                     thread.title = self._derive_thread_title(user_question)
                 thread.updated_at = utc_now_iso()
-                return ChatResult(thread_id=thread_id, answer=final_faq, sources=[])
+                return ChatResult(thread_id=thread_id, answer=final_faq, sources=[], thread=thread)
             preferred_doc_ids = thread.active_doc_ids if query_analysis.context_dependent else []
             preferred_section_ids = thread.active_section_ids if query_analysis.context_dependent else []
 
@@ -247,7 +251,7 @@ class PolicyGPTBot:
                     )
                     thread.last_answer_sources = cached_sources
                     thread.updated_at = utc_now_iso()
-                    return ChatResult(thread_id=thread_id, answer=cached_answer, sources=cached_sources)
+                    return ChatResult(thread_id=thread_id, answer=cached_answer, sources=cached_sources, thread=thread)
 
             answer_text = ""
             is_answerable = False
@@ -286,6 +290,26 @@ class PolicyGPTBot:
                     self._docs_from_sections(top_sections, preferred_doc_ids),
                     top_sections,
                 )
+
+                # ── Full-document injection for describe/explain queries ───────
+                # When the query explicitly names a document (high lookup score),
+                # replace top_sections with ALL sections from that document so
+                # the LLM can produce a complete description rather than
+                # reconstructing from scattered top-k chunks.
+                if (
+                    "document_lookup" in query_analysis.intents
+                    and top_docs
+                ):
+                    best_doc, _ = top_docs[0]
+                    lookup_score = self.corpus.document_lookup_score(query_analysis, best_doc)
+                    if lookup_score >= self.config.retrieval.document_lookup_score_threshold:
+                        full_sections = self.corpus.get_all_sections_for_document(best_doc.doc_id)
+                        if full_sections:
+                            top_sections = full_sections
+                            top_docs = self._merge_retrieved_documents(
+                                self._docs_from_sections(top_sections, preferred_doc_ids),
+                                top_sections,
+                            )
 
                 # One SourceReference per document (highest-scoring section wins).
                 # top_sections is already sorted by score descending so the first
@@ -477,6 +501,7 @@ class PolicyGPTBot:
                 thread_id=thread_id,
                 answer=final_answer,
                 sources=thread.last_answer_sources,
+                thread=thread,
             )
         except Exception as exc:
             self._write_query_failure_log(
@@ -494,6 +519,27 @@ class PolicyGPTBot:
 
     def ask(self, thread_id: str, user_question: str) -> str:
         return self.chat(thread_id, user_question).answer
+
+    @staticmethod
+    def _build_embedding_text(query_analysis: QueryAnalysis) -> str:
+        """Return the text to embed for vector retrieval.
+
+        For most queries this is just the original question.
+        For short context-dependent timeline queries (e.g. "is this open",
+        "is this still active") the phrase is too generic to semantically
+        match date/period sections, so we append temporal expansion terms
+        to steer the vector toward contest-period / deadline content.
+        """
+        q = query_analysis.original_question
+        is_short = len(q.split()) <= 6
+        is_timeline = "timeline" in query_analysis.intents
+        is_ctx = query_analysis.context_dependent
+        if is_short and is_timeline and is_ctx:
+            return (
+                q + " start date end date closing date deadline valid from valid till "
+                "effective date expiry open closed active inactive expired ongoing"
+            )
+        return q
 
     def _embed_one(self, text: str) -> np.ndarray:
         cached = self.cache.get_embedding(text)

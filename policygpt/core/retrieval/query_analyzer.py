@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -17,6 +19,11 @@ from policygpt.ingestion.extraction.taxonomy import (
     tokenize_text,
     unique_preserving_order,
 )
+
+if TYPE_CHECKING:
+    from policygpt.core.ai.base import AIService
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +264,19 @@ DOCUMENT_LOOKUP_PHRASES: tuple[str, ...] = (
     "send me",
     "find",
     "locate",
+    # Visual / descriptive requests
+    "describe",
+    "describe the",
+    "explain the",
+    "explain this",
+    "summarize the",
+    "summarise the",
+    "walk me through",
+    "tell me about the",
+    "what does the",
+    "what is shown in",
+    "what is in the",
+    "what does this",
 )
 
 
@@ -278,6 +298,27 @@ DOCUMENT_LOOKUP_NOUNS: set[str] = {
     "faq",
     "form",
     "forms",
+    # Visual artifacts — diagrams, charts, images, architecture
+    "diagram",
+    "diagrams",
+    "chart",
+    "charts",
+    "figure",
+    "figures",
+    "image",
+    "images",
+    "schematic",
+    "schematics",
+    "architecture",
+    "flow",
+    "flowchart",
+    "illustration",
+    "snapshot",
+    "screenshot",
+    "slide",
+    "slides",
+    "infographic",
+    "visual",
 }
 
 
@@ -322,9 +363,38 @@ class QueryAnalysis:
     expected_section_types: list[str] = field(default_factory=list)
 
 
+_VALID_INTENTS: frozenset[str] = frozenset(INTENT_TO_SECTION_TYPES.keys()) | {"general"}
+
+_LLM_INTENT_SYSTEM_PROMPT = """\
+You are a query intent classifier for a document Q&A system covering business, insurance, and banking policies.
+
+Classify the user's question and return ONLY valid JSON — no markdown, no explanation.
+
+Valid intents (pick one or more that apply):
+  general, eligibility, timeline, process, checklist, approval, scope, exceptions,
+  documents_required, contact, comparison, aggregate, document_lookup
+
+Rules:
+- "timeline" → any question about dates, deadlines, whether something is open/closed/active/expired
+- "eligibility" → who qualifies, criteria, conditions
+- "document_lookup" → describe/explain/show a specific named document, diagram, or chart
+- "aggregate" → list all, compare across, how many
+- "general" → catch-all when nothing else fits
+
+Return JSON exactly like this:
+{
+  "intents": ["timeline"],
+  "date_sensitive": true,
+  "detail_requested": false,
+  "focus_terms": ["contest", "closed", "march"]
+}
+"""
+
+
 class QueryAnalyzer:
-    def __init__(self) -> None:
+    def __init__(self, ai: "AIService | None" = None) -> None:
         self._analysis_cache: dict[tuple[str, tuple[str, ...]], QueryAnalysis] = {}
+        self._ai = ai
 
     def analyze(
         self,
@@ -460,8 +530,80 @@ class QueryAnalyzer:
             expanded_terms=unique_preserving_order(expanded_terms),
             expected_section_types=unique_preserving_order(expected_section_types),
         )
+
+        # LLM fallback — only when keyword matching produced weak signals
+        if self._is_low_confidence(result):
+            result = self._enrich_with_llm(result)
+
         self._analysis_cache[cache_key] = result
         return result
+
+    # ── Low-confidence detection ──────────────────────────────────────────────
+
+    @staticmethod
+    def _is_low_confidence(result: QueryAnalysis) -> bool:
+        """Return True when keyword matching produced weak signals worth enriching."""
+        return (
+            result.intents == ["general"]
+            and not result.topic_hints
+            and len(result.focus_terms) <= 2
+        )
+
+    # ── LLM intent enrichment ─────────────────────────────────────────────────
+
+    def _enrich_with_llm(self, result: QueryAnalysis) -> QueryAnalysis:
+        """Call the LLM to classify intent; merge with existing keyword signals."""
+        if self._ai is None:
+            return result
+        try:
+            raw = self._ai.llm_text(
+                system_prompt=_LLM_INTENT_SYSTEM_PROMPT,
+                user_prompt=result.original_question,
+                max_output_tokens=200,
+            )
+            parsed = json.loads(raw.strip())
+        except Exception as exc:
+            logger.debug("QueryAnalyzer LLM fallback failed: %s", exc)
+            return result
+
+        llm_intents = [
+            i for i in parsed.get("intents", [])
+            if i in _VALID_INTENTS
+        ]
+        llm_focus = [
+            t for t in parsed.get("focus_terms", [])
+            if isinstance(t, str) and t
+        ]
+        llm_date_sensitive = bool(parsed.get("date_sensitive", False))
+        llm_detail = bool(parsed.get("detail_requested", False))
+
+        merged_intents = unique_preserving_order(llm_intents + result.intents) or ["general"]
+        merged_focus = unique_preserving_order(result.focus_terms + llm_focus)
+        merged_section_types: list[str] = []
+        for intent in merged_intents:
+            merged_section_types.extend(INTENT_TO_SECTION_TYPES.get(intent, ()))
+        merged_section_types = unique_preserving_order(merged_section_types)
+
+        logger.debug(
+            "QueryAnalyzer LLM enrichment: intents=%s date_sensitive=%s focus=%s",
+            merged_intents, llm_date_sensitive, llm_focus,
+        )
+
+        return QueryAnalysis(
+            original_question=result.original_question,
+            normalized_question=result.normalized_question,
+            canonical_question=result.canonical_question
+                + f"\nLLM-inferred intents: {', '.join(merged_intents)}",
+            detail_requested=result.detail_requested or llm_detail,
+            multi_doc_expected=result.multi_doc_expected,
+            exact_match_expected=result.exact_match_expected,
+            context_dependent=result.context_dependent or llm_date_sensitive,
+            intents=merged_intents,
+            topic_hints=result.topic_hints,
+            focus_terms=merged_focus,
+            expanded_terms=result.expanded_terms,
+            expected_section_types=merged_section_types,
+        )
 
     def _infer_corpus_topics(
         self,
@@ -607,7 +749,8 @@ class QueryAnalyzer:
         if any(phrase in normalized_question for phrase in DOCUMENT_LOOKUP_PHRASES):
             return True
 
-        if query_tokens[0] in {"give", "show", "open", "share", "provide", "send", "find", "locate"}:
+        if query_tokens[0] in {"give", "show", "open", "share", "provide", "send", "find", "locate",
+                               "describe", "explain", "summarize", "summarise", "walk"}:
             return True
 
         if len(query_tokens) <= 6 and query_tokens[-1] in DOCUMENT_LOOKUP_NOUNS:

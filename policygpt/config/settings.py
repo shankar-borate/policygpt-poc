@@ -83,7 +83,7 @@ class Config:
     ai_profile: str = "bedrock-120b"
     accuracy_profile: str = "vhigh"
     runtime_cost_profile: str = "standard"
-    domain_type: str = "product_technical"
+    domain_type: str = "contest"
 
     # ── Sub-configs (mutable so __post_init__ can apply presets) ─────────────
     ai: AIConfig = field(default_factory=AIConfig)
@@ -231,7 +231,7 @@ class Config:
         storage = StorageConfig(
             public_base_url=os.getenv("POLICY_GPT_PUBLIC_BASE_URL", base.storage.public_base_url).rstrip("/"),
             usd_to_inr_exchange_rate=_env_float("POLICY_GPT_USD_TO_INR_RATE", base.storage.usd_to_inr_exchange_rate),
-            debug_log_dir=os.getenv("POLICY_GPT_DEBUG_LOG_DIR", base.storage.debug_log_dir) or "",
+            debug_log_dir=(os.getenv("POLICY_GPT_DEBUG_LOG_DIR") or base.storage.debug_log_dir) or None,
             debug=(
                 base.storage.debug
                 if debug_env is None
@@ -254,6 +254,9 @@ class Config:
             ),
             skip_section_summary=bool(_env_bool("POLICY_GPT_SKIP_SECTION_SUMMARY", base.ingestion.skip_section_summary)),
             image_max_bytes=_env_int("POLICY_GPT_IMAGE_MAX_BYTES", base.ingestion.image_max_bytes),
+            vision_provider=os.getenv("VISION_PROVIDER", base.ingestion.vision_provider).strip().lower()
+            or base.ingestion.vision_provider,
+            vision_model=os.getenv("VISION_MODEL", base.ingestion.vision_model).strip(),
             ingestion_user_ids=(
                 tuple(
                     uid.strip()
@@ -317,10 +320,10 @@ class Config:
         )
 
         search = SearchConfig(
-            opensearch_host=os.getenv("OS_HOST", base.search.opensearch_host).strip(),
+            opensearch_host=(os.getenv("OS_HOST") or base.search.opensearch_host) or None,
             opensearch_port=_env_int("OS_PORT", base.search.opensearch_port),
-            opensearch_username=os.getenv("OS_USERNAME", base.search.opensearch_username).strip(),
-            opensearch_password=os.getenv("OS_PASSWORD", base.search.opensearch_password),
+            opensearch_username=(os.getenv("OS_USERNAME") or base.search.opensearch_username) or None,
+            opensearch_password=(os.getenv("OS_PASSWORD") or base.search.opensearch_password) or None,
             opensearch_use_ssl=bool(_env_bool("OS_USE_SSL", base.search.opensearch_use_ssl)),
             opensearch_verify_certs=bool(_env_bool("OS_VERIFY_CERTS", base.search.opensearch_verify_certs)),
             opensearch_index_prefix=os.getenv("OS_INDEX_PREFIX", base.search.opensearch_index_prefix).strip()

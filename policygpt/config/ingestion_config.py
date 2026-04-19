@@ -24,7 +24,12 @@ class IngestionConfig:
 
     # ── OCR ───────────────────────────────────────────────────────────────────
     ocr_enabled: bool = False
+
+    # OCR provider — only used when ocr_enabled = True.
+    # OCRProvider.TEXTRACT — AWS Textract (requires AWS credentials + region)
+    # OCRProvider.CLAUDE   — Claude vision used as OCR (requires ANTHROPIC_API_KEY)
     ocr_provider: OCRProvider = OCRProvider.TEXTRACT
+
     ocr_min_confidence: float = 80.0
     image_max_bytes: int = 1 * 1024 * 1024
 
@@ -35,6 +40,20 @@ class IngestionConfig:
     pptx_to_html_enabled: bool = True
     excel_to_html_enabled: bool = True
     image_to_html_enabled: bool = True
+
+    # ── Vision model for image content (PDF image pages, PPT diagrams, DOCX images, standalone images)
+    # Fallback chain: vision (if set) → OCR (if ocr_enabled) → skip
+    #
+    # vision_provider options:
+    #   "claude" — Anthropic Claude vision (requires ANTHROPIC_API_KEY)
+    #   "openai" — OpenAI GPT-4o vision   (requires OPENAI_API_KEY)
+    #   None     — vision disabled, falls back to OCR or skip
+    vision_provider: str | None = "openai"
+
+    # Vision model override. None = use provider default.
+    # claude default : claude-haiku-4-5-20251001
+    # openai default : gpt-4o-mini
+    vision_model: str | None = "gpt-4o-mini"
 
     # ── Policy rewriting ──────────────────────────────────────────────────────
     rewrite_policies_enabled: bool = True
