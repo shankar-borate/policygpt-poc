@@ -27,6 +27,7 @@ from policygpt.ingestion.converters.base import HtmlConverter
 if TYPE_CHECKING:
     from policygpt.ingestion.converters.vision import VisionDescriber
     from policygpt.ingestion.extraction.ocr import OcrExtractor
+    from policygpt.ingestion.explainers.factory import ExplainerFactory
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +144,12 @@ class DocxToHtmlConverter(HtmlConverter):
         skip_if_cached: bool = True,
         vision_describer: "VisionDescriber | None" = None,
         ocr: "OcrExtractor | None" = None,
+        explainer: "ExplainerFactory | None" = None,
     ) -> None:
         super().__init__(output_dir=output_dir, skip_if_cached=skip_if_cached)
         self._vision = vision_describer
         self._ocr = ocr
+        self._explainer = explainer
 
     @property
     def supported_content_types(self) -> frozenset[str]:

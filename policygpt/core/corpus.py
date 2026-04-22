@@ -626,6 +626,16 @@ class DocumentCorpus:
             candidate_sections=candidates,
             user_profile=user_profile,
         )
+        # Enrich score_details with per-channel OS scores and matched_by
+        sr_lookup = getattr(self._os_retriever, "last_search_results", {})
+        for sid, sd in score_details.items():
+            sr = sr_lookup.get(sid)
+            if sr:
+                sd["kw_score"]      = round(sr.keyword_score, 4)
+                sd["sim_score"]     = round(sr.similarity_score, 4)
+                sd["vec_score"]     = round(sr.vector_score, 4)
+                sd["matched_by"]    = [st.value for st in sr.matched_by]
+
         # Expose per-section score breakdown for retrieval logging
         self.last_retrieval_score_details: dict[str, dict] = score_details
 

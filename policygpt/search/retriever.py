@@ -34,6 +34,9 @@ class OpenSearchRetriever:
         self.config = config
         self.cache = cache or CacheManager()
         self._hybrid = HybridSearcher(store, config)
+        # Populated after each retrieve() call — section_id → SearchResult
+        # Gives corpus.py access to per-channel scores and matched_by
+        self.last_search_results: dict[str, SearchResult] = {}
 
     def retrieve(
         self,
@@ -65,6 +68,7 @@ class OpenSearchRetriever:
         )
 
         results = self._hybrid.search(search_query)
+        self.last_search_results = {r.section_id: r for r in results}
 
         output: list[tuple[SectionRecord, float]] = []
         for result in results:

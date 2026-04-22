@@ -24,8 +24,12 @@ import logging
 import re
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from policygpt.ingestion.converters.base import HtmlConverter
+
+if TYPE_CHECKING:
+    from policygpt.ingestion.explainers.factory import ExplainerFactory
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,15 @@ def _format_cell(value) -> str:
 
 class ExcelToHtmlConverter(HtmlConverter):
     """Converts XLSX/XLS files to structured HTML."""
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        skip_if_cached: bool = True,
+        explainer: "ExplainerFactory | None" = None,
+    ) -> None:
+        super().__init__(output_dir=output_dir, skip_if_cached=skip_if_cached)
+        self._explainer = explainer
 
     @property
     def supported_content_types(self) -> frozenset[str]:
@@ -95,7 +108,7 @@ class ExcelToHtmlConverter(HtmlConverter):
         print(f"  [Convert] {src.name} — {len(sheet_names)} sheet(s), splitting …", flush=True)
         results: list[tuple[str, str]] = []
 
-        for sheet_name in sheet_names:
+        for sheet_num, sheet_name in enumerate(sheet_names, 1):
             safe = re.sub(r'[<>:"/\\|?*\s]+', "_", sheet_name).strip("_") or "Sheet"
             out_path = self._out / f"{src.stem}_{safe}.html"
 
@@ -119,6 +132,7 @@ class ExcelToHtmlConverter(HtmlConverter):
                 print(f"  [Convert] {src.name} [{sheet_name}] — empty, skipping", flush=True)
                 continue
 
+            sheet_html = self._maybe_explain_sheet(sheet_html, sheet_num)
             title = f"{self._title_from_stem(src.stem)} — {sheet_name}"
             meta = (
                 f'<dl class="doc-meta">'
@@ -152,9 +166,10 @@ class ExcelToHtmlConverter(HtmlConverter):
         wb.close()
 
         sheet_parts: list[str] = []
-        for sheet_name in sheet_names:
+        for sheet_num, sheet_name in enumerate(sheet_names, 1):
             sheet_html = self._sheet_to_html(sheet_name, path)
             if sheet_html:
+                sheet_html = self._maybe_explain_sheet(sheet_html, sheet_num)
                 sheet_parts.append(sheet_html)
 
         meta = (
@@ -166,6 +181,27 @@ class ExcelToHtmlConverter(HtmlConverter):
         )
         body = meta + "\n" + "\n".join(sheet_parts)
         return self._wrap_html(title, body)
+
+    def _maybe_explain_sheet(self, sheet_html: str, sheet_num: int) -> str:
+        """Inject an explanation div into sheet HTML when the explainer is active."""
+        if self._explainer is None:
+            return sheet_html
+        import re as _re
+        from policygpt.ingestion.explainers.base import UnitContent
+        plain_text = _re.sub(r"<[^>]+>", " ", sheet_html)
+        plain_text = _re.sub(r"\s+", " ", plain_text).strip()
+        unit = UnitContent(
+            unit_index=sheet_num,
+            unit_label="sheet",
+            text=plain_text,
+        )
+        explanation = self._explainer.explain_unit(unit, ctx=None)
+        if not explanation:
+            return sheet_html
+        sheet_html = sheet_html.rstrip()
+        if sheet_html.endswith("</section>"):
+            return sheet_html[:-10] + "\n" + explanation + "\n</section>"
+        return sheet_html + "\n" + explanation
 
     @staticmethod
     def _read_sheet_data(

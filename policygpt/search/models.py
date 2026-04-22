@@ -66,3 +66,7 @@ class SearchResult:
     keywords: list[str] = field(default_factory=list)
     # Which search type(s) contributed to this result
     matched_by: tuple[SearchType, ...] = field(default_factory=tuple)
+    # Per-channel normalised scores (0 when the channel did not match)
+    keyword_score: float = 0.0
+    similarity_score: float = 0.0
+    vector_score: float = 0.0

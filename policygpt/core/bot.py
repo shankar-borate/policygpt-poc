@@ -33,6 +33,38 @@ from policygpt.config.user_profiles import UserProfile
 from policygpt.cache import CacheManager, build_cache_backend
 
 
+def _log_retrieval_console(top_sections, top_docs, corpus) -> None:
+    """Print a concise retrieval summary to stdout for real-time tracking."""
+    score_details = getattr(corpus, "last_retrieval_score_details", {})
+    doc_count = len(top_docs)
+    sec_count = len(top_sections)
+    top_score = max((s for _, s in top_sections), default=0.0) if top_sections else 0.0
+    print(
+        f"  [Retrieval] {sec_count} section(s) from {doc_count} doc(s) | top_final={top_score:.3f}",
+        flush=True,
+    )
+    for sec, final_score in top_sections:
+        doc = next((d for d, _ in top_docs if any(s.doc_id == d.doc_id for s, _ in top_sections if s.section_id == sec.section_id)), None)
+        doc_title = doc.title if doc else sec.doc_id
+        sd = score_details.get(sec.section_id, {})
+        matched = ",".join(sd.get("matched_by") or []) or "?"
+        llm_part = (
+            f"llm={sd['llm_score']:.3f}" if sd.get("llm_score") is not None
+            else ("llm=skip" if sd.get("llm_skipped") else "")
+        )
+        print(
+            f"    {final_score:.3f} | {doc_title} :: {sec.title}"
+            f" | matched_by={matched}"
+            f" kw={sd.get('kw_score',0.0):.2f}"
+            f" sim={sd.get('sim_score',0.0):.2f}"
+            f" vec={sd.get('vec_score',0.0):.2f}"
+            f" os={sd.get('os_hybrid_score',0.0):.3f}"
+            f" h={sd.get('h_score',0.0):.3f}"
+            + (f" {llm_part}" if llm_part else ""),
+            flush=True,
+        )
+
+
 class PolicyGPTBot:
     def __init__(
         self,
@@ -290,6 +322,7 @@ class PolicyGPTBot:
                     self._docs_from_sections(top_sections, preferred_doc_ids),
                     top_sections,
                 )
+                _log_retrieval_console(top_sections, top_docs, self.corpus)
 
                 # ── Full-document injection for describe/explain queries ───────
                 # When the query explicitly names a document (high lookup score),
@@ -2268,18 +2301,25 @@ class PolicyGPTBot:
                         if sd.get("llm_score") is not None
                         else ("llm=skipped" if sd.get("llm_skipped") else "llm=n/a")
                     )
+                    matched = ",".join(sd.get("matched_by") or []) or "?"
                     lines.append(
-                        f"   scores: os_hybrid={sd.get('os_hybrid_score','?'):.4f}"
-                        f" | snippet_overlap={sd.get('snippet_overlap','?'):.4f}"
-                        f" | focus_match={sd.get('focus_match','?'):.4f}"
-                        f" | precise_match={sd.get('precise_match','?'):.4f}"
-                        f" | section_type_boost={sd.get('section_type_boost','?'):.4f}"
-                        f" | tag_boost={sd.get('tag_boost','?'):.4f}"
-                        f" | role_alignment={sd.get('role_alignment','?'):.4f}"
-                        f" | title_align={sd.get('title_alignment','?'):.4f}"
-                        f" | h_score={sd.get('h_score','?'):.4f}"
+                        f"   os: matched_by={matched}"
+                        f" | kw={sd.get('kw_score', 0.0):.3f}"
+                        f" sim={sd.get('sim_score', 0.0):.3f}"
+                        f" vec={sd.get('vec_score', 0.0):.3f}"
+                        f" → hybrid={sd.get('os_hybrid_score','?'):.4f}"
+                    )
+                    lines.append(
+                        f"   rerank: snippet={sd.get('snippet_overlap','?'):.3f}"
+                        f" | focus={sd.get('focus_match','?'):.3f}"
+                        f" | precise={sd.get('precise_match','?'):.3f}"
+                        f" | sec_type={sd.get('section_type_boost','?'):.3f}"
+                        f" | tag={sd.get('tag_boost','?'):.3f}"
+                        f" | role={sd.get('role_alignment','?'):.3f}"
+                        f" | title={sd.get('title_alignment','?'):.3f}"
+                        f" → h={sd.get('h_score','?'):.4f}"
                         f" | {llm_part}"
-                        f" | final={sd.get('final_score','?'):.4f}"
+                        f" → final={sd.get('final_score','?'):.4f}"
                     )
         else:
             lines.append("(none)")
@@ -2303,9 +2343,14 @@ class PolicyGPTBot:
                     if sd.get("llm_score") is not None
                     else ("llm=skipped" if sd.get("llm_skipped") else "llm=n/a")
                 )
+                matched = ",".join(sd.get("matched_by") or []) or "?"
                 lines.append(
                     f"  [{doc_label}] {sec_label}"
-                    f" | os_hybrid={sd.get('os_hybrid_score','?'):.4f}"
+                    f" | matched_by={matched}"
+                    f" | kw={sd.get('kw_score', 0.0):.3f}"
+                    f" sim={sd.get('sim_score', 0.0):.3f}"
+                    f" vec={sd.get('vec_score', 0.0):.3f}"
+                    f" os_hybrid={sd.get('os_hybrid_score','?'):.4f}"
                     f" | h={sd.get('h_score','?'):.4f}"
                     f" | {llm_part}"
                     f" | final={sd.get('final_score','?'):.4f}"

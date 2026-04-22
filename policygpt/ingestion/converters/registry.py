@@ -29,6 +29,7 @@ from policygpt.ingestion.converters.image_html_converter import ImageToHtmlConve
 if TYPE_CHECKING:
     from policygpt.ingestion.converters.vision import VisionDescriber
     from policygpt.ingestion.extraction.ocr import OcrExtractor
+    from policygpt.ingestion.explainers.factory import ExplainerFactory
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class HtmlConverterRegistry:
         skip_content_types: frozenset[str] = frozenset(),
         vision_describer: "VisionDescriber | None" = None,
         ocr: "OcrExtractor | None" = None,
+        explainer: "ExplainerFactory | None" = None,
     ) -> None:
         self._registry: dict[str, HtmlConverter] = {}
         _vision_converters = (
@@ -91,6 +93,13 @@ class HtmlConverterRegistry:
                     skip_if_cached=skip_if_cached,
                     vision_describer=vision_describer,
                     ocr=ocr,
+                    explainer=explainer,
+                )
+            elif cls is ExcelToHtmlConverter:
+                instance = cls(
+                    output_dir=output_dir,
+                    skip_if_cached=skip_if_cached,
+                    explainer=explainer,
                 )
             else:
                 instance = cls(output_dir=output_dir, skip_if_cached=skip_if_cached)

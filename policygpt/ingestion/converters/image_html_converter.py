@@ -30,6 +30,7 @@ from policygpt.ingestion.converters.base import HtmlConverter
 if TYPE_CHECKING:
     from policygpt.ingestion.converters.vision import VisionDescriber
     from policygpt.ingestion.extraction.ocr import OcrExtractor
+    from policygpt.ingestion.explainers.factory import ExplainerFactory
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +68,12 @@ class ImageToHtmlConverter(HtmlConverter):
         skip_if_cached: bool = True,
         vision_describer: "VisionDescriber | None" = None,
         ocr: "OcrExtractor | None" = None,
+        explainer: "ExplainerFactory | None" = None,
     ) -> None:
         super().__init__(output_dir=output_dir, skip_if_cached=skip_if_cached)
         self._vision = vision_describer
         self._ocr = ocr
+        self._explainer = explainer
 
     @property
     def supported_content_types(self) -> frozenset[str]:
@@ -91,6 +94,22 @@ class ImageToHtmlConverter(HtmlConverter):
         print(f"    [IMG] {path.name} — {len(image_bytes)/1024:.1f} KB ({mime_type})", flush=True)
 
         body = self._describe_image(image_bytes, mime_type, path)
+
+        # Images are always explained — no doc context needed (single-unit file)
+        if self._explainer is not None:
+            import re as _re
+            from policygpt.ingestion.explainers.base import UnitContent
+            plain = _re.sub(r"<[^>]+>", " ", body)
+            plain = _re.sub(r"\s+", " ", plain).strip()
+            unit = UnitContent(
+                unit_index=1,
+                unit_label="image",
+                text=plain,
+            )
+            explanation = self._explainer.explain_unit(unit, ctx=None)
+            if explanation:
+                body = body + "\n" + explanation
+
         return self._wrap_html(title, body)
 
     def _describe_image(self, image_bytes: bytes, mime_type: str, path: Path) -> str:

@@ -24,8 +24,17 @@ from policygpt.ingestion.converters.base import HtmlConverter
 if TYPE_CHECKING:
     from policygpt.ingestion.converters.vision import VisionDescriber
     from policygpt.ingestion.extraction.ocr import OcrExtractor
+    from policygpt.ingestion.explainers.factory import ExplainerFactory
 
 logger = logging.getLogger(__name__)
+
+
+def _inject_explanation(unit_html: str, explanation: str) -> str:
+    """Insert an explanation div before the closing tag of a slide section."""
+    unit_html = unit_html.rstrip()
+    if unit_html.endswith("</section>"):
+        return unit_html[:-10] + "\n" + explanation + "\n</section>"
+    return unit_html + "\n" + explanation
 
 
 class PptToHtmlConverter(HtmlConverter):
@@ -49,10 +58,12 @@ class PptToHtmlConverter(HtmlConverter):
         skip_if_cached: bool = True,
         vision_describer: "VisionDescriber | None" = None,
         ocr: "OcrExtractor | None" = None,
+        explainer: "ExplainerFactory | None" = None,
     ) -> None:
         super().__init__(output_dir=output_dir, skip_if_cached=skip_if_cached)
         self._vision = vision_describer
         self._ocr = ocr
+        self._explainer = explainer
 
     @property
     def supported_content_types(self) -> frozenset[str]:
@@ -69,16 +80,45 @@ class PptToHtmlConverter(HtmlConverter):
 
         title = self._title_from_stem(path.stem)
         prs = Presentation(str(path))
-        slide_count = len(prs.slides)
-        slide_parts: list[str] = []
+        slides = list(prs.slides)
+        slide_count = len(slides)
 
         logger.info("PptToHtmlConverter: %s — %d slide(s)", path.name, slide_count)
         print(f"    [PPT] {path.name} — {slide_count} slide(s)", flush=True)
 
-        for slide_num, slide in enumerate(prs.slides, 1):
+        # Pass 1 — build document context when explainer is active
+        doc_ctx = None
+        if self._explainer is not None:
+            from policygpt.ingestion.explainers.base import UnitContent
+            unit_texts = [self._extract_slide_text_only(s) for s in slides]
+            doc_ctx = self._explainer.build_context(unit_texts, "PowerPoint", title)
+
+        # Pass 2 — convert each slide to HTML and inject explanation
+        slide_parts: list[str] = []
+        prev_explanation = ""
+
+        for slide_num, slide in enumerate(slides, 1):
             slide_html = self._convert_slide(slide, slide_num, path.name)
-            if slide_html.strip():
-                slide_parts.append(slide_html)
+            if not slide_html.strip():
+                continue
+
+            if self._explainer is not None:
+                import re as _re
+                from policygpt.ingestion.explainers.base import UnitContent
+                plain = _re.sub(r"<[^>]+>", " ", slide_html)
+                plain = _re.sub(r"\s+", " ", plain).strip()
+                unit = UnitContent(
+                    unit_index=slide_num,
+                    unit_label="slide",
+                    text=plain,
+                    prev_explanation=prev_explanation,
+                )
+                explanation = self._explainer.explain_unit(unit, doc_ctx)
+                if explanation:
+                    slide_html = _inject_explanation(slide_html, explanation)
+                    prev_explanation = explanation
+
+            slide_parts.append(slide_html)
 
         meta = (
             f'<dl class="doc-meta">'
@@ -217,6 +257,36 @@ class PptToHtmlConverter(HtmlConverter):
                 parts.append(f"<p>{escaped}</p>")
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _extract_slide_text_only(slide) -> str:
+        """Extract plain text from all text frames and table cells on a slide."""
+        texts: list[str] = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    t = para.text.strip()
+                    if t:
+                        texts.append(t)
+            elif shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        t = cell.text.strip()
+                        if t:
+                            texts.append(t)
+        return "\n".join(texts)
+
+    @staticmethod
+    def _get_slide_picture_bytes(slide) -> tuple[bytes, str]:
+        """Return (image_bytes, mime_type) for the first PICTURE shape, or (b'', '')."""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        for shape in slide.shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                try:
+                    return shape.image.blob, shape.image.content_type or "image/png"
+                except Exception:
+                    pass
+        return b"", ""
 
     @staticmethod
     def _table_to_html(table) -> str:

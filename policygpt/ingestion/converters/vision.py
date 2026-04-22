@@ -70,7 +70,12 @@ class VisionDescriber(ABC):
     """
 
     @abstractmethod
-    def describe_page(self, image_bytes: bytes, mime_type: str = "image/png") -> str:
+    def describe_page(
+        self,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        context_prefix: str = "",
+    ) -> str:
         """Return an HTML fragment describing the page.
 
         Parameters
@@ -79,6 +84,10 @@ class VisionDescriber(ABC):
             Raw PNG (or JPEG/WEBP) bytes of the rendered page.
         mime_type:
             MIME type of the image (e.g. ``"image/png"``).
+        context_prefix:
+            Optional text prepended to the standard prompt — used by the
+            explainability feature to inject document-level context so the
+            model understands the slide/page in relation to the whole document.
 
         Returns
         -------
@@ -134,10 +143,20 @@ class ClaudeVisionDescriber(VisionDescriber):
             self._client = anthropic.Anthropic(api_key=api_key or None)
         return self._client
 
-    def describe_page(self, image_bytes: bytes, mime_type: str = "image/png") -> str:
+    def describe_page(
+        self,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        context_prefix: str = "",
+    ) -> str:
         if not image_bytes:
             return ""
         b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+        prompt = (
+            (context_prefix.strip() + "\n\n" + _PAGE_DESCRIPTION_PROMPT)
+            if context_prefix.strip()
+            else _PAGE_DESCRIPTION_PROMPT
+        )
         logger.info(
             "ClaudeVisionDescriber: sending %.1f KB image to %s …",
             len(image_bytes) / 1024, self._model,
@@ -157,7 +176,7 @@ class ClaudeVisionDescriber(VisionDescriber):
                                 "data": b64,
                             },
                         },
-                        {"type": "text", "text": _PAGE_DESCRIPTION_PROMPT},
+                        {"type": "text", "text": prompt},
                     ],
                 }],
             )
@@ -215,11 +234,21 @@ class OpenAIVisionDescriber(VisionDescriber):
             self._client = openai.OpenAI(api_key=api_key or None)
         return self._client
 
-    def describe_page(self, image_bytes: bytes, mime_type: str = "image/png") -> str:
+    def describe_page(
+        self,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        context_prefix: str = "",
+    ) -> str:
         if not image_bytes:
             return ""
         b64 = base64.standard_b64encode(image_bytes).decode("ascii")
         data_url = f"data:{mime_type};base64,{b64}"
+        prompt = (
+            (context_prefix.strip() + "\n\n" + _PAGE_DESCRIPTION_PROMPT)
+            if context_prefix.strip()
+            else _PAGE_DESCRIPTION_PROMPT
+        )
         logger.info(
             "OpenAIVisionDescriber: sending %.1f KB image to %s …",
             len(image_bytes) / 1024, self._model,
@@ -235,7 +264,7 @@ class OpenAIVisionDescriber(VisionDescriber):
                             "type": "image_url",
                             "image_url": {"url": data_url, "detail": "high"},
                         },
-                        {"type": "text", "text": _PAGE_DESCRIPTION_PROMPT},
+                        {"type": "text", "text": prompt},
                     ],
                 }],
             )

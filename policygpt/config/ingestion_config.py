@@ -74,6 +74,13 @@ class IngestionConfig:
     token_estimate_chars_per_token: int = 4
     token_estimate_tokens_per_word: float = 1.3
 
+    # ── Explainability ────────────────────────────────────────────────────────
+    # When enabled, each slide / page / sheet receives a contextual explanation
+    # injected as <div class="unit-explanation"> in the converted HTML.
+    # Rules: is_image → vision explainer; chars < explain_min_chars → text LLM; else skip.
+    explain_enabled: bool = True
+    explain_min_chars: int = 250
+
     # ── Summarisation token budgets (defaults = 'high' baseline) ─────────────
     doc_summary_input_token_budget: int = 6000
     doc_summary_combine_token_budget: int = 4500

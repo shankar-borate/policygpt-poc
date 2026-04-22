@@ -38,6 +38,7 @@ from policygpt.ingestion.converters.base import HtmlConverter
 if TYPE_CHECKING:
     from policygpt.ingestion.converters.vision import VisionDescriber
     from policygpt.ingestion.extraction.ocr import OcrExtractor
+    from policygpt.ingestion.explainers.factory import ExplainerFactory
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,14 @@ def _suppress_pdfminer_warnings():
         yield
     finally:
         pdfminer_logger.setLevel(original_level)
+
+
+def _inject_explanation(page_html: str, explanation: str) -> str:
+    """Insert an explanation div before the closing </div> of a page block."""
+    page_html = page_html.rstrip()
+    if page_html.endswith("</div>"):
+        return page_html[:-6] + "\n" + explanation + "\n</div>"
+    return page_html + "\n" + explanation
 
 
 def _wrap_bullet_lists(parts: list[str]) -> list[str]:
@@ -107,10 +116,12 @@ class PdfToHtmlConverter(HtmlConverter):
         skip_if_cached: bool = True,
         vision_describer: "VisionDescriber | None" = None,
         ocr: "OcrExtractor | None" = None,
+        explainer: "ExplainerFactory | None" = None,
     ) -> None:
         super().__init__(output_dir=output_dir, skip_if_cached=skip_if_cached)
         self._vision = vision_describer
         self._ocr = ocr
+        self._explainer = explainer
 
     @property
     def supported_content_types(self) -> frozenset[str]:
@@ -136,6 +147,18 @@ class PdfToHtmlConverter(HtmlConverter):
             logger.info("PdfToHtmlConverter: opened %s — %d page(s)", path.name, page_count)
             print(f"    [PDF] {path.name} — {page_count} page(s)", flush=True)
 
+            # Pass 1 — extract text from every page to build document context
+            doc_ctx = None
+            if self._explainer is not None:
+                unit_texts: list[str] = []
+                for page in pdf.pages:
+                    unit_texts.append(
+                        (page.extract_text(x_tolerance=3, y_tolerance=3) or "").strip()
+                    )
+                doc_ctx = self._explainer.build_context(unit_texts, "PDF", title)
+
+            # Pass 2 — convert each page and inject explanation
+            prev_explanation = ""
             for page_num, page in enumerate(pdf.pages, 1):
                 try:
                     page_html, page_type = self._convert_page(page, page_num)
@@ -146,11 +169,28 @@ class PdfToHtmlConverter(HtmlConverter):
                     )
                     stats["skipped"] += 1
                     continue
-                if page_html.strip():
-                    page_parts.append(page_html)
-                    stats[page_type] = stats.get(page_type, 0) + 1
-                else:
+                if not page_html.strip():
                     stats["skipped"] += 1
+                    continue
+
+                if self._explainer is not None:
+                    import re as _re
+                    from policygpt.ingestion.explainers.base import UnitContent
+                    plain = _re.sub(r"<[^>]+>", " ", page_html)
+                    plain = _re.sub(r"\s+", " ", plain).strip()
+                    unit = UnitContent(
+                        unit_index=page_num,
+                        unit_label="page",
+                        text=plain,
+                        prev_explanation=prev_explanation,
+                    )
+                    explanation = self._explainer.explain_unit(unit, doc_ctx)
+                    if explanation:
+                        page_html = _inject_explanation(page_html, explanation)
+                        prev_explanation = explanation
+
+                page_parts.append(page_html)
+                stats[page_type] = stats.get(page_type, 0) + 1
 
         logger.info(
             "PdfToHtmlConverter: %s done — text=%d vision=%d ocr=%d skipped=%d",

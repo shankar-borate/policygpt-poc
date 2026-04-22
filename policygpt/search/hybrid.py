@@ -150,6 +150,9 @@ class HybridSearcher:
             result = result_registry[sid]
             result.score = blended_score
             result.matched_by = tuple(matched_by[sid])
+            result.keyword_score    = norm.get(SearchType.KEYWORD,    {}).get(sid, 0.0)
+            result.similarity_score = norm.get(SearchType.SIMILARITY, {}).get(sid, 0.0)
+            result.vector_score     = norm.get(SearchType.VECTOR,      {}).get(sid, 0.0)
             final.append(result)
 
         return final

@@ -163,11 +163,29 @@ class IngestionPipeline:
                     except ValueError as exc:
                         logger.warning("OcrExtractor not built: %s", exc)
 
+                # Build explainer factory when explain_enabled is set.
+                explainer = None
+                if cfg.ingestion.explain_enabled:
+                    from policygpt.ingestion.explainers.factory import ExplainerFactory
+                    from policygpt.ingestion.explainers.rules import ExplainRules
+                    explainer = ExplainerFactory(
+                        rules=ExplainRules(min_chars=cfg.ingestion.explain_min_chars),
+                        vision=vision_describer,
+                        ocr=ocr,
+                        ai=corpus.ai,
+                    )
+                    logger.info(
+                        "ExplainerFactory enabled — min_chars=%d vision=%s",
+                        cfg.ingestion.explain_min_chars,
+                        cfg.ingestion.vision_provider or "disabled",
+                    )
+
                 html_converter_registry = HtmlConverterRegistry(
                     output_dir=html_dir,
                     skip_content_types=frozenset(skip_cts),
                     vision_describer=vision_describer,
                     ocr=ocr,
+                    explainer=explainer,
                 )
                 logger.info(
                     "HtmlConverterRegistry enabled — output=%s formats=%s vision=%s ocr=%s",
