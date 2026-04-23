@@ -13,6 +13,12 @@ class Message:
 class ThreadState:
     thread_id: str
     user_id: str = ""
+    profile_role: str = ""
+    profile_grade: str = ""
+    profile_department: str = ""
+    profile_location: str = ""
+    pending_question: str = ""
+    pending_clarification_kind: str = ""
     recent_messages: list[Message] = field(default_factory=list)
     display_messages: list[Message] = field(default_factory=list)
     conversation_summary: str = ""

@@ -1,18 +1,19 @@
-"""User profile — role/grade/department context injected at request time.
+"""User profile utilities for per-request and per-thread personalization.
 
 Structure
 ---------
-UserProfile          — per-request context (populated by API layer from session/token)
-DOMAIN_DEFAULT_PROFILES — domain-keyed defaults used until real login is wired
+UserProfile             — request/thread context describing the current user
+DOMAIN_DEFAULT_PROFILES — optional domain baselines kept for future integrations
 
-At request time the API layer calls ``resolve_user_profile(domain_type, request)``
-which returns the real profile (from JWT / session) when available, falling back
-to the domain default.  No other code needs to change when real login is added.
+Today the bot should *not* silently assume a default identity for anonymous
+users.  When we do not know who the user is, we return an empty profile and let
+the conversation flow ask for the missing context explicitly.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 
 
 @dataclass
@@ -59,6 +60,16 @@ class UserProfile:
         parts = [p for p in (self.role, self.grade, self.department, self.location) if p]
         return " | ".join(parts) if parts else ""
 
+    def merged_with(self, fallback: "UserProfile | None" = None) -> "UserProfile":
+        """Return a profile where this profile's non-empty fields win."""
+        fallback = fallback or UserProfile()
+        return UserProfile(
+            role=self.role or fallback.role,
+            grade=self.grade or fallback.grade,
+            department=self.department or fallback.department,
+            location=self.location or fallback.location,
+        ).build_tags()
+
 
 # ---------------------------------------------------------------------------
 # Domain-level default profiles
@@ -103,14 +114,92 @@ DOMAIN_DEFAULT_PROFILES: dict[str, UserProfile] = {
 }
 
 
+def merge_user_profiles(primary: UserProfile | None, fallback: UserProfile | None = None) -> UserProfile:
+    """Return a merged profile where primary values override fallback values."""
+    return (primary or UserProfile()).merged_with(fallback)
+
+
+def _clean_profile_value(value: str) -> str:
+    compact = " ".join((value or "").strip(" \t\r\n,;:-").split())
+    compact = re.sub(r"^(?:a|an|the)\s+", "", compact, flags=re.IGNORECASE)
+    return compact.strip()
+
+
+def _looks_like_question(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return False
+    if "?" in normalized:
+        return True
+    return bool(re.match(r"^(?:who|what|when|where|why|how|am|can|do|does|did|is|are|should|could|would)\b", normalized))
+
+
+def parse_user_profile_text(text: str) -> UserProfile:
+    """Parse a short free-form profile reply into a UserProfile.
+
+    Supports explicit labeled input such as:
+        Role: Branch Manager; Department: Retail Banking; Grade: M3; Location: Mumbai
+
+    and lightweight natural language such as:
+        I'm a Branch Manager in Retail Banking at Mumbai
+    """
+    raw_text = (text or "").strip()
+    if not raw_text:
+        return UserProfile()
+
+    fields: dict[str, str] = {
+        "role": "",
+        "grade": "",
+        "department": "",
+        "location": "",
+    }
+    pattern_map: dict[str, tuple[str, ...]] = {
+        "role": (
+            r"\b(?:role|designation|job title|title)\s*[:=-]\s*([^;\n,]+)",
+            r"\b(?:i am|i'm|im|my role is|role is|designation is)\s+(?:an?\s+)?(.+?)(?=\s+(?:in|at|from|based in|located in)\b|[.;]|$)",
+        ),
+        "grade": (
+            r"\b(?:grade|level|band)\s*[:=-]\s*([^;\n,]+)",
+        ),
+        "department": (
+            r"\b(?:department|dept|team|function|business unit)\s*[:=-]\s*([^;\n,]+)",
+            r"\b(?:i am|i'm|im).+?\bin\s+(.+?)(?=\s+(?:at|from|based in|located in)\b|[.;]|$)",
+        ),
+        "location": (
+            r"\b(?:location|city|office|region|country)\s*[:=-]\s*([^;\n,]+)",
+            r"\b(?:at|from|based in|located in)\s+(.+?)(?=[.;]|$)",
+        ),
+    }
+    for field_name, patterns in pattern_map.items():
+        for pattern in patterns:
+            match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            fields[field_name] = _clean_profile_value(match.group(1))
+            if fields[field_name]:
+                break
+
+    if not any(fields.values()):
+        compact = _clean_profile_value(raw_text)
+        if compact and len(compact.split()) <= 6 and ":" not in raw_text and not _looks_like_question(raw_text):
+            fields["role"] = compact
+
+    return UserProfile(
+        role=fields["role"],
+        grade=fields["grade"],
+        department=fields["department"],
+        location=fields["location"],
+    ).build_tags()
+
+
 def resolve_user_profile(domain_type: str, user_id: str | int | None = None) -> UserProfile:
     """Return the UserProfile for a request.
 
-    Today: always returns the domain default.
+    Today: anonymous or unresolved users intentionally return an empty profile.
     Later: look up user_id in a profile store / decode from JWT and return the
-    real profile; fall back to the domain default only when lookup fails.
+    real profile.
     """
     # TODO: replace with real profile lookup when login is wired
     # e.g.:  profile = ProfileService.get(user_id)
     #        if profile: return profile.build_tags()
-    return DOMAIN_DEFAULT_PROFILES.get(domain_type, UserProfile())
+    return UserProfile()

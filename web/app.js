@@ -338,9 +338,17 @@ function renderMessages() {
 
     const lastAssistantIdx = savedMessages.reduce((last, msg, idx) =>
         msg.role === "assistant" ? idx : last, -1);
+    const clarificationKind = state.activeThread?.pending_clarification_kind || "";
+    const clarificationAssistantIdx = clarificationKind ? lastAssistantIdx : -1;
 
     const parts = savedMessages.map((message, idx) => {
-        const label = message.role === "user" ? "You" : "Policy GPT";
+        const isClarificationPrompt = (
+            message.role === "assistant"
+            && idx === clarificationAssistantIdx
+        );
+        const label = message.role === "user"
+            ? "You"
+            : (isClarificationPrompt ? "Question for you" : "Policy GPT");
         let body, relatedHtml = "";
 
         if (message.role === "assistant") {
@@ -354,11 +362,21 @@ function renderMessages() {
         const sourcesHtml = (message.role === "assistant" && idx === lastAssistantIdx)
             ? renderSources(state.activeThread?.sources || [])
             : "";
+        const promptHintHtml = isClarificationPrompt
+            ? '<div class="message-prompt-hint">Please answer this so I can continue.</div>'
+            : "";
+        const classes = [
+            "message",
+            message.role,
+            isClarificationPrompt ? "clarification" : "",
+            isClarificationPrompt && clarificationKind ? `clarification-${clarificationKind}` : "",
+        ].filter(Boolean).join(" ");
 
         return `
-            <article class="message ${message.role}">
+            <article class="${classes}">
                 <div class="message-meta">${label}</div>
                 <div class="message-card">
+                    ${promptHintHtml}
                     <div class="message-body">${body}</div>
                     ${relatedHtml}
                     ${sourcesHtml}
@@ -452,6 +470,14 @@ function renderHeader() {
     elements.resetChatButton.disabled = !state.activeThread || state.loading || !ready;
     elements.sendButton.disabled = state.loading || !ready;
     elements.sendButton.textContent = state.loading ? "Working..." : "Send";
+    const clarificationKind = state.activeThread?.pending_clarification_kind || "";
+    if (clarificationKind === "profile") {
+        elements.composerInput.placeholder = "Reply with your role, department, grade, and location...";
+    } else if (clarificationKind) {
+        elements.composerInput.placeholder = "Reply to the question above...";
+    } else if (state.domain?.input_placeholder) {
+        elements.composerInput.placeholder = state.domain.input_placeholder;
+    }
 }
 
 function renderDomainUI() {

@@ -29,7 +29,11 @@ from policygpt.core.retrieval.query_analyzer import QueryAnalysis, QueryAnalyzer
 from policygpt.ingestion.extraction.redaction import Redactor
 from policygpt.ingestion.extraction.taxonomy import unique_preserving_order
 from policygpt.observability.usage_metrics import LLMUsageTracker
-from policygpt.config.user_profiles import UserProfile
+from policygpt.config.user_profiles import (
+    UserProfile,
+    merge_user_profiles,
+    parse_user_profile_text,
+)
 from policygpt.cache import CacheManager, build_cache_backend
 
 
@@ -63,6 +67,76 @@ def _log_retrieval_console(top_sections, top_docs, corpus) -> None:
             + (f" {llm_part}" if llm_part else ""),
             flush=True,
         )
+
+
+_PERSONAL_QUERY_PREFIXES: tuple[str, ...] = (
+    "am i",
+    "can i",
+    "do i",
+    "should i",
+    "what can i",
+    "what do i",
+    "what is for me",
+    "what's for me",
+    "what applies to me",
+    "what is available to me",
+)
+
+_VAGUE_QUERY_PHRASES: tuple[str, ...] = (
+    "what is for me",
+    "what's for me",
+    "what about me",
+    "what should i do",
+    "what do i need to do",
+    "can you help me",
+    "help me with this",
+    "tell me more",
+    "give me details",
+)
+
+_GENERIC_FOCUS_TERMS: frozenset[str] = frozenset({
+    "what",
+    "which",
+    "who",
+    "how",
+    "when",
+    "where",
+    "why",
+    "me",
+    "my",
+    "mine",
+    "i",
+    "it",
+    "this",
+    "that",
+    "thing",
+    "things",
+    "something",
+    "anything",
+    "do",
+    "need",
+    "help",
+    "tell",
+    "more",
+    "info",
+    "information",
+    "detail",
+    "details",
+    "policy",
+    "policies",
+    "process",
+    "procedure",
+    "procedures",
+    "rule",
+    "rules",
+    "benefit",
+    "benefits",
+    "eligible",
+    "eligibility",
+    "available",
+    "approval",
+    "apply",
+})
 
 
 class PolicyGPTBot:
@@ -202,34 +276,94 @@ class PolicyGPTBot:
             if not self.documents and self.corpus._os_retriever is None:
                 raise RuntimeError("No documents ingested. Call ingest_folder() first.")
 
+            display_user_question = user_question.strip()
+            effective_user_question = display_user_question
             thread = self.get_thread(thread_id)
-
-            conversational_intent = detect_conversational_intent(user_question)
-            if conversational_intent:
-                if conversational_intent == ConversationalIntent.SELF_REFERENTIAL:
-                    reply = self._self_referential_reply(thread, user_question)
-                else:
-                    reply = self._conversational_reply(conversational_intent, user_question)
-                thread.display_messages.append(Message(role="user", content=user_question))
-                thread.display_messages.append(Message(role="assistant", content=reply))
-                thread.updated_at = utc_now_iso()
-                return ChatResult(thread_id=thread_id, answer=reply, sources=[], thread=thread)
+            user_profile = merge_user_profiles(user_profile, self._thread_user_profile(thread))
+            if not user_profile.is_empty():
+                self._store_thread_user_profile(thread, user_profile)
 
             # Use recent_messages (always in memory) to detect first turn; display_messages
             # may be empty after OS save even when the thread already has history.
             first_user_message = not any(message.role == "user" for message in thread.recent_messages)
+
+            if thread.pending_clarification_kind:
+                pending_question = thread.pending_question.strip()
+                if thread.pending_clarification_kind == "profile":
+                    parsed_profile = parse_user_profile_text(display_user_question)
+                    if parsed_profile.is_empty():
+                        return self._reply_without_retrieval(
+                            thread=thread,
+                            thread_id=thread_id,
+                            user_message=display_user_question,
+                            reply=self._build_profile_clarification_question(
+                                pending_question or display_user_question,
+                                retry=True,
+                            ),
+                            first_user_message=first_user_message,
+                            title_source=pending_question or display_user_question,
+                        )
+                    user_profile = merge_user_profiles(parsed_profile, user_profile)
+                    self._store_thread_user_profile(thread, user_profile)
+                    effective_user_question = pending_question or display_user_question
+                elif thread.pending_clarification_kind == "question":
+                    effective_user_question = self._merge_clarification_into_question(
+                        pending_question,
+                        display_user_question,
+                    )
+                thread.pending_question = ""
+                thread.pending_clarification_kind = ""
+
+            conversational_intent = detect_conversational_intent(effective_user_question)
+            if conversational_intent:
+                if conversational_intent == ConversationalIntent.SELF_REFERENTIAL:
+                    reply = self._self_referential_reply(thread, effective_user_question)
+                else:
+                    reply = self._conversational_reply(conversational_intent, effective_user_question)
+                return self._reply_without_retrieval(
+                    thread=thread,
+                    thread_id=thread_id,
+                    user_message=display_user_question,
+                    reply=reply,
+                    first_user_message=first_user_message,
+                    title_source=effective_user_question,
+                )
             active_document_titles = [
                 self.documents[doc_id].title
                 for doc_id in thread.active_doc_ids
                 if doc_id in self.documents
             ]
             query_analysis = self.query_analyzer.analyze(
-                user_question=user_question,
+                user_question=effective_user_question,
                 active_document_titles=active_document_titles,
                 candidate_documents=list(self.documents.values()),
                 entity_lookup=self.corpus.entity_lookup,
                 user_profile=user_profile,
             )
+
+            if self._requires_profile_clarification(effective_user_question, query_analysis, user_profile):
+                thread.pending_question = effective_user_question
+                thread.pending_clarification_kind = "profile"
+                return self._reply_without_retrieval(
+                    thread=thread,
+                    thread_id=thread_id,
+                    user_message=display_user_question,
+                    reply=self._build_profile_clarification_question(effective_user_question),
+                    first_user_message=first_user_message,
+                    title_source=effective_user_question,
+                )
+
+            if self._needs_general_clarification(thread, query_analysis):
+                thread.pending_question = effective_user_question
+                thread.pending_clarification_kind = "question"
+                return self._reply_without_retrieval(
+                    thread=thread,
+                    thread_id=thread_id,
+                    user_message=display_user_question,
+                    reply=self._build_general_clarification_question(thread, query_analysis),
+                    first_user_message=first_user_message,
+                    title_source=effective_user_question,
+                )
 
             retrieval_query = self._build_retrieval_query(thread, query_analysis)
             masked_retrieval_query = self.redactor.mask_text(retrieval_query)
@@ -255,12 +389,13 @@ class PolicyGPTBot:
             )
             if faq_hit:
                 final_faq = self._normalize_answer_markdown(faq_hit)
-                thread.display_messages.append(Message(role="user", content=user_question))
+                thread.display_messages.append(Message(role="user", content=display_user_question))
                 thread.display_messages.append(Message(role="assistant", content=final_faq))
-                thread.recent_messages.append(Message(role="user", content=user_question))
+                thread.recent_messages.append(Message(role="user", content=display_user_question))
                 thread.recent_messages.append(Message(role="assistant", content=self._compact_history_message(final_faq)))
+                self._trim_recent_messages(thread)
                 if first_user_message:
-                    thread.title = self._derive_thread_title(user_question)
+                    thread.title = self._derive_thread_title(effective_user_question)
                 thread.updated_at = utc_now_iso()
                 return ChatResult(thread_id=thread_id, answer=final_faq, sources=[], thread=thread)
             preferred_doc_ids = thread.active_doc_ids if query_analysis.context_dependent else []
@@ -270,17 +405,18 @@ class PolicyGPTBot:
             # answer may differ based on which doc was last referenced.
             _cache_key: tuple | None = None
             if not query_analysis.context_dependent:
-                _norm_q = re.sub(r"\s+", " ", user_question.strip().casefold())
+                _norm_q = re.sub(r"\s+", " ", effective_user_question.strip().casefold())
                 _cache_key = (_norm_q, frozenset(thread.active_doc_ids))
                 _cached = self.cache.get_answer(_norm_q, frozenset(thread.active_doc_ids))
                 if _cached is not None:
                     cached_answer, cached_sources = _cached
-                    thread.display_messages.append(Message(role="user", content=user_question))
+                    thread.display_messages.append(Message(role="user", content=display_user_question))
                     thread.display_messages.append(Message(role="assistant", content=cached_answer))
-                    thread.recent_messages.append(Message(role="user", content=user_question))
+                    thread.recent_messages.append(Message(role="user", content=display_user_question))
                     thread.recent_messages.append(
                         Message(role="assistant", content=self._compact_history_message(cached_answer))
                     )
+                    self._trim_recent_messages(thread)
                     thread.last_answer_sources = cached_sources
                     thread.updated_at = utc_now_iso()
                     return ChatResult(thread_id=thread_id, answer=cached_answer, sources=cached_sources, thread=thread)
@@ -292,13 +428,13 @@ class PolicyGPTBot:
             # questions in one message, retrieve separately for each and answer
             # them together.  Skip when the question is a simple follow-up or
             # a direct aggregate query (those are handled by the FAQ path).
-            sub_questions = self._split_compound_question(user_question)
+            sub_questions = self._split_compound_question(effective_user_question)
             is_compound = len(sub_questions) > 1 and not query_analysis.context_dependent
 
             if is_compound:
                 answer_text, sources = self._answer_compound_question(
                     thread=thread,
-                    user_question=user_question,
+                    user_question=effective_user_question,
                     sub_questions=sub_questions,
                     active_document_titles=active_document_titles,
                     preferred_doc_ids=preferred_doc_ids,
@@ -458,13 +594,13 @@ class PolicyGPTBot:
                         and not self._is_dual_answer_candidate(top_docs, top_sections, query_analysis)
                     ):
                         followup = self._generate_low_confidence_followup(
-                            user_question, answer_text, query_analysis
+                            effective_user_question, answer_text, query_analysis
                         )
                         if followup:
                             answer_text += f"\n\n{followup}"
 
                     # Suggest related questions from the FAQ corpus
-                    related = self._find_related_questions(query_vec, user_question, user_id=user_id)
+                    related = self._find_related_questions(query_vec, effective_user_question, user_id=user_id)
                     if related:
                         answer_text += "\n\n**You might also ask:**\n" + "\n".join(f"- {q}" for q in related)
                 else:
@@ -472,16 +608,16 @@ class PolicyGPTBot:
                     # Ask the LLM to classify intent before showing a retrieval
                     # failure — cheap single call, avoids confusing non-policy
                     # messages with "I couldn't find a clear statement".
-                    llm_intent = self._llm_classify_intent(user_question)
+                    llm_intent = self._llm_classify_intent(effective_user_question)
                     if llm_intent == ConversationalIntent.SELF_REFERENTIAL:
-                        answer_text = self._self_referential_reply(thread, user_question)
+                        answer_text = self._self_referential_reply(thread, effective_user_question)
                     elif llm_intent != ConversationalIntent.POLICY:
-                        answer_text = self._conversational_reply(llm_intent, user_question)
+                        answer_text = self._conversational_reply(llm_intent, effective_user_question)
                     else:
                         # ── Feature 1a: always ask a clarifying question before
                         # giving up — the bot has docs nearby, ask the user to
                         # narrow down rather than showing a dead-end message.
-                        clarifying = self._generate_clarifying_question(user_question, query_analysis, top_docs)
+                        clarifying = self._generate_clarifying_question(effective_user_question, query_analysis, top_docs)
                         answer_text = clarifying if clarifying else self._build_unanswerable_response(
                             query_analysis, top_docs, query_vec=query_vec, user_id=user_id
                         )
@@ -492,7 +628,7 @@ class PolicyGPTBot:
                 self.cache.set_answer(_norm_q, frozenset(thread.active_doc_ids), final_answer, sources)
             self._write_retrieval_log(
                 thread_id=thread.thread_id,
-                user_question=user_question,
+                user_question=effective_user_question,
                 query_analysis=query_analysis,
                 retrieval_query=retrieval_query,
                 top_docs=top_docs,
@@ -503,28 +639,23 @@ class PolicyGPTBot:
                 sources=sources,
             )
 
-            recent_message_limit = max(0, self.config.conversation.max_recent_messages)
-            thread.recent_messages.append(Message(role="user", content=user_question))
+            thread.recent_messages.append(Message(role="user", content=display_user_question))
             thread.recent_messages.append(
                 Message(
                     role="assistant",
                     content=self._compact_history_message(answer_text),
                 )
             )
-            thread.recent_messages = (
-                thread.recent_messages[-recent_message_limit:]
-                if recent_message_limit
-                else []
-            )
-            thread.display_messages.append(Message(role="user", content=user_question))
+            self._trim_recent_messages(thread)
+            thread.display_messages.append(Message(role="user", content=display_user_question))
             thread.display_messages.append(Message(role="assistant", content=final_answer))
             thread.active_doc_ids = [document.doc_id for document, _ in top_docs]
             thread.active_section_ids = [section.section_id for section, _ in top_sections]
-            topic_summary = ", ".join(query_analysis.topic_hints) if query_analysis.topic_hints else user_question
+            topic_summary = ", ".join(query_analysis.topic_hints) if query_analysis.topic_hints else effective_user_question
             thread.current_topic = self._derive_thread_title(topic_summary, limit=90)
             thread.last_answer_sources = sources
             if first_user_message:
-                thread.title = self._derive_thread_title(user_question)
+                thread.title = self._derive_thread_title(effective_user_question)
             thread.updated_at = utc_now_iso()
 
             if len(thread.recent_messages) >= self.config.conversation.summarize_after_turns:
@@ -539,7 +670,7 @@ class PolicyGPTBot:
         except Exception as exc:
             self._write_query_failure_log(
                 thread_id=thread_id,
-                user_question=user_question,
+                user_question=effective_user_question,
                 query_analysis=query_analysis,
                 retrieval_query=retrieval_query,
                 top_docs=top_docs,
@@ -552,6 +683,142 @@ class PolicyGPTBot:
 
     def ask(self, thread_id: str, user_question: str) -> str:
         return self.chat(thread_id, user_question).answer
+
+    @staticmethod
+    def _thread_user_profile(thread) -> UserProfile:
+        return UserProfile(
+            role=getattr(thread, "profile_role", ""),
+            grade=getattr(thread, "profile_grade", ""),
+            department=getattr(thread, "profile_department", ""),
+            location=getattr(thread, "profile_location", ""),
+        ).build_tags()
+
+    @staticmethod
+    def _store_thread_user_profile(thread, profile: UserProfile | None) -> None:
+        merged = (profile or UserProfile()).build_tags()
+        thread.profile_role = merged.role
+        thread.profile_grade = merged.grade
+        thread.profile_department = merged.department
+        thread.profile_location = merged.location
+
+    def _trim_recent_messages(self, thread) -> None:
+        recent_message_limit = max(0, self.config.conversation.max_recent_messages)
+        thread.recent_messages = (
+            thread.recent_messages[-recent_message_limit:]
+            if recent_message_limit
+            else []
+        )
+
+    def _reply_without_retrieval(
+        self,
+        thread,
+        thread_id: str,
+        user_message: str,
+        reply: str,
+        *,
+        first_user_message: bool,
+        title_source: str,
+    ) -> ChatResult:
+        thread.recent_messages.append(Message(role="user", content=user_message))
+        thread.recent_messages.append(
+            Message(role="assistant", content=self._compact_history_message(reply))
+        )
+        self._trim_recent_messages(thread)
+        thread.display_messages.append(Message(role="user", content=user_message))
+        thread.display_messages.append(Message(role="assistant", content=reply))
+        thread.last_answer_sources = []
+        if first_user_message and title_source.strip():
+            thread.title = self._derive_thread_title(title_source)
+        thread.updated_at = utc_now_iso()
+        return ChatResult(thread_id=thread_id, answer=reply, sources=[], thread=thread)
+
+    @staticmethod
+    def _merge_clarification_into_question(original_question: str, clarification_reply: str) -> str:
+        parts = [p.strip() for p in (original_question, clarification_reply) if p and p.strip()]
+        return " ".join(parts)
+
+    @staticmethod
+    def _contains_personal_reference(normalized_question: str) -> bool:
+        return bool(re.search(r"\b(?:i|me|my|mine)\b", normalized_question))
+
+    def _requires_profile_clarification(
+        self,
+        user_question: str,
+        query_analysis: QueryAnalysis,
+        user_profile: "UserProfile | None" = None,
+    ) -> bool:
+        if user_profile and not user_profile.is_empty():
+            return False
+        normalized = query_analysis.normalized_question
+        is_personalized = (
+            any(normalized.startswith(prefix) for prefix in _PERSONAL_QUERY_PREFIXES)
+            or "for me" in normalized
+            or bool(re.search(r"\bmy\b", normalized))
+        )
+        if not is_personalized:
+            return False
+        if any(normalized.startswith(prefix) for prefix in _PERSONAL_QUERY_PREFIXES) or "for me" in normalized:
+            return True
+        return (
+            QueryIntent.ELIGIBILITY in query_analysis.intents
+            or QueryIntent.APPROVAL in query_analysis.intents
+            or not query_analysis.topic_hints
+        )
+
+    def _needs_general_clarification(self, thread, query_analysis: QueryAnalysis) -> bool:
+        if query_analysis.context_dependent and not (thread.active_doc_ids or thread.last_answer_sources):
+            return True
+        if QueryIntent.AGGREGATE in query_analysis.intents or QueryIntent.DOCUMENT_LOOKUP in query_analysis.intents:
+            return False
+        if query_analysis.topic_hints:
+            return False
+
+        normalized = query_analysis.normalized_question
+        if any(phrase in normalized for phrase in _VAGUE_QUERY_PHRASES):
+            return True
+        informative_terms = [
+            term for term in query_analysis.focus_terms
+            if term not in _GENERIC_FOCUS_TERMS
+        ]
+        if informative_terms:
+            return False
+        return len(query_analysis.focus_terms) <= 2 or len(normalized.split()) <= 6
+
+    @staticmethod
+    def _build_profile_clarification_question(_user_question: str, retry: bool = False) -> str:
+        if retry:
+            return (
+                "What is your role, department, grade, and location? "
+                "Please reply in one line like `Role: Branch Manager; Department: Retail Banking; "
+                "Grade: M3; Location: Mumbai`. Role is the most important field."
+            )
+        return (
+            "What is your role, department, grade, and location? "
+            "Please reply in one line like `Role: Branch Manager; Department: Retail Banking; "
+            "Grade: M3; Location: Mumbai`."
+        )
+
+    def _build_general_clarification_question(self, thread, query_analysis: QueryAnalysis) -> str:
+        if query_analysis.context_dependent and not (thread.active_doc_ids or thread.last_answer_sources):
+            return "Which policy, document, or previous answer are you referring to?"
+        if any(phrase in query_analysis.normalized_question for phrase in _VAGUE_QUERY_PHRASES):
+            return (
+                "Could you be a bit more specific? "
+                "Please mention the policy, benefit, process, document, or scenario you want help with."
+            )
+        if self._contains_personal_reference(query_analysis.normalized_question):
+            return (
+                "What specifically do you want me to check for you? "
+                "Please mention the policy, benefit, process, document, or scenario."
+            )
+        if QueryIntent.ELIGIBILITY in query_analysis.intents:
+            return "Which policy, benefit, or program do you want me to check eligibility for?"
+        if QueryIntent.APPROVAL in query_analysis.intents or QueryIntent.PROCESS in query_analysis.intents:
+            return "Which policy or process are you asking about?"
+        return (
+            "Could you be a bit more specific? "
+            "Please mention the policy, benefit, process, document, or scenario you want help with."
+        )
 
     @staticmethod
     def _build_embedding_text(query_analysis: QueryAnalysis) -> str:

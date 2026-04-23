@@ -64,9 +64,9 @@ DOMAIN_CONFIG_OVERRIDES: dict[str, dict[str, Any]] = {
 
         # Contest queries are often vague ("what do I win") so semantic vector
         # search should dominate.
-        "hybrid_keyword_weight": 0.30,
-        "hybrid_similarity_weight": 0.15,
-        "hybrid_vector_weight": 0.55,
+        "hybrid_keyword_weight": 0.50,
+        "hybrid_similarity_weight": 0.25,
+        "hybrid_vector_weight": 0.25,
     },
     "product_technical": {
         # Technical answers often include multi-step procedures, architecture

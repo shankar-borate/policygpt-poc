@@ -40,6 +40,12 @@ _THREADS_MAPPING = {
             "title":                {"type": "keyword"},
             "created_at":           {"type": "date"},
             "updated_at":           {"type": "date"},
+            "profile_role":         {"type": "keyword"},
+            "profile_grade":        {"type": "keyword"},
+            "profile_department":   {"type": "keyword"},
+            "profile_location":     {"type": "keyword"},
+            "pending_question":     {"type": "text"},
+            "pending_clarification_kind": {"type": "keyword"},
             "current_topic":        {"type": "keyword"},
             "active_doc_ids":       {"type": "keyword"},
             "active_section_ids":   {"type": "keyword"},
@@ -93,6 +99,12 @@ class ThreadRepository:
                 "title":                thread.title,
                 "created_at":           thread.created_at,
                 "updated_at":           thread.updated_at,
+                "profile_role":         thread.profile_role,
+                "profile_grade":        thread.profile_grade,
+                "profile_department":   thread.profile_department,
+                "profile_location":     thread.profile_location,
+                "pending_question":     thread.pending_question,
+                "pending_clarification_kind": thread.pending_clarification_kind,
                 "current_topic":        thread.current_topic,
                 "active_doc_ids":       thread.active_doc_ids,
                 "active_section_ids":   thread.active_section_ids,
@@ -141,6 +153,12 @@ class ThreadRepository:
                             ctx._source.active_section_ids   = params.active_section_ids;
                             ctx._source.last_answer_sources  = params.last_answer_sources;
                             ctx._source.conversation_summary = params.conversation_summary;
+                            ctx._source.profile_role         = params.profile_role;
+                            ctx._source.profile_grade        = params.profile_grade;
+                            ctx._source.profile_department   = params.profile_department;
+                            ctx._source.profile_location     = params.profile_location;
+                            ctx._source.pending_question     = params.pending_question;
+                            ctx._source.pending_clarification_kind = params.pending_clarification_kind;
                             ctx._source.current_topic        = params.current_topic;
                             ctx._source.title                = params.title;
                             ctx._source.updated_at           = params.updated_at;
@@ -152,6 +170,12 @@ class ThreadRepository:
                             "active_section_ids":   thread.active_section_ids,
                             "last_answer_sources":  sources,
                             "conversation_summary": thread.conversation_summary,
+                            "profile_role":         thread.profile_role,
+                            "profile_grade":        thread.profile_grade,
+                            "profile_department":   thread.profile_department,
+                            "profile_location":     thread.profile_location,
+                            "pending_question":     thread.pending_question,
+                            "pending_clarification_kind": thread.pending_clarification_kind,
                             "current_topic":        thread.current_topic,
                             "title":                thread.title,
                             "updated_at":           thread.updated_at,
@@ -164,6 +188,12 @@ class ThreadRepository:
                         "title":                thread.title,
                         "created_at":           thread.created_at,
                         "updated_at":           thread.updated_at,
+                        "profile_role":         thread.profile_role,
+                        "profile_grade":        thread.profile_grade,
+                        "profile_department":   thread.profile_department,
+                        "profile_location":     thread.profile_location,
+                        "pending_question":     thread.pending_question,
+                        "pending_clarification_kind": thread.pending_clarification_kind,
                         "current_topic":        thread.current_topic,
                         "active_doc_ids":       thread.active_doc_ids,
                         "active_section_ids":   thread.active_section_ids,
@@ -233,6 +263,12 @@ def _deserialize(src: dict) -> ThreadState:
     thread.title                = src.get("title", "New chat")
     thread.created_at           = src.get("created_at", thread.created_at)
     thread.updated_at           = src.get("updated_at", thread.updated_at)
+    thread.profile_role         = src.get("profile_role", "")
+    thread.profile_grade        = src.get("profile_grade", "")
+    thread.profile_department   = src.get("profile_department", "")
+    thread.profile_location     = src.get("profile_location", "")
+    thread.pending_question     = src.get("pending_question", "")
+    thread.pending_clarification_kind = src.get("pending_clarification_kind", "")
     thread.current_topic        = src.get("current_topic", "")
     thread.active_doc_ids       = src.get("active_doc_ids", [])
     thread.active_section_ids   = src.get("active_section_ids", [])

@@ -338,6 +338,9 @@ class PolicyApiServer:
             "messages": [self.serialize_message(message) for message in thread.display_messages],
             "sources": [self.serialize_source(s, self._gather_source_images(s)) for s in unique_sources],
             "conversation_summary": thread.conversation_summary,
+            "pending_clarification_kind": getattr(thread, "pending_clarification_kind", ""),
+            "pending_question": getattr(thread, "pending_question", ""),
+            "awaiting_user_input": bool(getattr(thread, "pending_clarification_kind", "")),
         }
 
     def _gather_source_images(self, source) -> list[str]:
